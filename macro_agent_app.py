@@ -22,14 +22,17 @@ def password_gate():
     if not st.session_state.auth:
         st.title("Login")
         pwd = st.text_input("Password", type="password")
-        if pwd and pwd == st.secrets["tradnig"]:
+
+        if pwd and pwd == st.secrets["APP_PASSWORD"]:
             st.session_state.auth = True
             st.rerun()
         elif pwd:
             st.error("Wrong password")
+
         st.stop()
 
 password_gate()
+
 
 
 # ------------------------------------
@@ -1791,3 +1794,4 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+

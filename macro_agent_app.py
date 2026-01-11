@@ -15,9 +15,6 @@ from openai import OpenAI
 from bs4 import BeautifulSoup
 import streamlit as st
 
-st.write("Secrets keys loaded:", sorted(list(st.secrets.keys())))
-st.stop()
-
 
 def password_gate():
     if "auth" not in st.session_state:
@@ -1812,6 +1809,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

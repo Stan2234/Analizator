@@ -33,7 +33,21 @@ def password_gate():
 
 password_gate()
 
+import streamlit as st
+import os
 
+def inject_secrets_to_env():
+    for key in [
+        "NEWSAPI_KEY",
+        "BINANCE_API_KEY",
+        "BINANCE_API_SECRET",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+    ]:
+        if key in st.secrets and not os.getenv(key):
+            os.environ[key] = str(st.secrets[key])
+
+inject_secrets_to_env()
 
 # ------------------------------------
 # LOAD ENV
@@ -1794,4 +1808,5 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 

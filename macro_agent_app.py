@@ -55,11 +55,22 @@ inject_secrets_to_env()
 # ------------------------------------
 load_dotenv()
 
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+def get_secret(name: str, default: str = "") -> str:
+    # 1) Streamlit Cloud secrets
+    try:
+        import streamlit as st
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    # 2) Local env/.env
+    return os.getenv(name, default).strip()
+
+NEWSAPI_KEY = get_secret("NEWSAPI_KEY")
+BINANCE_API_KEY = get_secret("BINANCE_API_KEY")
+BINANCE_API_SECRET = get_secret("BINANCE_API_SECRET")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4.1-mini")
 
 # ------------------------------------
 # CONFIG
@@ -1809,6 +1820,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

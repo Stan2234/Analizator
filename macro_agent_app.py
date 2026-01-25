@@ -111,6 +111,13 @@ ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
         "Tesla": "TSLA",
         "Alphabet": "GOOGL",
         "Amazon": "AMZN",
+        "ASML (NASDAQ ADR)": "ASML",
+        "L3Harris Technologies": "LHX",
+        "AeroVironment": "AVAV",
+        "Kratos Defense & Security": "KTOS",
+        "Allianz (XETRA)": "ALV.DE",
+        "Rheinmetall (XETRA)": "RHM.DE",
+        
     },
     "crypto": {
         "Bitcoin": "BTC-USD",
@@ -185,6 +192,14 @@ NEWS_KEYWORDS: List[str] = [
     "Bill Gates",
     "Jerome Powell",
     "Christine Lagarde",
+    "ASML",
+    "L3Harris",
+    "AeroVironment",
+    "Kratos Defense",
+    "Allianz",
+    "Rheinmetall",
+    "European defense spending",
+    "NATO defense"
 ]
 
 YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{}"
@@ -1820,6 +1835,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

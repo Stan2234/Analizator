@@ -14,6 +14,7 @@ from binance.client import Client
 from openai import OpenAI
 from bs4 import BeautifulSoup
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 def password_gate():
@@ -1580,7 +1581,8 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
 """
 )
 
-st.markdown(live_ticker_html, unsafe_allow_html=True)
+components.html(live_ticker_html, height=120, scrolling=False)
+
 
 
 # ===== REST OF HEADER =====
@@ -1909,6 +1911,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

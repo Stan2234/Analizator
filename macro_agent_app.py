@@ -1368,6 +1368,7 @@ st.markdown(retro_css, unsafe_allow_html=True)
 
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
+
 # ===== LIVE TICKER HORIZONTAL (CRYPTO, YAHOO STYLE) =====
 
 live_ticker_css = """
@@ -1388,14 +1389,14 @@ live_ticker_css = """
     overflow-x: auto;
     scroll-behavior: smooth;
     scrollbar-width: none;
+    padding: 0 42px; /* място за стрелките */
 }
-.live-ticker-row::-webkit-scrollbar {
-    display: none;
-}
+.live-ticker-row::-webkit-scrollbar { display: none; }
+
 .ticker-item {
-    min-width: 150px;
+    min-width: 170px;
     padding: 0.35rem 0.75rem;
-    border-radius: 4px;
+    border-radius: 6px;
     border: 1px solid #00ff00;
     background-color: #000000;
     display: flex;
@@ -1404,18 +1405,15 @@ live_ticker_css = """
     font-size: 0.85rem;
     color: #ffffff;
 }
+
 .ticker-header {
     display: flex;
     justify-content: space-between;
     margin-bottom: 0.15rem;
 }
-.ticker-symbol {
-    font-weight: 700;
-}
-.ticker-source {
-    opacity: 0.7;
-    font-size: 0.7rem;
-}
+.ticker-symbol { font-weight: 700; }
+.ticker-source { opacity: 0.7; font-size: 0.7rem; }
+
 .ticker-price-row {
     display: flex;
     justify-content: space-between;
@@ -1425,25 +1423,18 @@ live_ticker_css = """
     font-family: monospace;
     font-size: 0.95rem;
 }
-.ticker-change {
-    font-size: 0.8rem;
-}
-.ticker-change.up {
-    color: #00ff00;
-}
-.ticker-change.down {
-    color: #ff4d4d;
-}
-.ticker-change span {
-    margin-left: 0.15rem;
-}
+
+.ticker-change { font-size: 0.8rem; }
+.ticker-change.up { color: #00ff00; }
+.ticker-change.down { color: #ff4d4d; }
+
 .ticker-arrow {
     position: absolute;
     top: 50%;
     transform: translateY(-50%);
-    width: 32px;
-    height: 60px;
-    border-radius: 4px;
+    width: 34px;
+    height: 62px;
+    border-radius: 6px;
     border: 1px solid #555555;
     background-color: #111111;
     color: #cccccc;
@@ -1452,16 +1443,11 @@ live_ticker_css = """
     justify-content: center;
     cursor: pointer;
     z-index: 10;
+    user-select: none;
 }
-.ticker-arrow.left {
-    left: 4px;
-}
-.ticker-arrow.right {
-    right: 4px;
-}
-.ticker-arrow:hover {
-    background-color: #222222;
-}
+.ticker-arrow.left { left: 6px; }
+.ticker-arrow.right { right: 6px; }
+.ticker-arrow:hover { background-color: #222222; }
 </style>
 """
 
@@ -1475,39 +1461,127 @@ for sym, short in LIVE_TICKER_SYMBOLS:
   </div>
   <div class="ticker-price-row">
     <div class="ticker-price" data-symbol="{sym}" data-field="last">...</div>
-    <div class="ticker-change">
-      <span data-symbol="{sym}" data-field="change">...</span>
-      <span data-symbol="{sym}" data-field="change_pct"></span>
+    <div class="ticker-change" data-symbol="{sym}" data-field="chgClass">
+      <span data-symbol="{sym}" data-field="changePct">...</span>
     </div>
   </div>
 </div>
 """
     ticker_items_html.append(item_html)
 
+symbols_js = [sym for sym, _ in LIVE_TICKER_SYMBOLS]
+
 live_ticker_html = live_ticker_css + textwrap.dedent(
     f"""
 <div class="live-ticker-container">
-  <button class="ticker-arrow left" onclick="scrollTicker(-1)">&#9664;</button>
+  <button type="button" class="ticker-arrow left" onclick="scrollTicker(-1)">&#9664;</button>
   <div class="live-ticker-row" id="live-ticker-row">
     {''.join(ticker_items_html)}
   </div>
-  <button class="ticker-arrow right" onclick="scrollTicker(1)">&#9654;</button>
+  <button type="button" class="ticker-arrow right" onclick="scrollTicker(1)">&#9654;</button>
 </div>
 
-<script src="/static/ws-client.js"></script>
 <script>
-  function scrollTicker(direction) {{
-    const row = document.getElementById("live-ticker-row");
+(function() {{
+  const SYMBOLS = {json.dumps(symbols_js)};
+  const ROW_ID = "live-ticker-row";
+  const STORAGE_KEY = "ticker_scroll_left_v1";
+
+  function fmtPrice(x) {{
+    if (!isFinite(x)) return "...";
+    if (x >= 1000) return x.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+    if (x >= 1) return x.toLocaleString(undefined, {{maximumFractionDigits: 4}});
+    return x.toLocaleString(undefined, {{maximumFractionDigits: 8}});
+  }}
+
+  window.scrollTicker = function(direction) {{
+    const row = document.getElementById(ROW_ID);
     if (!row) return;
     const item = row.querySelector(".ticker-item");
-    const step = item ? (item.offsetWidth + 12) : 160;
+    const step = item ? (item.offsetWidth + 12) : 180;
     row.scrollBy({{ left: direction * step, behavior: "smooth" }});
   }}
+
+  function saveScroll() {{
+    const row = document.getElementById(ROW_ID);
+    if (!row) return;
+    try {{ localStorage.setItem(STORAGE_KEY, String(row.scrollLeft)); }} catch(e) {{}}
+  }}
+
+  function restoreScroll() {{
+    const row = document.getElementById(ROW_ID);
+    if (!row) return;
+    try {{
+      const v = localStorage.getItem(STORAGE_KEY);
+      if (v !== null) row.scrollLeft = Number(v) || 0;
+    }} catch(e) {{}}
+  }}
+
+  async function fetchAll24h() {{
+    // 1 request за всички символи
+    const url = "https://api.binance.com/api/v3/ticker/24hr";
+    const r = await fetch(url, {{ cache: "no-store" }});
+    if (!r.ok) throw new Error("Binance fetch failed: " + r.status);
+    return await r.json();
+  }}
+
+  function updateDom(map) {{
+    for (const sym of SYMBOLS) {{
+      const data = map.get(sym);
+      if (!data) continue;
+
+      const last = Number(data.lastPrice);
+      const pct = Number(data.priceChangePercent);
+
+      const lastEl = document.querySelector(`[data-symbol="${{sym}}"][data-field="last"]`);
+      const pctEl  = document.querySelector(`[data-symbol="${{sym}}"][data-field="changePct"]`);
+      const chgEl  = document.querySelector(`[data-symbol="${{sym}}"][data-field="chgClass"]`);
+
+      if (lastEl) lastEl.textContent = fmtPrice(last);
+      if (pctEl) pctEl.textContent = (isFinite(pct) ? pct.toFixed(2) : "...") + "%";
+      if (chgEl) {{
+        chgEl.classList.remove("up", "down");
+        if (isFinite(pct)) chgEl.classList.add(pct >= 0 ? "up" : "down");
+      }}
+    }}
+  }}
+
+  async function tick() {{
+    try {{
+      const all = await fetchAll24h();
+      const map = new Map();
+      for (const item of all) {{
+        if (item && item.symbol) map.set(item.symbol, item);
+      }}
+      updateDom(map);
+    }} catch(e) {{
+      // ако Binance е блокиран/timeout, просто не обновяваме
+      // може да добавим индикатор, ако искаш
+    }}
+  }}
+
+  function init() {{
+    const row = document.getElementById(ROW_ID);
+    if (row) {{
+      row.addEventListener("scroll", () => saveScroll(), {{ passive: true }});
+      restoreScroll();
+    }}
+    tick();
+    setInterval(tick, 3000); // обновяване на 3 секунди
+  }}
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", init);
+  }} else {{
+    init();
+  }}
+}})();
 </script>
 """
 )
 
 st.markdown(live_ticker_html, unsafe_allow_html=True)
+
 
 # ===== REST OF HEADER =====
 
@@ -1835,6 +1909,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -403,27 +403,46 @@ def get_binance_client(api_key: str, api_secret: str):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) -> pd.DataFrame:
-    url = "https://api.binance.com/api/v3/klines"
+    base_urls = [
+        "https://data-api.binance.vision",  # <-- най-често работи при 451
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+        "https://api.binance.com",
+    ]
+
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    klines = r.json()
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    if not klines:
-        raise ValueError(f"No klines for {symbol}")
+    last_err = None
+    for base in base_urls:
+        try:
+            url = f"{base}/api/v3/klines"
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            klines = r.json()
+            if not klines:
+                raise ValueError(f"No klines for {symbol} from {base}")
 
-    df = pd.DataFrame(
-        klines,
-        columns=[
-            "open_time","open","high","low","close","volume","close_time",
-            "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-        ],
-    )
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    df["close"] = df["close"].astype(float)
-    df = df.dropna()
-    return df
+            df = pd.DataFrame(
+                klines,
+                columns=[
+                    "open_time","open","high","low","close","volume","close_time",
+                    "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
+                ],
+            )
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.dropna(subset=["close"])
+            return df
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"All Binance endpoints failed for {symbol}: {last_err}")
+
 
 
 def run_analysis_binance(timeframe: str) -> pd.DataFrame:
@@ -1912,6 +1931,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

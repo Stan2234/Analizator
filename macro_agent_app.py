@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 from binance.client import Client
 from openai import OpenAI
 from bs4 import BeautifulSoup
-import streamlit as st
 import streamlit.components.v1 as components
 
+st.set_page_config(page_title="AI Macro Agent", layout="wide")
 
 def password_gate():
     if "auth" not in st.session_state:
@@ -35,8 +35,6 @@ def password_gate():
 
 password_gate()
 
-import streamlit as st
-import os
 
 def inject_secrets_to_env():
     for key in [
@@ -91,6 +89,7 @@ body, .stApp {
 }
 </style>
 """
+st.markdown(retro_css, unsafe_allow_html=True)
 
 # Yahoo Finance assets (by class)
 ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
@@ -1372,9 +1371,6 @@ def show_fomc_lab():
 # STREAMLIT UI
 # ------------------------------------
 
-st.set_page_config(page_title="AI Macro Agent", layout="wide")
-st.markdown(retro_css, unsafe_allow_html=True)
-
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
 
@@ -1535,8 +1531,7 @@ for sym, short in LIVE_TICKER_SYMBOLS:
 
 symbols_js = [sym for sym, _ in LIVE_TICKER_SYMBOLS]
 
-live_ticker_html = live_ticker_css + textwrap.dedent(
-    f"""
+live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 <div class="live-ticker-container">
   <button type="button" class="ticker-arrow left" onclick="scrollTicker(-1)">&#9664;</button>
   <div class="live-ticker-row" id="live-ticker-row">
@@ -1546,30 +1541,30 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
 </div>
 
 <script>
-(function() {{
+(function () {{
   const SYMBOLS = {json.dumps(symbols_js)};
   const ROW_ID = "live-ticker-row";
   const STORAGE_KEY = "ticker_scroll_left_v1";
 
   function fmtPrice(x) {{
     if (!isFinite(x)) return "...";
-    if (x >= 1000) return x.toLocaleString(undefined, {{maximumFractionDigits: 2}});
-    if (x >= 1) return x.toLocaleString(undefined, {{maximumFractionDigits: 4}});
-    return x.toLocaleString(undefined, {{maximumFractionDigits: 8}});
+    if (x >= 1000) return x.toLocaleString(undefined, {{ maximumFractionDigits: 2 }});
+    if (x >= 1) return x.toLocaleString(undefined, {{ maximumFractionDigits: 4 }});
+    return x.toLocaleString(undefined, {{ maximumFractionDigits: 8 }});
   }}
 
-  window.scrollTicker = function(direction) {{
+  window.scrollTicker = function (direction) {{
     const row = document.getElementById(ROW_ID);
     if (!row) return;
     const item = row.querySelector(".ticker-item");
     const step = item ? (item.offsetWidth + 12) : 180;
     row.scrollBy({{ left: direction * step, behavior: "smooth" }});
-  }}
+  }};
 
   function saveScroll() {{
     const row = document.getElementById(ROW_ID);
     if (!row) return;
-    try {{ localStorage.setItem(STORAGE_KEY, String(row.scrollLeft)); }} catch(e) {{}}
+    try {{ localStorage.setItem(STORAGE_KEY, String(row.scrollLeft)); }} catch (e) {{}}
   }}
 
   function restoreScroll() {{
@@ -1578,32 +1573,45 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
     try {{
       const v = localStorage.getItem(STORAGE_KEY);
       if (v !== null) row.scrollLeft = Number(v) || 0;
-    }} catch(e) {{}}
+    }} catch (e) {{}}
   }}
 
   async function fetchAll24h() {{
-    // 1 request за всички символи
-    const url = "https://api.binance.com/api/v3/ticker/24hr";
-    const r = await fetch(url, {{ cache: "no-store" }});
-    if (!r.ok) throw new Error("Binance fetch failed: " + r.status);
-    return await r.json();
+    const urls = [
+      "https://api.binance.com/api/v3/ticker/24hr",
+      "https://data-api.binance.vision/api/v3/ticker/24hr"
+    ];
+    let lastErr = null;
+
+    for (const url of urls) {{
+      try {{
+        const r = await fetch(url, {{ cache: "no-store" }});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return await r.json();
+      }} catch (e) {{
+        lastErr = e;
+      }}
+    }}
+    throw lastErr;
   }}
 
-  function updateDom(map) {
-    for (const sym of SYMBOLS) {
-        if (sym.endsWith("=X")) continue;
+  function updateDom(map) {{
+    for (const sym of SYMBOLS) {{
+      if (sym.endsWith("=X")) continue;
+
       const data = map.get(sym);
       if (!data) continue;
 
       const last = Number(data.lastPrice);
       const pct = Number(data.priceChangePercent);
 
-      const lastEl = document.querySelector(`[data-symbol="${{sym}}"][data-field="last"]`);
-      const pctEl  = document.querySelector(`[data-symbol="${{sym}}"][data-field="changePct"]`);
-      const chgEl  = document.querySelector(`[data-symbol="${{sym}}"][data-field="chgClass"]`);
+      const lastEl = document.querySelector(`[data-symbol="${sym}"][data-field="last"]`);
+      const pctEl  = document.querySelector(`[data-symbol="${sym}"][data-field="changePct"]`);
+      const chgEl  = document.querySelector(`[data-symbol="${sym}"][data-field="chgClass"]`);
 
       if (lastEl) lastEl.textContent = fmtPrice(last);
       if (pctEl) pctEl.textContent = (isFinite(pct) ? pct.toFixed(2) : "...") + "%";
+
       if (chgEl) {{
         chgEl.classList.remove("up", "down");
         if (isFinite(pct)) chgEl.classList.add(pct >= 0 ? "up" : "down");
@@ -1619,20 +1627,19 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
         if (item && item.symbol) map.set(item.symbol, item);
       }}
       updateDom(map);
-    }} catch(e) {{
-      // ако Binance е блокиран/timeout, просто не обновяваме
-      // може да добавим индикатор, ако искаш
+    }} catch (e) {{
+      // ignore
     }}
   }}
 
   function init() {{
     const row = document.getElementById(ROW_ID);
     if (row) {{
-      row.addEventListener("scroll", () => saveScroll(), {{ passive: true }});
+      row.addEventListener("scroll", saveScroll, {{ passive: true }});
       restoreScroll();
     }}
     tick();
-    setInterval(tick, 3000); // обновяване на 3 секунди
+    setInterval(tick, 3000);
   }}
 
   if (document.readyState === "loading") {{
@@ -1642,8 +1649,7 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
   }}
 }})();
 </script>
-"""
-)
+""")
 
 components.html(live_ticker_html, height=120, scrolling=False)
 
@@ -1982,6 +1988,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

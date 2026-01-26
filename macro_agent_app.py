@@ -95,8 +95,8 @@ st.markdown(retro_css, unsafe_allow_html=True)
 # Yahoo Finance assets (by class)
 ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
     "commodity": {
-       "Gold (spot)": "XAUUSD=X",
-        "Silver (spot)": "XAGUSD=X",
+        "Gold (futures)": "GC=F",
+        "Silver (futures)": "SI=F"
 
     },
     "index": {
@@ -146,8 +146,8 @@ BINANCE_TIMEFRAMES = {
 
 # Live ticker – кои символи да показваме хоризонтално (Binance crypto)
 LIVE_TICKER_SYMBOLS = [
-    ("XAUUSD=X", "XAUUSD"),
-    ("XAGUSD=X", "XAGUSD"),
+    ("GC=F", "GOLD"),
+    ("SI=F", "SILVER"),
 
     ("BTCUSDT", "BTC"),
     ("ETHUSDT", "ETH"),
@@ -1535,9 +1535,8 @@ live_ticker_css = """
 yahoo_live_map: Dict[str, Dict[str, float]] = {}
 
 for sym, _ in LIVE_TICKER_SYMBOLS:
-    if not sym.endswith("=X"):
-        continue
-
+    if sym.endswith("USDT"):
+        continue  # това е Binance
     try:
         yahoo_live_map[sym] = fetch_yahoo_live_quote(sym)
     except Exception as e:
@@ -1557,7 +1556,8 @@ for sym, _ in LIVE_TICKER_SYMBOLS:
 
 ticker_items_html = []
 for sym, short in LIVE_TICKER_SYMBOLS:
-    source = "Yahoo" if sym.endswith("=X") else "Binance"
+    source = "Binance" if sym.endswith("USDT") else "Yahoo"
+
 
     # initial values (само за Yahoo; Binance ще се обновява от JS)
     initial_last = "..."
@@ -1664,7 +1664,7 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 
   function updateDom(map) {{
     for (const sym of SYMBOLS) {{
-      if (sym.endsWith("=X")) continue;
+      if (!sym.endsWith("USDT")) continue; // само Binance се обновява от JS
 
       const data = map.get(sym);
       if (!data) continue;
@@ -2057,6 +2057,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

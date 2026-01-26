@@ -428,6 +428,7 @@ def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) ->
 
 def run_analysis_binance(timeframe: str) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
+    errors: List[str] = []
 
     for symbol, meta in BINANCE_SYMBOLS.items():
         try:
@@ -441,30 +442,26 @@ def run_analysis_binance(timeframe: str) -> pd.DataFrame:
                 **sig,
             }
             rows.append(row)
-        except Exception:
-            continue
+        except Exception as e:
+            errors.append(f"{symbol} ({timeframe}): {type(e).__name__}: {e}")
+
+    # покажи първите грешки в UI
+    if errors:
+        with st.expander("Binance debug (first errors)"):
+            st.text("\n".join(errors[:20]))
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df = df[
+    return df[
         [
-            "name",
-            "symbol",
-            "asset_class",
-            "timeframe",
-            "signal",
-            "confidence",
-            "trend",
-            "momentum",
-            "rsi14",
-            "close",
-            "sma50",
-            "sma200",
+            "name","symbol","asset_class","timeframe",
+            "signal","confidence","trend","momentum","rsi14",
+            "close","sma50","sma200",
         ]
     ]
-    return df
+
 
 # ------------------------------------
 # NEWS (NewsAPI) + HISTORY
@@ -1915,6 +1912,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

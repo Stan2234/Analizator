@@ -398,7 +398,8 @@ def get_binance_client(api_key: str, api_secret: str) -> Client:
 
 
 def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) -> pd.DataFrame:
-    client_binance = get_binance_client()
+    client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
     if client is None:
         raise RuntimeError("Binance client not configured")
 
@@ -1645,7 +1646,8 @@ with tab_global:
 with tab_crypto:
     st.subheader("Binance Crypto Signals")
 
-    client_binance = get_binance_client()
+    client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
     if client_binance is None:
         st.error("Binance API keys are not configured or client init failed.")
         df_crypto = pd.DataFrame()
@@ -1916,6 +1918,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

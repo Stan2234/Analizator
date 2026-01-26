@@ -1537,9 +1537,9 @@ for sym, _ in LIVE_TICKER_SYMBOLS:
     if sym.endswith("=X"):
         try:
             yahoo_live_map[sym] = fetch_yahoo_live_quote(sym)
-       except Exception as e:
-        yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
-        st.session_state["yahoo_live_errors"][sym] = str(e)
+        except Exception as e:
+            yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
+            st.session_state["yahoo_live_errors"][sym] = str(e)
 
 
 binance_live_map = {}
@@ -2053,6 +2053,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

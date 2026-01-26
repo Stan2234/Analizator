@@ -16,7 +16,8 @@ from bs4 import BeautifulSoup
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="AI Macro Agent", layout="wide")
-
+if "yahoo_live_errors" not in st.session_state:
+    st.session_state["yahoo_live_errors"] = {}
 def password_gate():
     if "auth" not in st.session_state:
         st.session_state.auth = False
@@ -1374,10 +1375,10 @@ def show_fomc_lab():
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
     url = YAHOO_CHART_URL.format(symbol)
-    params = {"range": "5d", "interval": "5m"}  # по-стабилно от 1d/1m
+    params = {"range": "1d", "interval": "1m"}
     headers = {"User-Agent": "Mozilla/5.0"}
 
     r = requests.get(url, params=params, headers=headers, timeout=15)
@@ -1386,24 +1387,35 @@ def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
 
     result = (data.get("chart", {}) or {}).get("result") or []
     if not result:
-        raise ValueError(f"No Yahoo chart result for {symbol}")
+        raise ValueError(f"No Yahoo chart result for {symbol}. chart.error={data.get('chart', {}).get('error')}")
 
-    result = result[0]
-    meta = result.get("meta", {}) or {}
+    res0 = result[0]
+    meta = res0.get("meta", {}) or {}
 
-    regular = meta.get("regularMarketPrice")
-    prev_close = meta.get("previousClose")
+    # 1) опит: meta regularMarketPrice / previousClose
+    last = meta.get("regularMarketPrice", None)
+    prev_close = meta.get("previousClose", None)
 
-    # fallback: последен close от quote
-    indicators = (result.get("indicators", {}) or {}).get("quote", [{}])[0]
-    closes = indicators.get("close") or []
-    last_close = next((x for x in reversed(closes) if x is not None), None)
+    # 2) fallback: вземи последния не-None close от indicators
+    if last is None or prev_close is None:
+        quotes = (res0.get("indicators", {}) or {}).get("quote", []) or []
+        closes = (quotes[0] or {}).get("close", []) if quotes else []
+        closes_clean = [c for c in closes if c is not None]
 
-    last = float(regular) if regular not in (None, 0, "0") else float(last_close or 0.0)
-    prev_close = float(prev_close) if prev_close not in (None, 0, "0") else float(last_close or last or 0.0)
+        if last is None and closes_clean:
+            last = closes_clean[-1]
+        if prev_close is None and len(closes_clean) >= 2:
+            prev_close = closes_clean[-2]
 
-    pct = ((last - prev_close) / prev_close) * 100.0 if prev_close else 0.0
+    if last is None or prev_close is None:
+        raise ValueError(f"Yahoo meta missing prices for {symbol}. meta keys={list(meta.keys())[:20]}")
+
+    last = float(last)
+    prev_close = float(prev_close)
+
+    pct = ((last - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
     return {"last": last, "pct": pct}
+
 
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -1525,8 +1537,10 @@ for sym, _ in LIVE_TICKER_SYMBOLS:
     if sym.endswith("=X"):
         try:
             yahoo_live_map[sym] = fetch_yahoo_live_quote(sym)
-        except Exception:
-            yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
+       except Exception as e:
+        yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
+        st.session_state["yahoo_live_errors"][sym] = str(e)
+
 
 binance_live_map = {}
 for sym, _ in LIVE_TICKER_SYMBOLS:
@@ -1701,6 +1715,8 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 """)
 
 components.html(live_ticker_html, height=120, scrolling=False)
+with st.expander("Yahoo Live Debug"):
+    st.write(st.session_state.get("yahoo_live_errors", {}))
 
 
 
@@ -2037,6 +2053,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -381,32 +381,33 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
 # BINANCE LAYER
 # ------------------------------------
 
-
 @st.cache_resource(show_spinner=False)
-@st.cache_resource(show_spinner=False)
-def get_binance_client(api_key: str, api_secret: str) -> Client:
-    api_key = (api_key or "").strip()
-    api_secret = (api_secret or "").strip()
-
-    # Публичен клиент (работи без ключове)
-    if not api_key or not api_secret:
-        return Client()
-
-    # Клиент с ключове
-    return Client(api_key=api_key, api_secret=api_secret)
-
-
-
-def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) -> pd.DataFrame:
-    client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
-
-    if client is None:
-        raise RuntimeError("Binance client not configured")
-
+def get_binance_client(api_key: str, api_secret: str):
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        api_key = (api_key or "").strip()
+        api_secret = (api_secret or "").strip()
+
+        # Дори без ключове, python-binance пак прави ping() и може да гръмне,
+        # затова го пазим в try/except
+        if not api_key or not api_secret:
+            return None
+
+        return Client(api_key=api_key, api_secret=api_secret)
+
     except Exception as e:
-        raise RuntimeError(f"Error fetching klines for {symbol}: {e}")
+        st.session_state["binance_client_error"] = str(e)
+        return None
+
+
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    klines = r.json()
 
     if not klines:
         raise ValueError(f"No klines for {symbol}")
@@ -414,18 +415,8 @@ def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) ->
     df = pd.DataFrame(
         klines,
         columns=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "qav",
-            "num_trades",
-            "taker_base_vol",
-            "taker_quote_vol",
-            "ignore",
+            "open_time","open","high","low","close","volume","close_time",
+            "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
         ],
     )
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
@@ -1647,31 +1638,36 @@ with tab_crypto:
     st.subheader("Binance Crypto Signals")
 
     client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
-
     if client_binance is None:
-        st.error("Binance API keys are not configured or client init failed.")
-        df_crypto = pd.DataFrame()
-    else:
-        col_left, col_right = st.columns([1, 3])
+        err = st.session_state.get("binance_client_error", "")
+        st.warning("Binance private client not available (keys/permissions/endpoint). Using public endpoints for klines.")
+        if err:
+            st.caption(f"Client init error: {err}")
 
-        with col_left:
-            timeframe_label = st.selectbox(
-                "Timeframe",
-                options=list(BINANCE_TIMEFRAMES.keys()),
-                index=0,
-            )
-            refresh_crypto = st.button("🔄 Refresh crypto signals")
-            st.write("Data: Binance klines, limit 500.")
-            st.write("Logic: SMA50 / SMA200 + RSI14.")
+    col_left, col_right = st.columns([1, 3])
 
+    with col_left:
+        timeframe_label = st.selectbox(
+            "Timeframe",
+            options=list(BINANCE_TIMEFRAMES.keys()),
+            index=0,
+            key="crypto_timeframe_label",
+        )
+        refresh_crypto = st.button("🔄 Refresh crypto signals", key="refresh_crypto_btn")
+        st.write("Data: Binance klines, limit 500.")
+        st.write("Logic: SMA50 / SMA200 + RSI14.")
+
+    with col_right:
+        # Run / load cached session results
         if "df_signals_binance" not in st.session_state or refresh_crypto:
             tf = BINANCE_TIMEFRAMES[timeframe_label]
             df_crypto = run_analysis_binance(tf)
             st.session_state["df_signals_binance"] = df_crypto
+            st.session_state["df_signals_binance_tf"] = tf
         else:
             df_crypto = st.session_state["df_signals_binance"]
 
-        if df_crypto.empty:
+        if df_crypto is None or df_crypto.empty:
             st.error("No Binance crypto results.")
         else:
             def color_terminal_c(row):
@@ -1689,6 +1685,7 @@ with tab_crypto:
                     f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
                     f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
                 )
+
 
 # -------- NEWS TAB --------
 with tab_news:
@@ -1918,6 +1915,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

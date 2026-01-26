@@ -95,8 +95,9 @@ body, .stApp {
 # Yahoo Finance assets (by class)
 ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
     "commodity": {
-        "Gold (futures)": "GC=F",
-        "Silver (futures)": "SI=F",
+       "Gold (spot)": "XAUUSD=X",
+        "Silver (spot)": "XAGUSD=X",
+
     },
     "index": {
         "S&P 500 index": "^GSPC",
@@ -134,11 +135,6 @@ BINANCE_SYMBOLS: Dict[str, Dict[str, str]] = {
     "SOLUSDT": {"display": "SOL", "class": "crypto_spot"},
     "ADAUSDT": {"display": "ADA", "class": "crypto_spot"},
     "XRPUSDT": {"display": "XRP", "class": "crypto_spot"},
-    "LINKUSDT": {"display": "LINK", "class": "crypto_spot"},
-    "AVAXUSDT": {"display": "AVAX", "class": "crypto_spot"},
-    "MATICUSDT": {"display": "MATIC", "class": "crypto_spot"},
-    "INJUSDT": {"display": "INJ", "class": "crypto_spot"},
-    "LAZIOUSDT": {"display": "LAZIO", "class": "fan_token"},
 }
 
 BINANCE_TIMEFRAMES = {
@@ -150,18 +146,17 @@ BINANCE_TIMEFRAMES = {
 
 # Live ticker – кои символи да показваме хоризонтално (Binance crypto)
 LIVE_TICKER_SYMBOLS = [
+    ("XAUUSD=X", "XAUUSD"),
+    ("XAGUSD=X", "XAGUSD"),
+
     ("BTCUSDT", "BTC"),
     ("ETHUSDT", "ETH"),
     ("BNBUSDT", "BNB"),
     ("SOLUSDT", "SOL"),
     ("ADAUSDT", "ADA"),
     ("XRPUSDT", "XRP"),
-    ("LINKUSDT", "LINK"),
-    ("AVAXUSDT", "AVAX"),
-    ("MATICUSDT", "MATIC"),
-    ("INJUSDT", "INJ"),
-    ("LAZIOUSDT", "LAZIO"),
 ]
+
 
 NEWS_KEYWORDS: List[str] = [
     "Bitcoin",
@@ -1383,6 +1378,34 @@ st.markdown(retro_css, unsafe_allow_html=True)
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
+    # Взимаме 1d/1m за да имаме последна цена + предишен close
+    url = YAHOO_CHART_URL.format(symbol)
+    params = {"range": "1d", "interval": "1m"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    result = (data.get("chart", {}) or {}).get("result") or []
+    if not result:
+        raise ValueError(f"No Yahoo chart result for {symbol}")
+
+    result = result[0]
+    meta = result.get("meta", {}) or {}
+
+    last = float(meta.get("regularMarketPrice") or 0.0)
+    prev_close = float(meta.get("previousClose") or 0.0)
+
+    if prev_close > 0:
+        pct = ((last - prev_close) / prev_close) * 100.0
+    else:
+        pct = 0.0
+
+    return {"last": last, "pct": pct}
+
 # ===== LIVE TICKER HORIZONTAL (CRYPTO, YAHOO STYLE) =====
 
 live_ticker_css = """
@@ -1465,23 +1488,50 @@ live_ticker_css = """
 </style>
 """
 
+# 1) Дърпаме Yahoo live само за металите
+yahoo_live_map: Dict[str, Dict[str, float]] = {}
+for sym, _ in LIVE_TICKER_SYMBOLS:
+    if sym.endswith("=X"):
+        try:
+            yahoo_live_map[sym] = fetch_yahoo_live_quote(sym)
+        except Exception:
+            yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
+
 ticker_items_html = []
 for sym, short in LIVE_TICKER_SYMBOLS:
+    source = "Yahoo" if sym.endswith("=X") else "Binance"
+
+    # initial values (само за Yahoo; Binance ще се обновява от JS)
+    initial_last = "..." 
+    initial_pct = "..."
+    initial_class = ""
+
+    if source == "Yahoo":
+        q = yahoo_live_map.get(sym, {})
+        last = q.get("last")
+        pct = q.get("pct")
+        if isinstance(last, (int, float)) and last == last:  # not NaN
+            initial_last = f"{last:.4f}"
+        if isinstance(pct, (int, float)) and pct == pct:
+            initial_pct = f"{pct:.2f}%"
+            initial_class = "up" if pct >= 0 else "down"
+
     item_html = f"""
-<div class="ticker-item" data-symbol="{sym}">
+<div class="ticker-item" data-symbol="{sym}" data-source="{source}">
   <div class="ticker-header">
     <div class="ticker-symbol">{short}</div>
-    <div class="ticker-source">Binance</div>
+    <div class="ticker-source">{source}</div>
   </div>
   <div class="ticker-price-row">
-    <div class="ticker-price" data-symbol="{sym}" data-field="last">...</div>
-    <div class="ticker-change" data-symbol="{sym}" data-field="chgClass">
-      <span data-symbol="{sym}" data-field="changePct">...</span>
+    <div class="ticker-price" data-symbol="{sym}" data-field="last">{initial_last}</div>
+    <div class="ticker-change {initial_class}" data-symbol="{sym}" data-field="chgClass">
+      <span data-symbol="{sym}" data-field="changePct">{initial_pct}</span>
     </div>
   </div>
 </div>
 """
     ticker_items_html.append(item_html)
+
 
 symbols_js = [sym for sym, _ in LIVE_TICKER_SYMBOLS]
 
@@ -1539,8 +1589,9 @@ live_ticker_html = live_ticker_css + textwrap.dedent(
     return await r.json();
   }}
 
-  function updateDom(map) {{
-    for (const sym of SYMBOLS) {{
+  function updateDom(map) {
+    for (const sym of SYMBOLS) {
+        if (sym.endsWith("=X")) continue;
       const data = map.get(sym);
       if (!data) continue;
 
@@ -1931,6 +1982,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -739,7 +739,7 @@ Constraints:
         context = base_ctx + "\n\n" + focus_block
 
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context},
@@ -814,7 +814,7 @@ for one specific asset at a time.
         context = base_ctx + "\n\n" + user_block
 
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context},
@@ -1099,7 +1099,7 @@ PRESS CONFERENCE EXCERPTS (may be empty):
 """
 
     completion = client.chat.completions.create(
-        model="gpt-5.1",
+        model=OPENAI_MODEL,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_msg},
@@ -1931,6 +1931,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -1374,11 +1374,10 @@ def show_fomc_lab():
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
-    # Взимаме 1d/1m за да имаме последна цена + предишен close
     url = YAHOO_CHART_URL.format(symbol)
-    params = {"range": "1d", "interval": "1m"}
+    params = {"range": "5d", "interval": "5m"}  # по-стабилно от 1d/1m
     headers = {"User-Agent": "Mozilla/5.0"}
 
     r = requests.get(url, params=params, headers=headers, timeout=15)
@@ -1392,15 +1391,49 @@ def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
     result = result[0]
     meta = result.get("meta", {}) or {}
 
-    last = float(meta.get("regularMarketPrice") or 0.0)
-    prev_close = float(meta.get("previousClose") or 0.0)
+    regular = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose")
 
-    if prev_close > 0:
-        pct = ((last - prev_close) / prev_close) * 100.0
-    else:
-        pct = 0.0
+    # fallback: последен close от quote
+    indicators = (result.get("indicators", {}) or {}).get("quote", [{}])[0]
+    closes = indicators.get("close") or []
+    last_close = next((x for x in reversed(closes) if x is not None), None)
 
+    last = float(regular) if regular not in (None, 0, "0") else float(last_close or 0.0)
+    prev_close = float(prev_close) if prev_close not in (None, 0, "0") else float(last_close or last or 0.0)
+
+    pct = ((last - prev_close) / prev_close) * 100.0 if prev_close else 0.0
     return {"last": last, "pct": pct}
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def fetch_binance_24h_quote(symbol: str) -> Dict[str, float]:
+    base_urls = [
+        "https://data-api.binance.vision",
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+    ]
+    params = {"symbol": symbol}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    last_err = None
+    for base in base_urls:
+        try:
+            url = f"{base}/api/v3/ticker/24hr"
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            return {
+                "last": float(j.get("lastPrice", 0.0)),
+                "pct": float(j.get("priceChangePercent", 0.0)),
+            }
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Binance 24h quote failed for {symbol}: {last_err}")
 
 # ===== LIVE TICKER HORIZONTAL (CRYPTO, YAHOO STYLE) =====
 
@@ -1485,7 +1518,9 @@ live_ticker_css = """
 """
 
 # 1) Дърпаме Yahoo live само за металите
-yahoo_live_map: Dict[str, Dict[str, float]] = {}
+# --- LIVE PRICE MAPS (INITIAL VALUES) ---
+
+yahoo_live_map = {}
 for sym, _ in LIVE_TICKER_SYMBOLS:
     if sym.endswith("=X"):
         try:
@@ -1493,24 +1528,38 @@ for sym, _ in LIVE_TICKER_SYMBOLS:
         except Exception:
             yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
 
+binance_live_map = {}
+for sym, _ in LIVE_TICKER_SYMBOLS:
+    if not sym.endswith("=X"):
+        try:
+            binance_live_map[sym] = fetch_binance_24h_quote(sym)
+        except Exception:
+            binance_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
+
+
 ticker_items_html = []
 for sym, short in LIVE_TICKER_SYMBOLS:
     source = "Yahoo" if sym.endswith("=X") else "Binance"
 
     # initial values (само за Yahoo; Binance ще се обновява от JS)
-    initial_last = "..." 
+    initial_last = "..."
     initial_pct = "..."
     initial_class = ""
 
     if source == "Yahoo":
         q = yahoo_live_map.get(sym, {})
-        last = q.get("last")
-        pct = q.get("pct")
-        if isinstance(last, (int, float)) and last == last:  # not NaN
-            initial_last = f"{last:.4f}"
-        if isinstance(pct, (int, float)) and pct == pct:
-            initial_pct = f"{pct:.2f}%"
-            initial_class = "up" if pct >= 0 else "down"
+    else:
+        q = binance_live_map.get(sym, {})
+
+    last = q.get("last")
+    pct = q.get("pct")
+
+    if isinstance(last, (int, float)) and last == last:
+        initial_last = f"{last:.4f}"
+    if isinstance(pct, (int, float)) and pct == pct:
+        initial_pct = f"{pct:.2f}%"
+        initial_class = "up" if pct >= 0 else "down"
+
 
     item_html = f"""
 <div class="ticker-item" data-symbol="{sym}" data-source="{source}">
@@ -1988,6 +2037,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -2049,8 +2049,8 @@ with col_right:
             user_question=user_question,
     )
 
-    st.markdown("---")
-    st.markdown(answer)
+        st.markdown("---")
+        st.markdown(answer)
 
 
 # ================= END OF APP LAYOUT =================
@@ -2061,6 +2061,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -2034,19 +2034,19 @@ with col_right:
     )
 
     if st.button("🚀 Run AI analysis"):
-    asset_for_ai = "" if target_asset == "(none)" else target_asset
+        asset_for_ai = "" if target_asset == "(none)" else target_asset
 
     # ✅ ВИНАГИ взимай новини при AI анализа (с fallback към history при 429/грешка)
-    news_items_for_ai = aggregate_news(NEWS_KEYWORDS)
-    st.session_state["news_items"] = news_items_for_ai
+        news_items_for_ai = aggregate_news(NEWS_KEYWORDS)
+        st.session_state["news_items"] = news_items_for_ai
 
-    answer = run_ai_analyst(
-        df_global=df_global_for_ai,
-        df_crypto=df_crypto_for_ai,
-        news_items=news_items_for_ai,
-        target_asset=asset_for_ai,
-        horizon=horizon,
-        user_question=user_question,
+        answer = run_ai_analyst(
+            df_global=df_global_for_ai,
+            df_crypto=df_crypto_for_ai,
+            news_items=news_items_for_ai,
+            target_asset=asset_for_ai,
+            horizon=horizon,
+            user_question=user_question,
     )
 
     st.markdown("---")
@@ -2061,6 +2061,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

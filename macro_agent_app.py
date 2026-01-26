@@ -383,17 +383,22 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
 
 
 @st.cache_resource(show_spinner=False)
-def get_binance_client() -> Optional[Client]:
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None
-    try:
-        return Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-    except Exception:
-        return None
+@st.cache_resource(show_spinner=False)
+def get_binance_client(api_key: str, api_secret: str) -> Client:
+    api_key = (api_key or "").strip()
+    api_secret = (api_secret or "").strip()
+
+    # Публичен клиент (работи без ключове)
+    if not api_key or not api_secret:
+        return Client()
+
+    # Клиент с ключове
+    return Client(api_key=api_key, api_secret=api_secret)
+
 
 
 def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) -> pd.DataFrame:
-    client = get_binance_client()
+    client_binance = get_binance_client()
     if client is None:
         raise RuntimeError("Binance client not configured")
 
@@ -1911,6 +1916,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

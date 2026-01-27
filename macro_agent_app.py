@@ -1207,7 +1207,7 @@ except json.JSONDecodeError:
         "error": "JSON parsing failed",
         "raw_response": raw,
     }
-    return data
+        return data
 
 
 
@@ -2094,6 +2094,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

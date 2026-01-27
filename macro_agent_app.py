@@ -1189,21 +1189,34 @@ JSON output example:
 """
 
     completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": press_text},
-        ],
-        temperature=0.25,
-        max_completion_tokens=1100,
-    )
+    model=OPENAI_MODEL,
+    response_format={"type": "json_object"},
+    messages=[
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ],
+    temperature=0.1,
+    max_completion_tokens=1200,
+)
 
-    raw = completion.choices[0].message.content or ""
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"error": "JSON parsing failed", "raw_response": raw}
+raw = completion.choices[0].message.content
+
+# ✅ ЗАДЪЛЖИТЕЛНА ЗАЩИТА
+if not raw or not raw.strip():
+    return {
+        "error": "Empty response from OpenAI model"
+    }
+
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    data = {
+        "error": "JSON parsing failed",
+        "raw_response": raw,
+    }
+
+return data
+
 
 
 # ------------------------------------
@@ -2088,6 +2101,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -1199,14 +1199,7 @@ JSON output example:
     max_completion_tokens=1200,
 )
 
-raw = completion.choices[0].message.content
-
-# ✅ ЗАДЪЛЖИТЕЛНА ЗАЩИТА
-if not raw or not raw.strip():
-    return {
-        "error": "Empty response from OpenAI model"
-    }
-
+raw = completion.choices[0].message.content or ""
 try:
     data = json.loads(raw)
 except json.JSONDecodeError:
@@ -1214,8 +1207,8 @@ except json.JSONDecodeError:
         "error": "JSON parsing failed",
         "raw_response": raw,
     }
-
 return data
+
 
 
 
@@ -2101,6 +2094,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

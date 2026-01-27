@@ -1188,7 +1188,7 @@ JSON output example:
 }
 """
 
-completion = client.chat.completions.create(
+    completion = client.chat.completions.create(
         model=OPENAI_MODEL,
         response_format={"type": "json_object"},
         messages=[
@@ -1199,11 +1199,11 @@ completion = client.chat.completions.create(
         max_completion_tokens=1200,
     )
 
-raw = completion.choices[0].message.content or ""
-try:
-    return json.loads(raw)
-except json.JSONDecodeError:
-    return {
+    raw = completion.choices[0].message.content or ""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {
             "error": "JSON parsing failed",
             "raw_response": raw,
         }
@@ -2094,6 +2094,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

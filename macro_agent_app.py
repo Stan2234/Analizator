@@ -1061,44 +1061,38 @@ You are an expert macro and FOMC analyst.
 
 Goal:
 - Read the CURRENT FOMC statement and (optionally) the PREVIOUS statement and PRESS CONFERENCE excerpts.
-- Produce a trading-oriented macro interpretation: hawkish/dovish evaluation, key changes, market implications, and a short actionable playbook.
-- You ARE allowed to express opinions and probabilistic expectations derived from the provided text.
+- Produce a trading-oriented macro interpretation: hawkish/dovish evaluation, key changes, and market implications.
 
-Hard rules:
-- Return ONLY valid JSON (no markdown, no extra text).
-- Base all factual claims ONLY on the provided text. Do NOT invent quotes or facts.
+Rules:
+- Return ONLY valid JSON. No markdown, no comments, no extra text.
+- Do NOT invent facts or quotes not present in the input.
+- Opinions and probabilistic interpretations ARE allowed.
 - Use probability-based language, not certainty.
-- If previous_text or pressconf_text is empty, still return the full JSON with best-effort fields.
 
 Allowed values:
 - tone_change: more_hawkish, more_dovish, similar
 - trade_bias: risk_on, risk_off, mixed
 
 Numeric constraints:
-- hawk_dove_score must be between -5 and +5 (can be decimal).
-- focus fields must be integers 0-10.
+- hawk_dove_score: -5 to +5
+- focus fields: integers 0–10
 
-JSON output example (follow this structure exactly):
+Output MUST strictly follow this JSON structure:
+
 {
   "hawk_dove_score": 0,
   "tone_change": "similar",
-  "key_changes": ["..."],
-  "key_quotes": ["..."],
+  "key_changes": [],
   "inflation_focus": 0,
   "labor_market_focus": 0,
   "growth_risk_focus": 0,
   "financial_stability_focus": 0,
-  "summary": "...",
+  "summary": "",
   "trade_bias": "mixed",
-  "scenarios": [
-    { "name": "Base case", "probability": 60, "description": "..." },
-    { "name": "Alt case", "probability": 25, "description": "..." },
-    { "name": "Risk case", "probability": 15, "description": "..." }
-  ],
   "playbook": {
-    "before_event": "...",
-    "first_15min": "...",
-    "next_24h": "..."
+    "before_event": "",
+    "first_15min": "",
+    "next_24h": ""
   }
 }
 """
@@ -2094,6 +2088,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

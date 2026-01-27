@@ -1044,17 +1044,12 @@ def analyze_fomc_with_gpt(
     pressconf_text: str = "",
 ) -> Dict[str, Any]:
     """
-    Анализира FOMC statement + пресконференция с модел (gpt-5.1).
-    Връща САМО валиден JSON dict: score, тон, ключови промени, quotes, bias, сценарии.
+    Анализира FOMC statement + пресконференция.
+    Връща САМО валиден JSON dict със score, тон, ключови промени и трейдинг implications.
     """
     client = get_openai_client()
     if client is None:
         return {"error": "OpenAI client is not configured (missing OPENAI_API_KEY)."}
-
-    # IMPORTANT:
-    # 1) В system_msg НЕ използваме // коментари и "a" | "b" синтаксис, за да не чупи JSON output-а.
-    # 2) Даваме валиден JSON EXAMPLE + Allowed values като текст.
-    # 3) Разрешаваме мнение/интерпретация и вероятностни сценарии (без "absolute certainty").
 
     system_msg = """
 You are an expert macro and FOMC analyst.
@@ -1062,11 +1057,11 @@ You are an expert macro and FOMC analyst.
 Goal:
 - Read the CURRENT FOMC statement and (optionally) the PREVIOUS statement and PRESS CONFERENCE excerpts.
 - Produce a trading-oriented macro interpretation: hawkish/dovish evaluation, key changes, and market implications.
+- Opinions and probabilistic interpretations ARE allowed, but do NOT invent facts or quotes.
 
 Rules:
 - Return ONLY valid JSON. No markdown, no comments, no extra text.
-- Do NOT invent facts or quotes not present in the input.
-- Opinions and probabilistic interpretations ARE allowed.
+- Base factual claims ONLY on the provided text.
 - Use probability-based language, not certainty.
 
 Allowed values:
@@ -1074,11 +1069,10 @@ Allowed values:
 - trade_bias: risk_on, risk_off, mixed
 
 Numeric constraints:
-- hawk_dove_score: -5 to +5
+- hawk_dove_score: -5 to +5 (can be decimal)
 - focus fields: integers 0–10
 
 Output MUST strictly follow this JSON structure:
-
 {
   "hawk_dove_score": 0,
   "tone_change": "similar",
@@ -1097,7 +1091,6 @@ Output MUST strictly follow this JSON structure:
 }
 """
 
-    # USER payload: ясно разграничение + инструкции да цитира кратко (за да намалим халюцинации)
     user_msg = f"""
 CURRENT FOMC STATEMENT:
 {current_text}
@@ -1109,29 +1102,47 @@ PRESS CONFERENCE EXCERPTS (may be empty):
 {pressconf_text}
 
 Instructions:
-- key_changes: list the most important wording changes or emphasis shifts (max 8 bullets).
-- key_quotes: short direct excerpts taken ONLY from the provided text (max 6, keep them short).
-- summary: 3-6 sentences. Mention what changed and what it implies.
-- scenarios: probabilities must sum to 100 (integers). Provide concise descriptions.
-- playbook: be specific (volatility expectation, rates/USD/risk assets bias, tactical behavior).
+- key_changes: max 8 bullet items, focus on wording changes/emphasis.
+- summary: 3-6 sentences, what changed + what it implies.
+- playbook: mention volatility + rates/USD/risk-assets bias + tactical behavior.
 """
 
     completion = client.chat.completions.create(
-        model="gpt-5.1",
+        model=OPENAI_MODEL,  # ако искаш gpt-5.1, направи OPENAI_MODEL="gpt-5.1"
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.2,              # 0.1-0.3 е по-добро за по-силен анализ без да се разпада JSON-а
-        max_completion_tokens=1400,   # малко повече, защото добавихме scenarios + quotes
+        temperature=0.1,
+        max_completion_tokens=1200,
     )
 
-    raw = completion.choices[0].message.content or ""
+    msg = completion.choices[0].message
+    raw = msg.content
+    refusal = getattr(msg, "refusal", None)
+
+    if refusal:
+        return {"error": "Model refusal / blocked output", "refusal": refusal}
+
+    if raw is None or not str(raw).strip():
+        try:
+            debug = msg.model_dump()
+        except Exception:
+            debug = str(msg)
+        return {"error": "Empty response from OpenAI model", "debug_message": debug}
+
+    raw = str(raw)
+
+    # Ако по някаква причина raw вече е dict (рядко), върни го директно
+    if isinstance(raw, dict):
+        return raw
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         data = {"error": "JSON parsing failed", "raw_response": raw}
+
     return data
 
 
@@ -1166,24 +1177,24 @@ Allowed values:
 - overall_tone: hawkish, dovish, neutral, mixed
 - trade_bias: risk_on, risk_off, mixed
 
-JSON output example:
+Output MUST strictly follow this JSON structure:
 {
   "event": "FOMC Press Conference",
   "topics": [
     {
-      "topic": "...",
-      "summary": "...",
+      "topic": "",
+      "summary": "",
       "stance": "neutral",
-      "market_take": "..."
+      "market_take": ""
     }
   ],
   "overall_tone": "mixed",
-  "implied_change_vs_previous": "...",
+  "implied_change_vs_previous": "",
   "trade_bias": "mixed",
   "scenarios": [
-    { "name": "Base case", "probability": 60, "description": "..." },
-    { "name": "Alt case", "probability": 25, "description": "..." },
-    { "name": "Risk case", "probability": 15, "description": "..." }
+    { "name": "Base case", "probability": 60, "description": "" },
+    { "name": "Alt case", "probability": 25, "description": "" },
+    { "name": "Risk case", "probability": 15, "description": "" }
   ]
 }
 """
@@ -1199,39 +1210,29 @@ JSON output example:
         max_completion_tokens=1200,
     )
 
-   msg = completion.choices[0].message
+    msg = completion.choices[0].message
+    raw = msg.content
+    refusal = getattr(msg, "refusal", None)
 
-raw = msg.content
-refusal = getattr(msg, "refusal", None)
+    if refusal:
+        return {"error": "Model refusal / blocked output", "refusal": refusal}
 
-if refusal:
-    return {
-        "error": "Model refusal / blocked output",
-        "refusal": refusal
-    }
+    if raw is None or not str(raw).strip():
+        try:
+            debug = msg.model_dump()
+        except Exception:
+            debug = str(msg)
+        return {"error": "Empty response from OpenAI model", "debug_message": debug}
 
-if raw is None or not str(raw).strip():
+    raw = str(raw)
+
     try:
-        debug = msg.model_dump()
-    except Exception:
-        debug = str(msg)
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {"error": "JSON parsing failed", "raw_response": raw}
 
-    return {
-        "error": "Empty response from OpenAI model",
-        "debug_message": debug
-    }
+    return data
 
-raw = str(raw)
-
-try:
-    data = json.loads(raw)
-except json.JSONDecodeError:
-    data = {
-        "error": "JSON parsing failed",
-        "raw_response": raw,
-    }
-
-return data
 
 
 
@@ -2117,6 +2118,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -1199,16 +1199,39 @@ JSON output example:
         max_completion_tokens=1200,
     )
 
-    raw = completion.choices[0].message.content or ""
+   msg = completion.choices[0].message
+
+raw = msg.content
+refusal = getattr(msg, "refusal", None)
+
+if refusal:
+    return {
+        "error": "Model refusal / blocked output",
+        "refusal": refusal
+    }
+
+if raw is None or not str(raw).strip():
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {
-            "error": "JSON parsing failed",
-            "raw_response": raw,
-        }
+        debug = msg.model_dump()
+    except Exception:
+        debug = str(msg)
 
+    return {
+        "error": "Empty response from OpenAI model",
+        "debug_message": debug
+    }
 
+raw = str(raw)
+
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    data = {
+        "error": "JSON parsing failed",
+        "raw_response": raw,
+    }
+
+return data
 
 
 
@@ -2094,6 +2117,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

@@ -1038,50 +1038,72 @@ def get_latest_fomc_statements(year: Optional[int] = None):
 # FOMC ANALYZER (GPT-5.1)
 # ------------------------------------
 
-
 def analyze_fomc_with_gpt(
     current_text: str,
     previous_text: str = "",
     pressconf_text: str = "",
 ) -> Dict[str, Any]:
     """
-    Анализира FOMC statement + пресконференция с най-новия модел (gpt-5.1).
-    Връща структурирано JSON-подобно dict с score, тон, ключови фрази и трейдинг bias.
+    Анализира FOMC statement + пресконференция с модел (gpt-5.1).
+    Връща САМО валиден JSON dict: score, тон, ключови промени, quotes, bias, сценарии.
     """
     client = get_openai_client()
     if client is None:
-        return {
-            "error": "OpenAI client is not configured (missing OPENAI_API_KEY)."
-        }
+        return {"error": "OpenAI client is not configured (missing OPENAI_API_KEY)."}
+
+    # IMPORTANT:
+    # 1) В system_msg НЕ използваме // коментари и "a" | "b" синтаксис, за да не чупи JSON output-а.
+    # 2) Даваме валиден JSON EXAMPLE + Allowed values като текст.
+    # 3) Разрешаваме мнение/интерпретация и вероятностни сценарии (без "absolute certainty").
 
     system_msg = """
 You are an expert macro and FOMC analyst.
-Your job is to read the current FOMC statement (and optionally the previous one and press conference excerpts),
-evaluate how hawkish or dovish it is, and summarise the key changes and trading implications.
 
-You MUST return ONLY valid JSON. No extra commentary, no markdown.
+Goal:
+- Read the CURRENT FOMC statement and (optionally) the PREVIOUS statement and PRESS CONFERENCE excerpts.
+- Produce a trading-oriented macro interpretation: hawkish/dovish evaluation, key changes, market implications, and a short actionable playbook.
+- You ARE allowed to express opinions and probabilistic expectations derived from the provided text.
 
-JSON schema:
+Hard rules:
+- Return ONLY valid JSON (no markdown, no extra text).
+- Base all factual claims ONLY on the provided text. Do NOT invent quotes or facts.
+- Use probability-based language, not certainty.
+- If previous_text or pressconf_text is empty, still return the full JSON with best-effort fields.
+
+Allowed values:
+- tone_change: more_hawkish, more_dovish, similar
+- trade_bias: risk_on, risk_off, mixed
+
+Numeric constraints:
+- hawk_dove_score must be between -5 and +5 (can be decimal).
+- focus fields must be integers 0-10.
+
+JSON output example (follow this structure exactly):
 {
-  "hawk_dove_score": number,        // -5 (very dovish) to +5 (very hawkish)
-  "tone_change": "more_hawkish" | "more_dovish" | "similar",
-  "key_changes": [
-    "..."
+  "hawk_dove_score": 0,
+  "tone_change": "similar",
+  "key_changes": ["..."],
+  "key_quotes": ["..."],
+  "inflation_focus": 0,
+  "labor_market_focus": 0,
+  "growth_risk_focus": 0,
+  "financial_stability_focus": 0,
+  "summary": "...",
+  "trade_bias": "mixed",
+  "scenarios": [
+    { "name": "Base case", "probability": 60, "description": "..." },
+    { "name": "Alt case", "probability": 25, "description": "..." },
+    { "name": "Risk case", "probability": 15, "description": "..." }
   ],
-  "inflation_focus": number,        // 0–10
-  "labor_market_focus": number,     // 0–10
-  "growth_risk_focus": number,      // 0–10
-  "financial_stability_focus": number, // 0–10
-  "summary": string,
-  "trade_bias": "risk_on" | "risk_off" | "mixed",
   "playbook": {
-    "before_event": string,
-    "first_15min": string,
-    "next_24h": string
+    "before_event": "...",
+    "first_15min": "...",
+    "next_24h": "..."
   }
 }
 """
 
+    # USER payload: ясно разграничение + инструкции да цитира кратко (за да намалим халюцинации)
     user_msg = f"""
 CURRENT FOMC STATEMENT:
 {current_text}
@@ -1091,70 +1113,84 @@ PREVIOUS FOMC STATEMENT (may be empty):
 
 PRESS CONFERENCE EXCERPTS (may be empty):
 {pressconf_text}
+
+Instructions:
+- key_changes: list the most important wording changes or emphasis shifts (max 8 bullets).
+- key_quotes: short direct excerpts taken ONLY from the provided text (max 6, keep them short).
+- summary: 3-6 sentences. Mention what changed and what it implies.
+- scenarios: probabilities must sum to 100 (integers). Provide concise descriptions.
+- playbook: be specific (volatility expectation, rates/USD/risk assets bias, tactical behavior).
 """
 
     completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model="gpt-5.1",
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.1,
-        max_completion_tokens=1200,
+        temperature=0.2,              # 0.1-0.3 е по-добро за по-силен анализ без да се разпада JSON-а
+        max_completion_tokens=1400,   # малко повече, защото добавихме scenarios + quotes
     )
 
     raw = completion.choices[0].message.content or ""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        data = {
-            "error": "JSON parsing failed",
-            "raw_response": raw,
-        }
+        data = {"error": "JSON parsing failed", "raw_response": raw}
     return data
 
 
 # ------------------------------------
-# FOMC PRESS CONFERENCE — LEVEL 2 (Key Topics)
+# FOMC PRESS CONFERENCE — LEVEL 2 (Topics + Market Read)
 # ------------------------------------
 
 def extract_fomc_pressconf_topics(press_text: str) -> Dict[str, Any]:
     """
     LEVEL 2:
-    Extracts WHAT was discussed in the FOMC press conference.
-    No market prediction, no bias.
+    Extracts WHAT was discussed in the FOMC press conference + interpretive market read.
+    (Позволяваме мнение и вероятностни реакции, без да халюцинира факти.)
     """
     client = get_openai_client()
     if client is None or not press_text.strip():
-        return {
-            "error": "No press conference text available or OpenAI not configured."
-        }
+        return {"error": "No press conference text available or OpenAI not configured."}
 
     system_prompt = """
-You are a Federal Reserve press conference analyst.
+You are a Federal Reserve press conference macro analyst.
 
-Rules:
-- Extract WHAT was discussed
-- Do NOT predict markets
-- Do NOT give opinions
-- Do NOT invent facts
-- Omit topics not mentioned
+Goal:
+- Extract the main topics discussed in the press conference.
+- Provide a market-oriented interpretation of the tone and implications.
 
-Return ONLY valid JSON.
+Hard rules:
+- Return ONLY valid JSON (no markdown, no extra text).
+- Do NOT invent facts, questions, or quotes not present in the provided text.
+- You MAY interpret tone and likely market reaction in probabilistic language.
 
-JSON schema:
+Allowed values:
+- stance: hawkish, dovish, neutral
+- overall_tone: hawkish, dovish, neutral, mixed
+- trade_bias: risk_on, risk_off, mixed
+
+JSON output example:
 {
   "event": "FOMC Press Conference",
   "topics": [
     {
-      "topic": string,
-      "summary": string,
-      "stance": "hawkish" | "dovish" | "neutral"
+      "topic": "...",
+      "summary": "...",
+      "stance": "neutral",
+      "market_take": "..."
     }
   ],
-  "overall_tone": "hawkish" | "dovish" | "neutral" | "mixed",
-  "implied_change_vs_previous": string
+  "overall_tone": "mixed",
+  "implied_change_vs_previous": "...",
+  "trade_bias": "mixed",
+  "scenarios": [
+    { "name": "Base case", "probability": 60, "description": "..." },
+    { "name": "Alt case", "probability": 25, "description": "..." },
+    { "name": "Risk case", "probability": 15, "description": "..." }
+  ]
 }
 """
 
@@ -1165,18 +1201,15 @@ JSON schema:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": press_text},
         ],
-        temperature=0.2,
-        max_completion_tokens=900,
+        temperature=0.25,
+        max_completion_tokens=1100,
     )
 
     raw = completion.choices[0].message.content or ""
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return {
-            "error": "JSON parsing failed",
-            "raw_response": raw,
-        }
+        return {"error": "JSON parsing failed", "raw_response": raw}
 
 
 # ------------------------------------
@@ -2061,6 +2094,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

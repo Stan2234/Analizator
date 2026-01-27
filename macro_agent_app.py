@@ -1200,10 +1200,10 @@ completion = client.chat.completions.create(
     )
 
 raw = completion.choices[0].message.content or ""
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {
+try:
+    return json.loads(raw)
+except json.JSONDecodeError:
+    return {
             "error": "JSON parsing failed",
             "raw_response": raw,
         }
@@ -2094,6 +2094,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

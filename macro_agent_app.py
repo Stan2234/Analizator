@@ -441,6 +441,12 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
             "close",
             "sma50",
             "sma200",
+            "lambda_year",
+            "avg_jump_pct",
+            "jump_vol_pct",
+            "sigma_diffusion_pct",
+            "jump_risk_score",
+            "jumps_count",
         ]
     ]
     return df
@@ -2200,6 +2206,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

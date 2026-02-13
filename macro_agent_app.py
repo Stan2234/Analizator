@@ -531,6 +531,7 @@ def quant_metrics_to_brief(symbol: str, source: str, timeframe: str, lookback_da
             lines.append(f"- {k}: {qm.get(k)}")
     return "\n".join(lines)
 
+@st.cache_data(ttl=60, show_spinner=False)
 def run_quant_gpt_analysis(brief: str) -> str:
     client = get_openai_client()
     if client is None:
@@ -2504,6 +2505,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

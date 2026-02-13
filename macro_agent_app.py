@@ -5,7 +5,7 @@ import textwrap  # за да махнем водещите интервали о
 import json
 import re
 import html as ihtml
-
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -217,6 +217,71 @@ def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     return rsi
 
 
+def compute_jump_diffusion_metrics(
+    close: pd.Series,
+    bars_per_year: int = 252,
+    jump_z: float = 3.0,
+) -> Dict[str, Any]:
+    """
+    Practical jump-diffusion diagnostics (Merton-style) from log returns.
+
+    - Identifies "jumps" as returns with |z| >= jump_z (z-score on log returns).
+    - Estimates:
+      lambda_year: expected number of jumps per year
+      avg_jump_pct: average jump size in %
+      jump_vol_pct: variability of jump sizes in %
+      sigma_diffusion_pct: diffusion (non-jump) annualized-ish vol in %
+      jump_risk_score: lambda_year * abs(avg_jump_pct)  (simple risk score)
+    """
+    s = close.dropna().astype(float)
+    if len(s) < 120:
+        return {
+            "lambda_year": None,
+            "avg_jump_pct": None,
+            "jump_vol_pct": None,
+            "sigma_diffusion_pct": None,
+            "jump_risk_score": None,
+            "jumps_count": 0,
+        }
+
+    r = np.log(s).diff().dropna()  # log returns
+    if len(r) < 60 or float(r.std()) == 0.0:
+        return {
+            "lambda_year": None,
+            "avg_jump_pct": None,
+            "jump_vol_pct": None,
+            "sigma_diffusion_pct": None,
+            "jump_risk_score": None,
+            "jumps_count": 0,
+        }
+
+    z = (r - r.mean()) / (r.std() + 1e-12)
+    jump_mask = z.abs() >= float(jump_z)
+
+    r_jump = r[jump_mask]
+    r_norm = r[~jump_mask]
+
+    jumps_count = int(r_jump.shape[0])
+    lambda_year = (jumps_count / max(len(r), 1)) * float(bars_per_year)
+
+    jump_moves_pct = (np.exp(r_jump) - 1.0) * 100.0 if jumps_count > 0 else np.array([])
+    avg_jump_pct = float(np.mean(jump_moves_pct)) if jumps_count > 0 else 0.0
+    jump_vol_pct = float(np.std(jump_moves_pct)) if jumps_count > 1 else 0.0
+
+    sigma_diffusion = float(r_norm.std()) * np.sqrt(float(bars_per_year)) if len(r_norm) > 5 else None
+    sigma_diffusion_pct = float((np.exp(sigma_diffusion) - 1.0) * 100.0) if sigma_diffusion is not None else None
+
+    jump_risk_score = float(lambda_year * abs(avg_jump_pct))
+
+    return {
+        "lambda_year": round(lambda_year, 2),
+        "avg_jump_pct": round(avg_jump_pct, 2),
+        "jump_vol_pct": round(jump_vol_pct, 2),
+        "sigma_diffusion_pct": round(sigma_diffusion_pct, 2) if sigma_diffusion_pct is not None else None,
+        "jump_risk_score": round(jump_risk_score, 2),
+        "jumps_count": jumps_count,
+    }
+
 def basic_signal_from_series(close: pd.Series) -> Dict[str, Any]:
     df = pd.DataFrame({"Close": close})
     df["sma50"] = df["Close"].rolling(50).mean()
@@ -330,14 +395,23 @@ def analyze_yahoo_asset(name: str, ticker: str, asset_class: str) -> Optional[Di
     try:
         df = fetch_yahoo_history(ticker, range_str="1y", interval="1d", max_points=DAYS_BACK)
         sig = basic_signal_from_series(df["close"])
+
+        jm = compute_jump_diffusion_metrics(
+            df["close"],
+            bars_per_year=252,   # Yahoo 1D
+            jump_z=3.0
+        )
+
         return {
             "name": name,
             "ticker": ticker,
             "asset_class": asset_class,
             **sig,
+            **jm,
         }
     except Exception:
         return None
+
 
 
 def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
@@ -444,37 +518,38 @@ def run_analysis_binance(timeframe: str) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     errors: List[str] = []
 
+    bars_map = {"1d": 252, "4h": 252 * 6, "1h": 252 * 24, "15m": 252 * 24 * 4}
+
     for symbol, meta in BINANCE_SYMBOLS.items():
         try:
             df = fetch_binance_klines(symbol, interval=timeframe, limit=500)
             sig = basic_signal_from_series(df["close"])
+
+            bpy = bars_map.get(timeframe, 252)
+
+            jm = compute_jump_diffusion_metrics(
+                df["close"],
+                bars_per_year=bpy,
+                jump_z=3.0
+            )
+
             row = {
                 "symbol": symbol,
                 "name": meta["display"],
                 "asset_class": meta["class"],
                 "timeframe": timeframe,
                 **sig,
+                **jm,
             }
             rows.append(row)
         except Exception as e:
             errors.append(f"{symbol} ({timeframe}): {type(e).__name__}: {e}")
 
-    # покажи първите грешки в UI
     if errors:
-        with st.expander("Binance debug (first errors)"):
-            st.text("\n".join(errors[:20]))
+        st.warning("Some Binance symbols failed:\n" + "\n".join(errors))
 
-    if not rows:
-        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
-    return df[
-        [
-            "name","symbol","asset_class","timeframe",
-            "signal","confidence","trend","momentum","rsi14",
-            "close","sma50","sma200",
-        ]
-    ]
 
 
 # ------------------------------------
@@ -650,20 +725,27 @@ def df_to_brief(df: pd.DataFrame, label: str) -> str:
         for c in df_local.columns
         if c
         in [
-            "name",
-            "ticker",
-            "symbol",
-            "asset_class",
-            "timeframe",
-            "signal",
-            "confidence",
-            "trend",
-            "momentum",
-            "rsi14",
-            "close",
-            "sma50",
-            "sma200",
-        ]
+    "name",
+    "ticker",
+    "symbol",
+    "asset_class",
+    "timeframe",
+    "signal",
+    "confidence",
+    "trend",
+    "momentum",
+    "rsi14",
+    "close",
+    "sma50",
+    "sma200",
+    "lambda_year",
+    "avg_jump_pct",
+    "jump_vol_pct",
+    "sigma_diffusion_pct",
+    "jump_risk_score",
+    "jumps_count",
+]
+
     ]
     return df_local[cols].to_string(index=False)
 
@@ -2118,6 +2200,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

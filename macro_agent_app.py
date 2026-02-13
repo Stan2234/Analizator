@@ -342,6 +342,228 @@ def basic_signal_from_series(close: pd.Series) -> Dict[str, Any]:
 
 
 # ------------------------------------
+# QUANT HELPERS (Quant Lab)
+# ------------------------------------
+
+def parse_selected_asset_to_symbol(asset_label: str) -> str:
+    # asset_label пример: "NVIDIA (NVDA)" или "BTC (BTCUSDT)" или "(choose)"
+    if not asset_label or asset_label == "(choose)":
+        return ""
+    m = re.search(r"\(([^)]+)\)\s*$", str(asset_label).strip())
+    if m:
+        return m.group(1).strip()
+    return asset_label.strip()
+
+def detect_source_for_symbol(symbol: str, preferred: str = "Auto") -> str:
+    # preferred: Auto/Yahoo/Binance
+    if preferred and preferred != "Auto":
+        return preferred
+    # Auto logic:
+    if symbol.endswith("USDT"):
+        return "Binance"
+    return "Yahoo"
+
+def bars_per_year_for_timeframe(source: str, timeframe: str) -> int:
+    # rough trading bars/year for annualization
+    if source == "Yahoo":
+        return 252
+    # Binance
+    bars_map = {"1d": 252, "4h": 252 * 6, "1h": 252 * 24, "15m": 252 * 24 * 4}
+    return int(bars_map.get(timeframe, 252))
+
+def bars_per_day_for_tf(source: str, timeframe: str) -> int:
+    if source == "Yahoo":
+        return 1
+    mpd = {"1d": 1, "4h": 6, "1h": 24, "15m": 96}
+    return int(mpd.get(timeframe, 1))
+
+def fetch_close_series_for_quant(symbol: str, source: str, timeframe: str, lookback_days: int) -> pd.Series:
+    if source == "Yahoo":
+        # range_str подбираме грубо
+        if lookback_days <= 365:
+            range_str = "1y"
+        elif lookback_days <= 730:
+            range_str = "2y"
+        else:
+            range_str = "5y"
+        df = fetch_yahoo_history(symbol, range_str=range_str, interval="1d", max_points=lookback_days)
+        s = df["close"].dropna().astype(float)
+        return s
+
+    # Binance
+    mpd = bars_per_day_for_tf("Binance", timeframe)
+    bars_needed = int(lookback_days * mpd)
+    # public endpoint limit practical: 1000
+    limit = int(min(1000, max(200, bars_needed)))
+    df = fetch_binance_klines(symbol, interval=timeframe, limit=limit)
+    s = df["close"].dropna().astype(float)
+    # ако bars_needed > limit, просто ще работим с това което имаме
+    return s
+
+def max_drawdown_from_close(close: pd.Series) -> float:
+    s = close.dropna().astype(float)
+    if len(s) < 5:
+        return 0.0
+    peak = s.cummax()
+    dd = (s / peak) - 1.0
+    return float(dd.min())
+
+def hurst_exponent(close: pd.Series, max_lag: int = 20) -> Optional[float]:
+    s = close.dropna().astype(float)
+    if len(s) < 120:
+        return None
+    lags = range(2, max_lag + 1)
+    tau = []
+    for lag in lags:
+        diff = s.diff(lag).dropna()
+        tau.append(np.sqrt(np.std(diff)))
+    if not tau or any(t <= 0 for t in tau):
+        return None
+    poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
+    return float(poly[0] * 2.0)
+
+def monte_carlo_forward_distribution(
+    close: pd.Series,
+    horizon_bars: int,
+    sims: int = 5000,
+) -> Dict[str, Any]:
+    s = close.dropna().astype(float)
+    if len(s) < 60 or horizon_bars < 1:
+        return {}
+    r = np.log(s).diff().dropna()
+    mu = float(r.mean())
+    sigma = float(r.std())
+    s0 = float(s.iloc[-1])
+
+    # 1-step aggregated horizon using normal approximation (OK for quant dashboard)
+    z = np.random.normal(loc=0.0, scale=1.0, size=sims)
+    rh = (mu * horizon_bars) + (sigma * np.sqrt(horizon_bars) * z)
+    st = s0 * np.exp(rh)
+
+    p10 = float(np.percentile(st, 10))
+    p50 = float(np.percentile(st, 50))
+    p90 = float(np.percentile(st, 90))
+    expv = float(np.mean(st))
+
+    return {"mc_p10": p10, "mc_p50": p50, "mc_p90": p90, "mc_mean": expv}
+
+def compute_quant_metrics(
+    close: pd.Series,
+    bars_per_year: int,
+    jump_z: float,
+    horizon_bars: int,
+) -> Dict[str, Any]:
+    s = close.dropna().astype(float)
+    if len(s) < 80:
+        return {"error": "Not enough data for quant metrics."}
+
+    r = np.log(s).diff().dropna()
+
+    # realized vol annualized
+    realized_vol = float(r.std() * np.sqrt(float(bars_per_year))) if len(r) > 5 else None
+
+    # skew/kurtosis (pandas)
+    skew = float(r.skew()) if len(r) > 10 else None
+    kurt = float(r.kurt()) if len(r) > 10 else None
+
+    # VaR/CVaR 95% (on returns)
+    var95 = float(np.percentile(r, 5)) if len(r) > 20 else None
+    cvar95 = float(r[r <= var95].mean()) if (var95 is not None and (r <= var95).any()) else None
+
+    # drawdown
+    mdd = max_drawdown_from_close(s)
+
+    # vol regime (simple)
+    regime = None
+    if realized_vol is not None:
+        if realized_vol < 0.15:
+            regime = "LOW_VOL"
+        elif realized_vol < 0.30:
+            regime = "NORMAL_VOL"
+        else:
+            regime = "HIGH_VOL"
+
+    # hurst
+    h = hurst_exponent(s, max_lag=20)
+
+    # jump-diffusion pack (uses your existing function)
+    jm = compute_jump_diffusion_metrics(s, bars_per_year=bars_per_year, jump_z=jump_z)
+
+    # Monte Carlo horizon distribution
+    mc = monte_carlo_forward_distribution(s, horizon_bars=horizon_bars, sims=5000)
+
+    out = {
+        "last_price": float(s.iloc[-1]),
+        "n_bars": int(len(s)),
+        "realized_vol_annual": round(realized_vol, 4) if realized_vol is not None else None,
+        "skew": round(skew, 4) if skew is not None else None,
+        "kurtosis": round(kurt, 4) if kurt is not None else None,
+        "VaR_95_logret": round(var95, 6) if var95 is not None else None,
+        "CVaR_95_logret": round(cvar95, 6) if cvar95 is not None else None,
+        "max_drawdown": round(mdd, 4),
+        "hurst": round(h, 4) if h is not None else None,
+        "vol_regime": regime,
+        **jm,
+        **mc,
+    }
+    return out
+
+def quant_metrics_to_brief(symbol: str, source: str, timeframe: str, lookback_days: int, horizon_label: str, qm: Dict[str, Any]) -> str:
+    # brief text for GPT (numbers only)
+    keys = [
+        "last_price","n_bars",
+        "realized_vol_annual","vol_regime",
+        "skew","kurtosis","max_drawdown","hurst",
+        "lambda_year","avg_jump_pct","jump_vol_pct","sigma_diffusion_pct","jump_risk_score","jumps_count",
+        "mc_p10","mc_p50","mc_p90","mc_mean",
+        "VaR_95_logret","CVaR_95_logret",
+    ]
+    lines = [
+        f"SYMBOL: {symbol}",
+        f"SOURCE: {source}",
+        f"TIMEFRAME: {timeframe}",
+        f"LOOKBACK_DAYS: {lookback_days}",
+        f"HORIZON: {horizon_label}",
+        "METRICS:"
+    ]
+    for k in keys:
+        if k in qm:
+            lines.append(f"- {k}: {qm.get(k)}")
+    return "\n".join(lines)
+
+def run_quant_gpt_analysis(brief: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        return "Quant GPT analysis error: OpenAI client not configured."
+
+    system_prompt = """
+You are a quantitative trading analyst.
+
+Rules:
+- Use ONLY the numbers provided in the brief. Do not invent prices, indicators, or news.
+- Explain what the metrics imply about: volatility regime, jump risk, tail risk, trend vs mean-reversion tendency.
+- Provide 3 strategy-style playbooks (rule-based), NOT investment advice and NOT position sizing.
+- Be explicit about limitations and what would invalidate the read.
+Output structure:
+1) Regime Summary
+2) Risk Profile (jumps/tails/drawdown)
+3) Scenario ranges (use Monte Carlo percentiles)
+4) Strategy Playbooks (3)
+5) Red flags / invalidation
+"""
+
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": brief},
+        ],
+        max_completion_tokens=2000,
+        temperature=0.25,
+    )
+    return completion.choices[0].message.content.strip()
+
+# ------------------------------------
 # YAHOO PRICE DATA
 # ------------------------------------
 
@@ -1875,8 +2097,9 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_crypto, tab_news, tab_ai, tab_fomc = st.tabs(
-    ["🌍 Global Signals", "🪙 Crypto (Binance)", "📰 News & Macro", "🤖 AI Analyst", "🏛 FOMC Lab"]
+tab_global, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
+    ["🌍 Global Signals", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab"]
+
 )
 
 # -------- GLOBAL TAB --------
@@ -2113,6 +2336,81 @@ with tab_news:
                         st.write(item["description"])
                     st.markdown("---")
 
+                    
+# -------- QUANT TAB --------
+with tab_quant:
+    st.subheader("🧮 Quant Lab — Quantitative Market Analysis (Yahoo + Binance)")
+
+    df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
+    df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
+
+    asset_options: List[str] = ["(choose)"]
+
+    if not df_global_for_q.empty:
+        asset_options.extend(
+            df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
+        )
+    if not df_crypto_for_q.empty:
+        asset_options.extend(
+            df_crypto_for_q["name"].astype(str) + " (" + df_crypto_for_q["symbol"].astype(str) + ")"
+        )
+
+    asset_options = sorted(set(asset_options))
+
+    colA, colB, colC = st.columns(3)
+    with colA:
+        focus_asset = st.selectbox("Asset:", options=asset_options, index=0)
+        source_pref = st.selectbox("Source:", options=["Auto", "Yahoo", "Binance"], index=0)
+
+    with colB:
+        lookback_days = st.slider("Lookback (days):", 90, 730, 365, 30)
+        jump_z = st.slider("Jump threshold (z):", 2.0, 5.0, 3.0, 0.25)
+
+    with colC:
+        tf_binance = st.selectbox("Binance timeframe:", options=["1d", "4h", "1h", "15m"], index=0)
+        horizon_label = st.selectbox("Horizon:", options=["1 day", "1 week", "1 month"], index=1)
+
+    run_quant = st.button("🧮 Run Quant Analysis", type="primary")
+
+    if run_quant:
+        sym = parse_selected_asset_to_symbol(focus_asset)
+        if not sym:
+            st.warning("Select an asset.")
+        else:
+            source = detect_source_for_symbol(sym, preferred=source_pref)
+
+            # horizon bars
+            mpd = bars_per_day_for_tf(source, tf_binance)
+            if horizon_label == "1 day":
+                horizon_bars = 1 * mpd
+            elif horizon_label == "1 week":
+                horizon_bars = 7 * mpd
+            else:
+                horizon_bars = 30 * mpd
+
+            # timeframe used
+            tf_used = "1d" if source == "Yahoo" else tf_binance
+            bpy = bars_per_year_for_timeframe(source, tf_used)
+
+            try:
+                close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days)
+                qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z), horizon_bars=int(horizon_bars))
+
+                if "error" in qm:
+                    st.error(qm["error"])
+                else:
+                    st.markdown("### Quant Metrics")
+                    st.dataframe(pd.DataFrame([qm]), use_container_width=True)
+
+                    st.markdown("---")
+                    st.markdown("### GPT Quant Analysis (based ONLY on the numbers above)")
+                    brief = quant_metrics_to_brief(sym, source, tf_used, lookback_days, horizon_label, qm)
+                    gpt_text = run_quant_gpt_analysis(brief)
+                    st.markdown(gpt_text)
+
+            except Exception as e:
+                st.error(f"Quant Lab error: {type(e).__name__}: {e}")
+
 # -------- AI TAB (можеш да го ползваш по-късно за други модули) --------
 with tab_ai:
     st.subheader("AI Market Analyst (bottom of page)")
@@ -2206,6 +2504,7 @@ st.write(
     "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
     "or run the AI Market Analyst."
 )
+
 
 
 

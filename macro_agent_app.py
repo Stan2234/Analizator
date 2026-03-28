@@ -14,6 +14,8 @@ from binance.client import Client
 from openai import OpenAI
 from bs4 import BeautifulSoup
 import streamlit.components.v1 as components
+import pdfplumber
+import io
 
 st.set_page_config(page_title="AI Macro Agent", layout="wide")
 if "yahoo_live_errors" not in st.session_state:
@@ -1809,6 +1811,17 @@ def init_fomc_state():
         st.session_state["fomc_press"] = ""
 
 
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract all text from an uploaded PDF file."""
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return "\n\n".join(text_parts)
+
+
 def show_fomc_lab():
     if "fomc_current" not in st.session_state:
         st.session_state["fomc_current"] = ""
@@ -1859,6 +1872,57 @@ def show_fomc_lab():
         if auto:
             st.session_state["fomc_press"] = auto
 
+    # ── PDF UPLOAD SECTION ──
+    st.markdown("#### 📄 Upload PDF files (or paste text below)")
+    pdf_col1, pdf_col2, pdf_col3 = st.columns(3)
+    with pdf_col1:
+        pdf_current = st.file_uploader(
+            "Current FOMC Statement (PDF)",
+            type=["pdf"],
+            key="pdf_current_upload",
+        )
+        if pdf_current is not None:
+            with st.spinner("Extracting text from current statement PDF..."):
+                extracted = extract_text_from_pdf(pdf_current)
+            if extracted.strip():
+                st.session_state["fomc_current"] = extracted
+                st.success(f"Extracted {len(extracted):,} characters from PDF")
+            else:
+                st.warning("Could not extract text from this PDF (may be scanned/image-based).")
+
+    with pdf_col2:
+        pdf_previous = st.file_uploader(
+            "Previous FOMC Statement (PDF)",
+            type=["pdf"],
+            key="pdf_previous_upload",
+        )
+        if pdf_previous is not None:
+            with st.spinner("Extracting text from previous statement PDF..."):
+                extracted = extract_text_from_pdf(pdf_previous)
+            if extracted.strip():
+                st.session_state["fomc_previous"] = extracted
+                st.success(f"Extracted {len(extracted):,} characters from PDF")
+            else:
+                st.warning("Could not extract text from this PDF.")
+
+    with pdf_col3:
+        pdf_press = st.file_uploader(
+            "Press Conference Transcript (PDF)",
+            type=["pdf"],
+            key="pdf_press_upload",
+        )
+        if pdf_press is not None:
+            with st.spinner("Extracting text from press conference PDF..."):
+                extracted = extract_text_from_pdf(pdf_press)
+            if extracted.strip():
+                st.session_state["fomc_press"] = extracted
+                st.success(f"Extracted {len(extracted):,} characters from PDF")
+            else:
+                st.warning("Could not extract text from this PDF.")
+
+    st.markdown("---")
+
+    # ── TEXT AREAS (auto-filled from PDF or manual paste) ──
     col1, col2 = st.columns(2)
     with col1:
         current_text = st.text_area(

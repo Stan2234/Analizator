@@ -1467,6 +1467,145 @@ Rules:
         return f"AI analysis error: {e}"
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def run_asset_deep_analysis(
+    asset_name: str,
+    asset_type: str,
+    signal_data: Dict[str, Any],
+    quant_data: Dict[str, Any],
+    momentum_data: Dict[str, Any],
+    regime_data: Dict[str, Any],
+    tail_data: Dict[str, Any],
+    mean_rev_data: Dict[str, Any],
+) -> str:
+    client = get_openai_client()
+    if client is None:
+        return "AI analysis error: OpenAI client not configured."
+
+    brief_lines = [f"ASSET: {asset_name}", f"TYPE: {asset_type}", "", "SIGNAL DATA:"]
+    for k, v in signal_data.items():
+        brief_lines.append(f"  {k}: {v}")
+    brief_lines.append("")
+    brief_lines.append("QUANT METRICS:")
+    for k, v in quant_data.items():
+        brief_lines.append(f"  {k}: {v}")
+    brief_lines.append("")
+    brief_lines.append("MOMENTUM:")
+    for k, v in momentum_data.items():
+        brief_lines.append(f"  {k}: {v}")
+    brief_lines.append("")
+    brief_lines.append("REGIME:")
+    for k, v in regime_data.items():
+        brief_lines.append(f"  {k}: {v}")
+    brief_lines.append("")
+    brief_lines.append("TAIL RISK:")
+    for k, v in tail_data.items():
+        brief_lines.append(f"  {k}: {v}")
+    brief_lines.append("")
+    brief_lines.append("MEAN REVERSION:")
+    for k, v in mean_rev_data.items():
+        brief_lines.append(f"  {k}: {v}")
+
+    brief = "\n".join(brief_lines)
+
+    asset_context = ""
+    if asset_type == "currency":
+        asset_context = """
+Context: This is a FOREX currency pair. Consider:
+- Central bank policy differentials (Fed, ECB, BoJ, BoE, etc.)
+- Interest rate differentials and carry trade dynamics
+- Trade balance and current account flows
+- Risk sentiment (risk-on vs risk-off flows)
+- Commodity linkages (AUD, CAD, NOK = commodity currencies)
+- Safe haven dynamics (JPY, CHF, USD in crisis)
+- Purchasing power parity and fair value models
+"""
+    elif asset_type == "crypto":
+        asset_context = """
+Context: This is a CRYPTOCURRENCY. Consider:
+- On-chain metrics implications (hashrate, active addresses, whale flows)
+- DeFi TVL and ecosystem growth for relevant chains
+- Regulatory environment and institutional adoption
+- Bitcoin dominance and altcoin rotation cycles
+- Liquidity conditions (Fed policy, stablecoin supply)
+- Halving cycles and supply dynamics (for BTC)
+- Network upgrades and protocol changes
+- Correlation to risk assets (Nasdaq, SPX) and inverse USD
+"""
+
+    system_prompt = f"""
+You are a senior portfolio manager at a top systematic hedge fund.
+Produce a comprehensive, institutional-grade analysis of the given asset.
+{asset_context}
+Use ONLY the data provided. Do NOT invent prices, levels, or indicators.
+
+Output format (markdown):
+
+## VERDICT
+One-line: BULLISH / BEARISH / NEUTRAL with conviction (High/Medium/Low) and 1-sentence reason.
+
+## TECHNICAL STRUCTURE
+- Trend analysis (SMA alignment, ADX strength)
+- Momentum (RSI, MACD, Stochastic interpretation)
+- Mean reversion status (Z-scores, O-U half-life)
+- Volatility regime and what it means for positioning
+
+## RISK ASSESSMENT
+- Tail risk profile (Sortino, Calmar, max drawdown context)
+- Jump risk (frequency, expected size)
+- Current regime risk level
+
+## SCENARIOS (next 1-4 weeks)
+| Scenario | Probability | Trigger | Expected Move |
+|----------|-------------|---------|---------------|
+| Bull     | %           | ...     | ...           |
+| Base     | %           | ...     | ...           |
+| Bear     | %           | ...     | ...           |
+
+## STRATEGY PLAYBOOK
+- **Scalper / Day Trader:** ...
+- **Swing Trader (1-4 weeks):** ...
+- **Position Trader (1-3 months):** ...
+
+## KEY LEVELS & WATCHPOINTS
+What specific conditions would change this view?
+"""
+
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": brief},
+        ],
+        max_completion_tokens=2500,
+        temperature=0.3,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+def run_deep_analysis_for_asset(asset_name: str, asset_type: str, close_series: pd.Series, signal_data: Dict[str, Any]) -> str:
+    """Helper that computes all quant metrics and runs AI analysis for a single asset."""
+    returns = np.log(close_series).diff().dropna()
+    bpy = 252
+
+    qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=3.0, horizon_bars=7)
+    regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns) // 3)))
+    mean_rev = compute_mean_reversion_signals(close_series)
+    mom = compute_momentum_features(close_series)
+    tail = compute_tail_risk_metrics(returns)
+
+    return run_asset_deep_analysis(
+        asset_name=asset_name,
+        asset_type=asset_type,
+        signal_data=signal_data,
+        quant_data=qm,
+        momentum_data=mom,
+        regime_data=regime,
+        tail_data=tail,
+        mean_rev_data=mean_rev,
+    )
+
+
 def run_news_forecast(
     df_global, df_crypto, latest_news_items: List[Dict[str, Any]], focus_asset: str
 ):
@@ -2793,17 +2932,14 @@ tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
 
 # -------- GLOBAL TAB --------
 with tab_global:
-    st.subheader("Global Signals — Yahoo Finance (1D, ~1y history)")
+    st.subheader("🌍 Global Signals — Multi-Asset Dashboard")
 
-    all_classes = list(ASSETS_BY_CLASS.keys())
+    all_classes = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
     selected_classes = st.multiselect(
         "Asset classes to show:",
         options=all_classes,
         default=all_classes,
     )
-
-    st.write("Data source: Yahoo Finance chart API.")
-    st.write("Logic: SMA50 / SMA200 trend + RSI14 momentum.")
 
     refresh = st.button("🔄 Refresh global signals")
 
@@ -2816,123 +2952,432 @@ with tab_global:
     if df_global.empty:
         st.error("No global results. Possibly no data or connection issue.")
     else:
-        def color_terminal(row):
-            return ["color: #00ff00; background-color: #000000;" for _ in row]
+        def color_global_row(row):
+            sig = row.get("signal", "")
+            if "BUY" in str(sig):
+                return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
+            elif "SELL" in str(sig):
+                return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
+            return ["color: #cccccc; background-color: #000000;" for _ in row]
 
-        styled_df = df_global.style.apply(color_terminal, axis=1)
+        styled_df = df_global.style.apply(color_global_row, axis=1)
         st.dataframe(styled_df, use_container_width=True)
 
+        # Signal cards by asset class
         st.markdown("---")
-        st.subheader("Summary")
-        for _, row in df_global.iterrows():
-            st.markdown(
-                f"**{row['name']}** (`{row['ticker']}`) — "
-                f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
-                f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
-                f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
-            )
+        for ac in selected_classes:
+            ac_df = df_global[df_global["asset_class"] == ac]
+            if ac_df.empty:
+                continue
+            st.subheader(f"{ac.title()}")
+            n_cols = min(5, len(ac_df))
+            cols_row = st.columns(n_cols)
+            for i, (_, row) in enumerate(ac_df.iterrows()):
+                col = cols_row[i % n_cols]
+                sig = row["signal"]
+                if "BUY" in sig:
+                    sig_icon = "🟢"
+                elif "SELL" in sig:
+                    sig_icon = "🔴"
+                else:
+                    sig_icon = "⚪"
+                with col:
+                    st.markdown(
+                        f"**{row['name']}**\n\n"
+                        f"{sig_icon} **{sig}**\n\n"
+                        f"Score: `{row.get('score','N/A')}` | RSI: `{row['rsi14']}`\n\n"
+                        f"Close: `{row['close']}`\n\n"
+                        f"Trend: `{row['trend']}` | Mom: `{row['momentum']}`"
+                    )
 
 # -------- FX / CURRENCIES TAB --------
 with tab_fx:
-    st.subheader("💱 Currency Pairs — Live FX Signals (Yahoo Finance)")
-    st.write("Major and emerging market currency pairs. Data: Yahoo Finance, daily timeframe.")
-    st.write("Logic: Multi-indicator scoring (SMA trend + RSI + MACD + Bollinger Bands).")
+    st.subheader("💱 Currencies — Institutional FX Dashboard")
 
-    refresh_fx = st.button("🔄 Refresh FX signals", key="refresh_fx_btn")
+    fx_tab_overview, fx_tab_analysis = st.tabs(["📊 FX Overview", "🔍 Deep Analysis"])
 
-    if "df_signals_fx" not in st.session_state or refresh_fx:
-        fx_rows: List[Dict[str, Any]] = []
-        for name, ticker in ASSETS_BY_CLASS.get("currency", {}).items():
-            r = analyze_yahoo_asset(name, ticker, "currency")
-            if r:
-                fx_rows.append(r)
-        df_fx = pd.DataFrame(fx_rows)
-        if not df_fx.empty:
-            base_cols = [
-                "name", "ticker", "asset_class",
-                "signal", "confidence", "score",
-                "trend", "momentum",
-                "rsi14", "macd_hist", "bb_pct",
-                "close", "sma20", "sma50", "sma200",
-            ]
-            optional_cols = ["adx", "stoch_k", "stoch_d"]
-            cols = [c for c in base_cols if c in df_fx.columns] + [c for c in optional_cols if c in df_fx.columns]
-            df_fx = df_fx[cols]
-        st.session_state["df_signals_fx"] = df_fx
-    else:
-        df_fx = st.session_state["df_signals_fx"]
+    with fx_tab_overview:
+        st.markdown("Major and emerging market currency pairs. Multi-indicator scoring system.")
+        refresh_fx = st.button("🔄 Refresh FX signals", key="refresh_fx_btn")
 
-    if df_fx is None or df_fx.empty:
-        st.error("No FX data available. Check connection.")
-    else:
-        def color_fx_row(row):
-            return ["color: #00ff00; background-color: #000000;" for _ in row]
-        styled_fx = df_fx.style.apply(color_fx_row, axis=1)
-        st.dataframe(styled_fx, use_container_width=True)
+        if "df_signals_fx" not in st.session_state or refresh_fx:
+            fx_rows: List[Dict[str, Any]] = []
+            for name, ticker in ASSETS_BY_CLASS.get("currency", {}).items():
+                r = analyze_yahoo_asset(name, ticker, "currency")
+                if r:
+                    fx_rows.append(r)
+            df_fx = pd.DataFrame(fx_rows)
+            if not df_fx.empty:
+                base_cols = [
+                    "name", "ticker", "asset_class",
+                    "signal", "confidence", "score",
+                    "trend", "momentum",
+                    "rsi14", "macd_hist", "bb_pct",
+                    "close", "sma20", "sma50", "sma200",
+                ]
+                optional_cols = ["adx", "stoch_k", "stoch_d"]
+                cols = [c for c in base_cols if c in df_fx.columns] + [c for c in optional_cols if c in df_fx.columns]
+                df_fx = df_fx[cols]
+            st.session_state["df_signals_fx"] = df_fx
+        else:
+            df_fx = st.session_state["df_signals_fx"]
 
-        st.markdown("---")
-        st.subheader("FX Summary")
-        for _, row in df_fx.iterrows():
-            st.markdown(
-                f"**{row['name']}** (`{row['ticker']}`) — "
-                f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
-                f"Score: `{row.get('score','N/A')}`, "
-                f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
-                f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
-            )
+        if df_fx is None or df_fx.empty:
+            st.error("No FX data available. Check connection.")
+        else:
+            def color_fx_row(row):
+                sig = row.get("signal", "")
+                if "BUY" in str(sig):
+                    return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
+                elif "SELL" in str(sig):
+                    return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
+                return ["color: #cccccc; background-color: #000000;" for _ in row]
+            styled_fx = df_fx.style.apply(color_fx_row, axis=1)
+            st.dataframe(styled_fx, use_container_width=True)
+
+            # Signal summary cards
+            st.markdown("---")
+            st.subheader("FX Signal Board")
+            fx_cols_per_row = 5
+            fx_names = df_fx["name"].tolist()
+            for i in range(0, len(fx_names), fx_cols_per_row):
+                cols_row = st.columns(min(fx_cols_per_row, len(fx_names) - i))
+                for j, col in enumerate(cols_row):
+                    idx = i + j
+                    if idx < len(fx_names):
+                        row = df_fx.iloc[idx]
+                        sig = row["signal"]
+                        if "BUY" in sig:
+                            sig_icon = "🟢"
+                        elif "SELL" in sig:
+                            sig_icon = "🔴"
+                        else:
+                            sig_icon = "⚪"
+                        score_val = row.get("score", "N/A")
+                        with col:
+                            st.markdown(
+                                f"**{row['name']}**\n\n"
+                                f"{sig_icon} **{sig}**\n\n"
+                                f"Score: `{score_val}` | RSI: `{row['rsi14']}`\n\n"
+                                f"Price: `{row['close']}`"
+                            )
+
+    with fx_tab_analysis:
+        st.markdown("### 🔍 Deep FX Analysis — Select a Currency Pair")
+
+        fx_pair_options = list(ASSETS_BY_CLASS.get("currency", {}).keys())
+        if not fx_pair_options:
+            st.warning("No FX pairs configured.")
+        else:
+            selected_fx = st.selectbox("Select currency pair:", fx_pair_options, key="fx_deep_select")
+            fx_ticker = ASSETS_BY_CLASS["currency"][selected_fx]
+
+            if st.button("🚀 Run Deep FX Analysis", key="fx_deep_run", type="primary"):
+                with st.spinner(f"Analyzing {selected_fx}..."):
+                    try:
+                        df_hist = fetch_yahoo_history(fx_ticker, range_str="1y", interval="1d", max_points=365)
+                        h = df_hist["high"] if "high" in df_hist.columns else None
+                        l = df_hist["low"] if "low" in df_hist.columns else None
+                        sig = basic_signal_from_series(df_hist["close"], h, l)
+                        close_s = df_hist["close"].dropna().astype(float)
+                        returns = np.log(close_s).diff().dropna()
+
+                        # Compute all metrics
+                        qm = compute_quant_metrics(close_s, bars_per_year=252, jump_z=3.0, horizon_bars=7)
+                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)))
+                        mean_rev = compute_mean_reversion_signals(close_s)
+                        mom = compute_momentum_features(close_s)
+                        tail = compute_tail_risk_metrics(returns)
+
+                        # Display signal header
+                        sig_val = sig.get("signal", "HOLD")
+                        if "BUY" in sig_val:
+                            sig_color = "🟢"
+                        elif "SELL" in sig_val:
+                            sig_color = "🔴"
+                        else:
+                            sig_color = "⚪"
+
+                        st.markdown(f"## {sig_color} {selected_fx} — {sig_val}")
+
+                        # Key metrics row
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
+                        m1.metric("Price", f"{sig['close']:.5f}")
+                        m2.metric("Score", sig.get("score", "N/A"))
+                        m3.metric("RSI", sig["rsi14"])
+                        m4.metric("Trend", sig["trend"].title())
+                        m5.metric("Vol Regime", regime.get("current_regime", "?"))
+                        m6.metric("Hurst", f"{qm.get('hurst', 'N/A')}")
+
+                        # Momentum
+                        st.markdown("#### Momentum")
+                        if mom:
+                            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                            mc1.metric("5D", f"{mom.get('return_5d_pct', 'N/A')}%")
+                            mc2.metric("1M", f"{mom.get('return_21d_pct', 'N/A')}%")
+                            mc3.metric("3M", f"{mom.get('return_63d_pct', 'N/A')}%")
+                            mc4.metric("6M", f"{mom.get('return_126d_pct', 'N/A')}%")
+                            mc5.metric("12M", f"{mom.get('return_252d_pct', 'N/A')}%")
+
+                        # Mean reversion
+                        st.markdown("#### Mean Reversion")
+                        mr1, mr2, mr3 = st.columns(3)
+                        mr1.metric("Z-Score (20d)", mean_rev.get("z_score_20", "N/A"))
+                        mr2.metric("Z-Score (50d)", mean_rev.get("z_score_50", "N/A"))
+                        hl = mean_rev.get("ou_half_life")
+                        mr3.metric("O-U Half-Life", f"{hl:.0f} days" if hl else "N/A (trending)")
+
+                        # Risk
+                        st.markdown("#### Risk Profile")
+                        if tail:
+                            r1, r2, r3, r4 = st.columns(4)
+                            r1.metric("Sortino", tail.get("sortino_ratio", "N/A"))
+                            r2.metric("Max DD", f"{tail.get('max_drawdown_pct', 'N/A')}%")
+                            r3.metric("Win Rate", f"{tail.get('win_rate_pct', 'N/A')}%")
+                            r4.metric("Tail Ratio", tail.get("tail_ratio", "N/A"))
+
+                        # Monte Carlo
+                        st.markdown("#### Monte Carlo (1 week ahead)")
+                        mc_p10 = qm.get("mc_p10")
+                        mc_p50 = qm.get("mc_p50")
+                        mc_p90 = qm.get("mc_p90")
+                        last_p = qm.get("last_price", 0)
+                        if mc_p10 and last_p:
+                            s1, s2, s3 = st.columns(3)
+                            s1.metric("🔴 Bear (P10)", f"{mc_p10:.5f}", f"{((mc_p10/last_p)-1)*100:+.2f}%")
+                            s2.metric("⚪ Base (P50)", f"{mc_p50:.5f}", f"{((mc_p50/last_p)-1)*100:+.2f}%")
+                            s3.metric("🟢 Bull (P90)", f"{mc_p90:.5f}", f"{((mc_p90/last_p)-1)*100:+.2f}%")
+
+                        # AI Analysis
+                        st.markdown("---")
+                        st.subheader("🧠 AI Deep Analysis")
+                        with st.spinner("Generating institutional-grade FX analysis..."):
+                            ai_text = run_asset_deep_analysis(
+                                asset_name=selected_fx,
+                                asset_type="currency",
+                                signal_data=sig,
+                                quant_data=qm,
+                                momentum_data=mom,
+                                regime_data=regime,
+                                tail_data=tail,
+                                mean_rev_data=mean_rev,
+                            )
+                        st.markdown(ai_text)
+
+                    except Exception as e:
+                        st.error(f"FX analysis error: {type(e).__name__}: {e}")
 
 # -------- CRYPTO TAB --------
 with tab_crypto:
-    st.subheader("Binance Crypto Signals")
+    st.subheader("🪙 Crypto — Institutional Digital Asset Dashboard")
 
-    client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
-    if client_binance is None:
-        err = st.session_state.get("binance_client_error", "")
-        st.warning("Binance private client not available (keys/permissions/endpoint). Using public endpoints for klines.")
-        if err:
-            st.caption(f"Client init error: {err}")
+    crypto_tab_overview, crypto_tab_analysis = st.tabs(["📊 Crypto Overview", "🔍 Deep Analysis"])
 
-    col_left, col_right = st.columns([1, 3])
+    with crypto_tab_overview:
+        client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        if client_binance is None:
+            err = st.session_state.get("binance_client_error", "")
+            st.warning("Binance private client not available. Using public endpoints.")
+            if err:
+                st.caption(f"Client init error: {err}")
 
-    with col_left:
-        timeframe_label = st.selectbox(
-            "Timeframe",
-            options=list(BINANCE_TIMEFRAMES.keys()),
-            index=0,
-            key="crypto_timeframe_label",
-        )
-        refresh_crypto = st.button("🔄 Refresh crypto signals", key="refresh_crypto_btn")
-        st.write("Data: Binance klines, limit 500.")
-        st.write("Logic: SMA50 / SMA200 + RSI14.")
+        col_ctrl, col_data = st.columns([1, 4])
 
-    with col_right:
-        # Run / load cached session results
-        if "df_signals_binance" not in st.session_state or refresh_crypto:
-            tf = BINANCE_TIMEFRAMES[timeframe_label]
-            df_crypto = run_analysis_binance(tf)
-            st.session_state["df_signals_binance"] = df_crypto
-            st.session_state["df_signals_binance_tf"] = tf
-        else:
-            df_crypto = st.session_state["df_signals_binance"]
+        with col_ctrl:
+            timeframe_label = st.selectbox(
+                "Timeframe",
+                options=list(BINANCE_TIMEFRAMES.keys()),
+                index=0,
+                key="crypto_timeframe_label",
+            )
+            refresh_crypto = st.button("🔄 Refresh", key="refresh_crypto_btn")
 
-        if df_crypto is None or df_crypto.empty:
-            st.error("No Binance crypto results.")
-        else:
-            def color_terminal_c(row):
-                return ["color: #00ff00; background-color: #000000;" for _ in row]
+        with col_data:
+            if "df_signals_binance" not in st.session_state or refresh_crypto:
+                tf = BINANCE_TIMEFRAMES[timeframe_label]
+                df_crypto = run_analysis_binance(tf)
+                st.session_state["df_signals_binance"] = df_crypto
+                st.session_state["df_signals_binance_tf"] = tf
+            else:
+                df_crypto = st.session_state["df_signals_binance"]
 
-            styled_df_crypto = df_crypto.style.apply(color_terminal_c, axis=1)
-            st.dataframe(styled_df_crypto, use_container_width=True)
+            if df_crypto is None or df_crypto.empty:
+                st.error("No Binance crypto results.")
+            else:
+                def color_crypto_row(row):
+                    sig = row.get("signal", "")
+                    if "BUY" in str(sig):
+                        return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
+                    elif "SELL" in str(sig):
+                        return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
+                    return ["color: #cccccc; background-color: #000000;" for _ in row]
 
+                styled_crypto = df_crypto.style.apply(color_crypto_row, axis=1)
+                st.dataframe(styled_crypto, use_container_width=True)
+
+        # Signal cards
+        if df_crypto is not None and not df_crypto.empty:
             st.markdown("---")
-            st.subheader("Summary")
-            for _, row in df_crypto.iterrows():
-                st.markdown(
-                    f"**{row['name']}** (`{row['symbol']}`, {row['timeframe']}) — "
-                    f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
-                    f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
-                    f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
+            st.subheader("Crypto Signal Board")
+            crypto_cols = st.columns(min(6, len(df_crypto)))
+            for i, col in enumerate(crypto_cols):
+                if i < len(df_crypto):
+                    row = df_crypto.iloc[i]
+                    sig = row["signal"]
+                    if "BUY" in sig:
+                        sig_icon = "🟢"
+                    elif "SELL" in sig:
+                        sig_icon = "🔴"
+                    else:
+                        sig_icon = "⚪"
+                    score_val = row.get("score", "N/A")
+                    with col:
+                        st.markdown(
+                            f"**{row['name']}**\n\n"
+                            f"{sig_icon} **{sig}**\n\n"
+                            f"Score: `{score_val}` | RSI: `{row['rsi14']}`\n\n"
+                            f"Price: `${float(row['close']):,.2f}`"
+                        )
+
+    with crypto_tab_analysis:
+        st.markdown("### 🔍 Deep Crypto Analysis — Select a Coin")
+
+        crypto_options = {v["display"]: k for k, v in BINANCE_SYMBOLS.items()}
+        crypto_names = list(crypto_options.keys())
+
+        if not crypto_names:
+            st.warning("No crypto symbols configured.")
+        else:
+            col_sel, col_tf = st.columns([2, 1])
+            with col_sel:
+                selected_crypto = st.selectbox("Select cryptocurrency:", crypto_names, key="crypto_deep_select")
+            with col_tf:
+                crypto_analysis_tf = st.selectbox(
+                    "Analysis timeframe:",
+                    options=["1d", "4h", "1h", "15m"],
+                    index=0,
+                    key="crypto_analysis_tf",
                 )
+
+            crypto_symbol = crypto_options[selected_crypto]
+
+            if st.button("🚀 Run Deep Crypto Analysis", key="crypto_deep_run", type="primary"):
+                with st.spinner(f"Analyzing {selected_crypto} ({crypto_symbol})..."):
+                    try:
+                        df_klines = fetch_binance_klines(crypto_symbol, interval=crypto_analysis_tf, limit=500)
+                        close_s = df_klines["close"].dropna().astype(float)
+                        high_s = df_klines["high"].dropna().astype(float) if "high" in df_klines.columns else None
+                        low_s = df_klines["low"].dropna().astype(float) if "low" in df_klines.columns else None
+
+                        sig = basic_signal_from_series(close_s, high_s, low_s)
+                        returns = np.log(close_s).diff().dropna()
+
+                        bars_map = {"1d": 252, "4h": 252*6, "1h": 252*24, "15m": 252*24*4}
+                        bpy = bars_map.get(crypto_analysis_tf, 252)
+                        mpd_map = {"1d": 1, "4h": 6, "1h": 24, "15m": 96}
+                        horizon_bars = 7 * mpd_map.get(crypto_analysis_tf, 1)
+
+                        qm = compute_quant_metrics(close_s, bars_per_year=bpy, jump_z=3.0, horizon_bars=horizon_bars)
+                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)))
+                        mean_rev = compute_mean_reversion_signals(close_s)
+                        mom = compute_momentum_features(close_s)
+                        tail = compute_tail_risk_metrics(returns)
+
+                        # Signal header
+                        sig_val = sig.get("signal", "HOLD")
+                        if "BUY" in sig_val:
+                            sig_color = "🟢"
+                        elif "SELL" in sig_val:
+                            sig_color = "🔴"
+                        else:
+                            sig_color = "⚪"
+
+                        st.markdown(f"## {sig_color} {selected_crypto} ({crypto_symbol}) — {sig_val}")
+                        st.caption(f"Timeframe: {crypto_analysis_tf} | Data: Binance")
+
+                        # Key metrics
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
+                        m1.metric("Price", f"${float(sig['close']):,.2f}")
+                        m2.metric("Score", sig.get("score", "N/A"))
+                        m3.metric("RSI", sig["rsi14"])
+                        m4.metric("Trend", sig["trend"].title())
+                        m5.metric("Vol Regime", regime.get("current_regime", "?"))
+                        m6.metric("Hurst", f"{qm.get('hurst', 'N/A')}")
+
+                        # Momentum
+                        st.markdown("#### Momentum")
+                        if mom:
+                            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                            mc1.metric("5D", f"{mom.get('return_5d_pct', 'N/A')}%")
+                            mc2.metric("1M", f"{mom.get('return_21d_pct', 'N/A')}%")
+                            mc3.metric("3M", f"{mom.get('return_63d_pct', 'N/A')}%")
+                            mc4.metric("6M", f"{mom.get('return_126d_pct', 'N/A')}%")
+                            mc5.metric("12M", f"{mom.get('return_252d_pct', 'N/A')}%")
+                        else:
+                            st.info("Not enough data for full momentum (need 252+ bars). Try 1d timeframe.")
+
+                        # Mean Reversion
+                        st.markdown("#### Mean Reversion Signals")
+                        mr1, mr2, mr3 = st.columns(3)
+                        mr1.metric("Z-Score (20d)", mean_rev.get("z_score_20", "N/A"))
+                        mr2.metric("Z-Score (50d)", mean_rev.get("z_score_50", "N/A"))
+                        hl = mean_rev.get("ou_half_life")
+                        mr3.metric("O-U Half-Life", f"{hl:.0f} bars" if hl else "N/A (trending)")
+
+                        z20 = mean_rev.get("z_score_20")
+                        if z20 is not None:
+                            if z20 > 2.0:
+                                st.warning("⚠️ Z-Score > 2.0 — price significantly above mean. Potential reversion risk.")
+                            elif z20 < -2.0:
+                                st.info("💡 Z-Score < -2.0 — price significantly below mean. Potential bounce zone.")
+
+                        # Risk Profile
+                        st.markdown("#### Risk Profile")
+                        if tail:
+                            r1, r2, r3, r4 = st.columns(4)
+                            r1.metric("Sortino", tail.get("sortino_ratio", "N/A"))
+                            r2.metric("Max DD", f"{tail.get('max_drawdown_pct', 'N/A')}%")
+                            r3.metric("Win Rate", f"{tail.get('win_rate_pct', 'N/A')}%")
+                            r4.metric("Tail Ratio", tail.get("tail_ratio", "N/A"))
+
+                        # Jump Diffusion
+                        st.markdown("#### Jump Risk")
+                        j1, j2, j3, j4 = st.columns(4)
+                        j1.metric("Jumps/Year", qm.get("lambda_year", "N/A"))
+                        j2.metric("Avg Jump", f"{qm.get('avg_jump_pct', 'N/A')}%")
+                        j3.metric("Jump Vol", f"{qm.get('jump_vol_pct', 'N/A')}%")
+                        j4.metric("Jump Risk Score", qm.get("jump_risk_score", "N/A"))
+
+                        # Monte Carlo
+                        st.markdown("#### Monte Carlo Scenarios (1 week ahead)")
+                        mc_p10 = qm.get("mc_p10")
+                        mc_p50 = qm.get("mc_p50")
+                        mc_p90 = qm.get("mc_p90")
+                        last_p = qm.get("last_price", 0)
+                        if mc_p10 and last_p:
+                            s1, s2, s3 = st.columns(3)
+                            s1.metric("🔴 Bear (P10)", f"${mc_p10:,.2f}", f"{((mc_p10/last_p)-1)*100:+.1f}%")
+                            s2.metric("⚪ Base (P50)", f"${mc_p50:,.2f}", f"{((mc_p50/last_p)-1)*100:+.1f}%")
+                            s3.metric("🟢 Bull (P90)", f"${mc_p90:,.2f}", f"{((mc_p90/last_p)-1)*100:+.1f}%")
+
+                        # AI Analysis
+                        st.markdown("---")
+                        st.subheader("🧠 AI Deep Analysis")
+                        with st.spinner(f"Generating institutional crypto analysis for {selected_crypto}..."):
+                            ai_text = run_asset_deep_analysis(
+                                asset_name=f"{selected_crypto} ({crypto_symbol})",
+                                asset_type="crypto",
+                                signal_data=sig,
+                                quant_data=qm,
+                                momentum_data=mom,
+                                regime_data=regime,
+                                tail_data=tail,
+                                mean_rev_data=mean_rev,
+                            )
+                        st.markdown(ai_text)
+
+                    except Exception as e:
+                        st.error(f"Crypto analysis error: {type(e).__name__}: {e}")
 
 
 # -------- NEWS TAB --------

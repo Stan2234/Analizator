@@ -1651,14 +1651,20 @@ Output this exact JSON structure (fill every field):
 }
 """
 
+    # Truncate inputs to avoid exceeding context limits
+    max_input = 25000
+    cur_t = current_text[:max_input] if len(current_text) > max_input else current_text
+    prev_t = previous_text[:max_input] if len(previous_text) > max_input else previous_text
+    press_t = pressconf_text[:max_input] if len(pressconf_text) > max_input else pressconf_text
+
     user_msg = f"""CURRENT FOMC STATEMENT:
-{current_text}
+{cur_t}
 
 PREVIOUS FOMC STATEMENT (may be empty):
-{previous_text}
+{prev_t}
 
 PRESS CONFERENCE EXCERPTS (may be empty):
-{pressconf_text}
+{press_t}
 
 Instructions:
 - key_changes: up to 8 concise bullets on exact wording/emphasis shifts vs. previous.
@@ -1677,22 +1683,27 @@ Instructions:
             {"role": "user", "content": user_msg},
         ],
         temperature=0.15,
-        max_completion_tokens=2500,
+        max_completion_tokens=4500,
     )
 
     msg = completion.choices[0].message
     raw = msg.content
     refusal = getattr(msg, "refusal", None)
+    finish = completion.choices[0].finish_reason
 
     if refusal:
         return {"error": "Model refusal / blocked output", "refusal": refusal}
 
     if raw is None or not str(raw).strip():
+        # Possibly hit token limit or content filter
         try:
             debug = msg.model_dump()
         except Exception:
             debug = str(msg)
-        return {"error": "Empty response from OpenAI model", "debug_message": debug}
+        hint = ""
+        if finish == "length":
+            hint = " (output was cut off — token limit reached)"
+        return {"error": f"Empty response from OpenAI model{hint}", "finish_reason": finish, "debug_message": debug}
 
     raw = str(raw)
 
@@ -1702,7 +1713,9 @@ Instructions:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        data = {"error": "JSON parsing failed", "raw_response": raw}
+        # If truncated due to length, try to note that
+        hint = " (possibly truncated — increase max_completion_tokens)" if finish == "length" else ""
+        data = {"error": f"JSON parsing failed{hint}", "raw_response": raw[:2000]}
 
     return data
 
@@ -1768,7 +1781,7 @@ Output MUST strictly follow this JSON structure:
             {"role": "user", "content": press_text},
         ],
         temperature=0.2,
-        max_completion_tokens=1200,
+        max_completion_tokens=2000,
     )
 
     msg = completion.choices[0].message
@@ -1790,7 +1803,7 @@ Output MUST strictly follow this JSON structure:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        data = {"error": "JSON parsing failed", "raw_response": raw}
+        data = {"error": "JSON parsing failed", "raw_response": raw[:2000]}
 
     return data
 
@@ -1811,15 +1824,22 @@ def init_fomc_state():
         st.session_state["fomc_press"] = ""
 
 
-def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract all text from an uploaded PDF file."""
+def extract_text_from_pdf(uploaded_file, max_chars: int = 60000) -> str:
+    """Extract text from an uploaded PDF file, capped to max_chars."""
     text_parts = []
+    total = 0
     with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
                 text_parts.append(page_text)
-    return "\n\n".join(text_parts)
+                total += len(page_text)
+                if total >= max_chars:
+                    break
+    full = "\n\n".join(text_parts)
+    if len(full) > max_chars:
+        full = full[:max_chars] + "\n\n[... truncated for analysis ...]"
+    return full
 
 
 def show_fomc_lab():

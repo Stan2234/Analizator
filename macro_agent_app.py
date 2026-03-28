@@ -127,6 +127,18 @@ ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
         "Bitcoin": "BTC-USD",
         "Ethereum": "ETH-USD",
     },
+    "currency": {
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "USD/JPY": "JPY=X",
+        "USD/CHF": "CHF=X",
+        "AUD/USD": "AUDUSD=X",
+        "USD/CAD": "CAD=X",
+        "NZD/USD": "NZDUSD=X",
+        "USD/CNY": "CNY=X",
+        "USD/TRY": "TRY=X",
+        "USD/RUB": "RUB=X",
+    },
 }
 
 # Binance spot symbols (за таба Crypto)
@@ -150,6 +162,9 @@ BINANCE_TIMEFRAMES = {
 LIVE_TICKER_SYMBOLS = [
     ("GC=F", "GOLD"),
     ("SI=F", "SILVER"),
+    ("EURUSD=X", "EUR/USD"),
+    ("GBPUSD=X", "GBP/USD"),
+    ("JPY=X", "USD/JPY"),
 
     ("BTCUSDT", "BTC"),
     ("ETHUSDT", "ETH"),
@@ -668,6 +683,201 @@ def compute_quant_metrics(
         **mc,
     }
     return out
+
+
+def compute_autocorrelation(returns: pd.Series, max_lag: int = 10) -> Dict[str, float]:
+    """Serial correlation of returns — Renaissance-style mean-reversion detection."""
+    acf = {}
+    for lag in range(1, max_lag + 1):
+        corr = returns.autocorr(lag=lag)
+        acf[f"lag_{lag}"] = round(float(corr), 4) if not np.isnan(corr) else 0.0
+    return acf
+
+
+def compute_regime_hmm_simple(returns: pd.Series, window: int = 63) -> Dict[str, Any]:
+    """
+    Simple volatility regime detection using rolling vol percentile.
+    Approximates Hidden Markov Model regime states without external libraries.
+    """
+    roll_vol = returns.rolling(window).std()
+    if roll_vol.dropna().empty:
+        return {"current_regime": "UNKNOWN", "regime_percentile": None, "regime_duration_bars": 0}
+
+    current_vol = float(roll_vol.iloc[-1])
+    pct = float((roll_vol.dropna() < current_vol).mean() * 100.0)
+
+    if pct >= 80:
+        regime = "HIGH_VOL_CRISIS"
+    elif pct >= 60:
+        regime = "ELEVATED_VOL"
+    elif pct >= 40:
+        regime = "NORMAL_VOL"
+    elif pct >= 20:
+        regime = "LOW_VOL_COMPLACENT"
+    else:
+        regime = "ULTRA_LOW_VOL"
+
+    # How long have we been in this regime?
+    vol_series = roll_vol.dropna()
+    duration = 0
+    for v in reversed(vol_series.values):
+        v_pct = float((vol_series < v).mean() * 100.0)
+        if abs(v_pct - pct) < 20:
+            duration += 1
+        else:
+            break
+
+    return {
+        "current_regime": regime,
+        "regime_percentile": round(pct, 1),
+        "regime_duration_bars": duration,
+        "current_vol_annualized": round(float(current_vol * np.sqrt(252)), 4),
+    }
+
+
+def compute_mean_reversion_signals(close: pd.Series) -> Dict[str, Any]:
+    """
+    Renaissance-style mean reversion metrics:
+    - Z-score from rolling mean
+    - Ornstein-Uhlenbeck half-life estimate
+    - Bollinger band position
+    """
+    s = close.dropna().astype(float)
+    if len(s) < 100:
+        return {"z_score_20": None, "z_score_50": None, "ou_half_life": None}
+
+    # Z-scores
+    m20 = s.rolling(20).mean()
+    std20 = s.rolling(20).std()
+    z20 = ((s - m20) / (std20 + 1e-12)).iloc[-1]
+
+    m50 = s.rolling(50).mean()
+    std50 = s.rolling(50).std()
+    z50 = ((s - m50) / (std50 + 1e-12)).iloc[-1]
+
+    # Ornstein-Uhlenbeck half-life (simplified ADF-style regression)
+    spread = s - m50
+    spread_lag = spread.shift(1)
+    delta_spread = spread.diff()
+    valid = pd.concat([delta_spread, spread_lag], axis=1).dropna()
+    valid.columns = ["delta", "lag"]
+
+    ou_half_life = None
+    if len(valid) > 30 and float(valid["lag"].std()) > 1e-12:
+        beta = float(np.cov(valid["delta"], valid["lag"])[0, 1] / (np.var(valid["lag"]) + 1e-12))
+        if beta < -0.001:
+            ou_half_life = round(-np.log(2) / beta, 1)
+
+    return {
+        "z_score_20": round(float(z20), 3),
+        "z_score_50": round(float(z50), 3),
+        "ou_half_life": ou_half_life,
+    }
+
+
+def compute_momentum_features(close: pd.Series) -> Dict[str, Any]:
+    """
+    Cross-timeframe momentum — core of trend-following systematic strategies.
+    """
+    s = close.dropna().astype(float)
+    if len(s) < 252:
+        return {}
+
+    ret_5d = float((s.iloc[-1] / s.iloc[-5] - 1.0) * 100) if len(s) >= 5 else None
+    ret_21d = float((s.iloc[-1] / s.iloc[-21] - 1.0) * 100) if len(s) >= 21 else None
+    ret_63d = float((s.iloc[-1] / s.iloc[-63] - 1.0) * 100) if len(s) >= 63 else None
+    ret_126d = float((s.iloc[-1] / s.iloc[-126] - 1.0) * 100) if len(s) >= 126 else None
+    ret_252d = float((s.iloc[-1] / s.iloc[-252] - 1.0) * 100) if len(s) >= 252 else None
+
+    # Momentum score: weighted average of multi-period returns
+    weights = [0.05, 0.15, 0.30, 0.25, 0.25]
+    rets = [ret_5d, ret_21d, ret_63d, ret_126d, ret_252d]
+    valid = [(w, r) for w, r in zip(weights, rets) if r is not None]
+    mom_score = sum(w * r for w, r in valid) / (sum(w for w, _ in valid) + 1e-12) if valid else None
+
+    return {
+        "return_5d_pct": round(ret_5d, 2) if ret_5d is not None else None,
+        "return_21d_pct": round(ret_21d, 2) if ret_21d is not None else None,
+        "return_63d_pct": round(ret_63d, 2) if ret_63d is not None else None,
+        "return_126d_pct": round(ret_126d, 2) if ret_126d is not None else None,
+        "return_252d_pct": round(ret_252d, 2) if ret_252d is not None else None,
+        "momentum_composite_score": round(mom_score, 3) if mom_score is not None else None,
+    }
+
+
+def compute_tail_risk_metrics(returns: pd.Series) -> Dict[str, Any]:
+    """
+    Advanced tail risk analysis beyond simple VaR/CVaR.
+    """
+    r = returns.dropna()
+    if len(r) < 60:
+        return {}
+
+    # Sortino ratio (downside deviation)
+    downside = r[r < 0]
+    downside_std = float(downside.std()) if len(downside) > 5 else None
+    sortino = float(r.mean() / (downside_std + 1e-12) * np.sqrt(252)) if downside_std else None
+
+    # Gain/pain ratio
+    total_gain = float(r[r > 0].sum())
+    total_pain = float(abs(r[r < 0].sum()))
+    gain_pain_ratio = round(total_gain / (total_pain + 1e-12), 3)
+
+    # Calmar ratio (annualized return / max drawdown)
+    ann_ret = float(r.mean() * 252)
+    cum = (1 + r).cumprod()
+    peak = cum.cummax()
+    dd = (cum / peak - 1.0)
+    max_dd = float(dd.min())
+    calmar = round(ann_ret / (abs(max_dd) + 1e-12), 3) if max_dd != 0 else None
+
+    # Tail ratio (95th percentile gain / 5th percentile loss)
+    p95 = float(np.percentile(r, 95))
+    p05 = float(np.percentile(r, 5))
+    tail_ratio = round(abs(p95 / (p05 + 1e-12)), 3)
+
+    # Win rate
+    win_rate = round(float((r > 0).mean() * 100), 1)
+
+    return {
+        "sortino_ratio": round(sortino, 3) if sortino else None,
+        "gain_pain_ratio": gain_pain_ratio,
+        "calmar_ratio": calmar,
+        "tail_ratio": tail_ratio,
+        "win_rate_pct": win_rate,
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "annualized_return_pct": round(ann_ret * 100, 2),
+    }
+
+
+def compute_correlation_to_benchmarks(close: pd.Series, lookback: int = 63) -> Dict[str, float]:
+    """
+    Rolling correlation to key benchmarks (SPY, Gold, DXY proxy).
+    Uses Yahoo Finance for benchmark data.
+    """
+    benchmarks = {"SPY": "SPY", "Gold": "GC=F", "DXY_proxy": "UUP"}
+    correlations = {}
+    s = close.dropna().astype(float)
+    r_asset = np.log(s).diff().dropna()
+
+    for label, ticker in benchmarks.items():
+        try:
+            df_b = fetch_yahoo_history(ticker, range_str="1y", interval="1d", max_points=365)
+            r_bench = np.log(df_b["close"].dropna().astype(float)).diff().dropna()
+
+            # Align dates
+            common = r_asset.index.intersection(r_bench.index)
+            if len(common) < lookback:
+                correlations[f"corr_{label}"] = None
+                continue
+
+            corr = float(r_asset.loc[common].tail(lookback).corr(r_bench.loc[common].tail(lookback)))
+            correlations[f"corr_{label}"] = round(corr, 3) if not np.isnan(corr) else None
+        except Exception:
+            correlations[f"corr_{label}"] = None
+
+    return correlations
+
 
 def quant_metrics_to_brief(symbol: str, source: str, timeframe: str, lookback_days: int, horizon_label: str, qm: Dict[str, Any]) -> str:
     # brief text for GPT (numbers only)
@@ -2576,8 +2786,8 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
-    ["🌍 Global Signals", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab"]
+tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab"]
 
 )
 
@@ -2618,6 +2828,55 @@ with tab_global:
             st.markdown(
                 f"**{row['name']}** (`{row['ticker']}`) — "
                 f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
+                f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
+                f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
+            )
+
+# -------- FX / CURRENCIES TAB --------
+with tab_fx:
+    st.subheader("💱 Currency Pairs — Live FX Signals (Yahoo Finance)")
+    st.write("Major and emerging market currency pairs. Data: Yahoo Finance, daily timeframe.")
+    st.write("Logic: Multi-indicator scoring (SMA trend + RSI + MACD + Bollinger Bands).")
+
+    refresh_fx = st.button("🔄 Refresh FX signals", key="refresh_fx_btn")
+
+    if "df_signals_fx" not in st.session_state or refresh_fx:
+        fx_rows: List[Dict[str, Any]] = []
+        for name, ticker in ASSETS_BY_CLASS.get("currency", {}).items():
+            r = analyze_yahoo_asset(name, ticker, "currency")
+            if r:
+                fx_rows.append(r)
+        df_fx = pd.DataFrame(fx_rows)
+        if not df_fx.empty:
+            base_cols = [
+                "name", "ticker", "asset_class",
+                "signal", "confidence", "score",
+                "trend", "momentum",
+                "rsi14", "macd_hist", "bb_pct",
+                "close", "sma20", "sma50", "sma200",
+            ]
+            optional_cols = ["adx", "stoch_k", "stoch_d"]
+            cols = [c for c in base_cols if c in df_fx.columns] + [c for c in optional_cols if c in df_fx.columns]
+            df_fx = df_fx[cols]
+        st.session_state["df_signals_fx"] = df_fx
+    else:
+        df_fx = st.session_state["df_signals_fx"]
+
+    if df_fx is None or df_fx.empty:
+        st.error("No FX data available. Check connection.")
+    else:
+        def color_fx_row(row):
+            return ["color: #00ff00; background-color: #000000;" for _ in row]
+        styled_fx = df_fx.style.apply(color_fx_row, axis=1)
+        st.dataframe(styled_fx, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("FX Summary")
+        for _, row in df_fx.iterrows():
+            st.markdown(
+                f"**{row['name']}** (`{row['ticker']}`) — "
+                f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
+                f"Score: `{row.get('score','N/A')}`, "
                 f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
                 f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
             )
@@ -2818,73 +3077,214 @@ with tab_news:
                     
 # -------- QUANT TAB --------
 with tab_quant:
-    st.subheader("🧮 Quant Lab — Quantitative Market Analysis (Yahoo + Binance)")
+    st.subheader("🧮 Quant Lab — Renaissance-Grade Quantitative Analysis")
+    st.markdown(
+        "Institutional systematic analysis inspired by Renaissance Technologies / Two Sigma. "
+        "Multi-factor scoring: regime detection, mean-reversion, momentum, tail risk, and Monte Carlo."
+    )
 
     df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
     df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
 
-    asset_options: List[str] = ["(choose)"]
+    asset_options_q: List[str] = ["(choose)"]
 
     if not df_global_for_q.empty:
-        asset_options.extend(
+        asset_options_q.extend(
             df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
         )
     if not df_crypto_for_q.empty:
-        asset_options.extend(
+        asset_options_q.extend(
             df_crypto_for_q["name"].astype(str) + " (" + df_crypto_for_q["symbol"].astype(str) + ")"
         )
 
-    asset_options = sorted(set(asset_options))
+    asset_options_q = sorted(set(asset_options_q))
 
     colA, colB, colC = st.columns(3)
     with colA:
-        focus_asset = st.selectbox("Asset:", options=asset_options, index=0)
-        source_pref = st.selectbox("Source:", options=["Auto", "Yahoo", "Binance"], index=0)
+        focus_asset_q = st.selectbox("Asset:", options=asset_options_q, index=0, key="quant_asset")
+        source_pref_q = st.selectbox("Source:", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source")
 
     with colB:
-        lookback_days = st.slider("Lookback (days):", 90, 730, 365, 30)
-        jump_z = st.slider("Jump threshold (z):", 2.0, 5.0, 3.0, 0.25)
+        lookback_days_q = st.slider("Lookback (days):", 90, 730, 365, 30, key="quant_lookback")
+        jump_z_q = st.slider("Jump threshold (z):", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
 
     with colC:
-        tf_binance = st.selectbox("Binance timeframe:", options=["1d", "4h", "1h", "15m"], index=0)
-        horizon_label = st.selectbox("Horizon:", options=["1 day", "1 week", "1 month"], index=1)
+        tf_binance_q = st.selectbox("Binance timeframe:", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
+        horizon_label_q = st.selectbox("Horizon:", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon")
 
-    run_quant = st.button("🧮 Run Quant Analysis", type="primary")
+    run_quant_btn = st.button("🧮 Run Quant Analysis", type="primary", key="run_quant_btn")
 
-    if run_quant:
-        sym = parse_selected_asset_to_symbol(focus_asset)
+    if run_quant_btn:
+        sym = parse_selected_asset_to_symbol(focus_asset_q)
         if not sym:
             st.warning("Select an asset.")
         else:
-            source = detect_source_for_symbol(sym, preferred=source_pref)
-
-            # horizon bars
-            mpd = bars_per_day_for_tf(source, tf_binance)
-            if horizon_label == "1 day":
-                horizon_bars = 1 * mpd
-            elif horizon_label == "1 week":
-                horizon_bars = 7 * mpd
-            else:
-                horizon_bars = 30 * mpd
-
-            # timeframe used
-            tf_used = "1d" if source == "Yahoo" else tf_binance
+            source = detect_source_for_symbol(sym, preferred=source_pref_q)
+            mpd = bars_per_day_for_tf(source, tf_binance_q)
+            horizon_map = {"1 day": 1, "1 week": 7, "1 month": 30, "3 months": 90}
+            horizon_bars = horizon_map.get(horizon_label_q, 7) * mpd
+            tf_used = "1d" if source == "Yahoo" else tf_binance_q
             bpy = bars_per_year_for_timeframe(source, tf_used)
 
             try:
-                close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days)
-                qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z), horizon_bars=int(horizon_bars))
+                close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
+                returns = np.log(close_series).diff().dropna()
+
+                # Core quant metrics
+                qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q), horizon_bars=int(horizon_bars))
 
                 if "error" in qm:
                     st.error(qm["error"])
                 else:
-                    st.markdown("### Quant Metrics")
-                    st.dataframe(pd.DataFrame([qm]), use_container_width=True)
+                    # Advanced metrics
+                    regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3))
+                    mean_rev = compute_mean_reversion_signals(close_series)
+                    mom_feat = compute_momentum_features(close_series)
+                    tail_risk = compute_tail_risk_metrics(returns)
+                    acf = compute_autocorrelation(returns, max_lag=5)
 
+                    # ── REGIME & SIGNAL OVERVIEW ──
                     st.markdown("---")
-                    st.markdown("### GPT Quant Analysis (based ONLY on the numbers above)")
-                    brief = quant_metrics_to_brief(sym, source, tf_used, lookback_days, horizon_label, qm)
-                    gpt_text = run_quant_gpt_analysis(brief)
+                    st.subheader("📊 Regime & Signal Overview")
+                    rc1, rc2, rc3, rc4 = st.columns(4)
+                    rc1.metric("Vol Regime", regime.get("current_regime", "?"))
+                    rc2.metric("Vol Percentile", f"{regime.get('regime_percentile', 0):.0f}%")
+                    rc3.metric("Regime Duration", f"{regime.get('regime_duration_bars', 0)} bars")
+                    rc4.metric("Ann. Volatility", f"{regime.get('current_vol_annualized', 0):.1%}")
+
+                    # Hurst interpretation
+                    hurst = qm.get("hurst")
+                    if hurst is not None:
+                        if hurst > 0.55:
+                            hurst_label = "🟢 Trending (H > 0.55)"
+                        elif hurst < 0.45:
+                            hurst_label = "🔵 Mean-Reverting (H < 0.45)"
+                        else:
+                            hurst_label = "⚪ Random Walk (H ≈ 0.5)"
+                    else:
+                        hurst_label = "N/A"
+
+                    rc5, rc6, rc7, rc8 = st.columns(4)
+                    rc5.metric("Hurst Exponent", f"{hurst:.3f}" if hurst else "N/A", help=hurst_label)
+                    rc6.metric("Z-Score (20d)", f"{mean_rev.get('z_score_20', 'N/A')}")
+                    rc7.metric("Z-Score (50d)", f"{mean_rev.get('z_score_50', 'N/A')}")
+                    half_life = mean_rev.get("ou_half_life")
+                    rc8.metric("O-U Half-Life", f"{half_life:.0f} bars" if half_life else "N/A (trending)")
+
+                    # ── MOMENTUM DASHBOARD ──
+                    st.markdown("---")
+                    st.subheader("🚀 Multi-Timeframe Momentum")
+                    if mom_feat:
+                        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                        mc1.metric("5-Day", f"{mom_feat.get('return_5d_pct', 'N/A')}%")
+                        mc2.metric("1-Month", f"{mom_feat.get('return_21d_pct', 'N/A')}%")
+                        mc3.metric("3-Month", f"{mom_feat.get('return_63d_pct', 'N/A')}%")
+                        mc4.metric("6-Month", f"{mom_feat.get('return_126d_pct', 'N/A')}%")
+                        mc5.metric("12-Month", f"{mom_feat.get('return_252d_pct', 'N/A')}%")
+
+                        mom_score = mom_feat.get("momentum_composite_score")
+                        if mom_score is not None:
+                            if mom_score > 5:
+                                mom_label = "🟢 Strong Bullish Momentum"
+                            elif mom_score > 1:
+                                mom_label = "🟢 Bullish Momentum"
+                            elif mom_score > -1:
+                                mom_label = "⚪ Neutral / Flat"
+                            elif mom_score > -5:
+                                mom_label = "🔴 Bearish Momentum"
+                            else:
+                                mom_label = "🔴 Strong Bearish Momentum"
+                            st.markdown(f"**Composite Momentum Score:** `{mom_score:.2f}` → {mom_label}")
+                    else:
+                        st.info("Not enough data for momentum analysis (need 252+ bars).")
+
+                    # ── TAIL RISK & PERFORMANCE ──
+                    st.markdown("---")
+                    st.subheader("🛡️ Tail Risk & Performance")
+                    if tail_risk:
+                        tr1, tr2, tr3, tr4 = st.columns(4)
+                        tr1.metric("Sortino Ratio", tail_risk.get("sortino_ratio", "N/A"))
+                        tr2.metric("Calmar Ratio", tail_risk.get("calmar_ratio", "N/A"))
+                        tr3.metric("Tail Ratio", tail_risk.get("tail_ratio", "N/A"), help="P95 gain / P5 loss — higher is better")
+                        tr4.metric("Gain/Pain", tail_risk.get("gain_pain_ratio", "N/A"))
+
+                        tr5, tr6, tr7, tr8 = st.columns(4)
+                        tr5.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
+                        tr6.metric("Max Drawdown", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
+                        tr7.metric("Ann. Return", f"{tail_risk.get('annualized_return_pct', 'N/A')}%")
+                        var95 = qm.get("VaR_95_logret")
+                        tr8.metric("VaR 95%", f"{var95:.4f}" if var95 else "N/A", help="Worst daily loss at 95% confidence")
+
+                    # ── JUMP DIFFUSION ──
+                    st.markdown("---")
+                    st.subheader("⚡ Jump-Diffusion Analysis (Merton Model)")
+                    jc1, jc2, jc3, jc4 = st.columns(4)
+                    jc1.metric("Jumps/Year (λ)", qm.get("lambda_year", "N/A"))
+                    jc2.metric("Avg Jump Size", f"{qm.get('avg_jump_pct', 'N/A')}%")
+                    jc3.metric("Jump Volatility", f"{qm.get('jump_vol_pct', 'N/A')}%")
+                    jc4.metric("Jump Risk Score", qm.get("jump_risk_score", "N/A"))
+
+                    # ── AUTOCORRELATION ──
+                    st.markdown("---")
+                    st.subheader("🔄 Serial Correlation (Autocorrelation)")
+                    if acf:
+                        acf_data = pd.DataFrame([acf])
+                        acf_data.columns = [f"Lag {c.split('_')[1]}" for c in acf_data.columns]
+                        st.dataframe(acf_data, use_container_width=True)
+                        lag1 = acf.get("lag_1", 0)
+                        if lag1 > 0.05:
+                            st.markdown("📈 **Positive autocorrelation** — momentum/trend continuation likely. Trend-following strategies favored.")
+                        elif lag1 < -0.05:
+                            st.markdown("🔄 **Negative autocorrelation** — mean-reversion signal. Contrarian/reversion strategies favored.")
+                        else:
+                            st.markdown("⚪ **Near-zero autocorrelation** — no strong serial pattern. Market is efficient at this timeframe.")
+
+                    # ── MONTE CARLO ──
+                    st.markdown("---")
+                    st.subheader(f"🎲 Monte Carlo Scenarios ({horizon_label_q} ahead)")
+                    mc_p10 = qm.get("mc_p10")
+                    mc_p50 = qm.get("mc_p50")
+                    mc_p90 = qm.get("mc_p90")
+                    mc_mean = qm.get("mc_mean")
+                    last_p = qm.get("last_price", 0)
+
+                    if mc_p10 is not None and last_p:
+                        sc1, sc2, sc3, sc4 = st.columns(4)
+                        sc1.metric("🔴 Bear (P10)", f"${mc_p10:,.2f}", f"{((mc_p10/last_p)-1)*100:+.1f}%")
+                        sc2.metric("⚪ Base (P50)", f"${mc_p50:,.2f}", f"{((mc_p50/last_p)-1)*100:+.1f}%")
+                        sc3.metric("🟢 Bull (P90)", f"${mc_p90:,.2f}", f"{((mc_p90/last_p)-1)*100:+.1f}%")
+                        sc4.metric("📊 Expected", f"${mc_mean:,.2f}", f"{((mc_mean/last_p)-1)*100:+.1f}%")
+
+                    # ── FULL METRICS TABLE ──
+                    st.markdown("---")
+                    with st.expander("📋 Full Quant Metrics Table"):
+                        all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
+                        st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
+
+                    # ── GPT ANALYSIS ──
+                    st.markdown("---")
+                    st.subheader("🧠 AI Quant Analysis (Renaissance-Grade)")
+
+                    # Build enhanced brief with all metrics
+                    all_metrics_for_brief = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk}
+                    enhanced_brief_lines = [
+                        f"SYMBOL: {sym}",
+                        f"SOURCE: {source}",
+                        f"TIMEFRAME: {tf_used}",
+                        f"LOOKBACK_DAYS: {lookback_days_q}",
+                        f"HORIZON: {horizon_label_q}",
+                        "",
+                        "CORE METRICS:",
+                    ]
+                    for k, v in all_metrics_for_brief.items():
+                        enhanced_brief_lines.append(f"- {k}: {v}")
+                    enhanced_brief_lines.append("")
+                    enhanced_brief_lines.append("AUTOCORRELATION:")
+                    for k, v in acf.items():
+                        enhanced_brief_lines.append(f"- {k}: {v}")
+
+                    enhanced_brief = "\n".join(enhanced_brief_lines)
+                    gpt_text = run_quant_gpt_analysis(enhanced_brief)
                     st.markdown(gpt_text)
 
             except Exception as e:

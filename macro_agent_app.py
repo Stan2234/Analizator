@@ -217,6 +217,49 @@ def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     return rsi
 
 
+def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, pd.Series]:
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
+
+
+def compute_bollinger_bands(close: pd.Series, window: int = 20, std_dev: float = 2.0) -> Dict[str, pd.Series]:
+    sma = close.rolling(window).mean()
+    std = close.rolling(window).std()
+    upper = sma + std_dev * std
+    lower = sma - std_dev * std
+    bb_pct = (close - lower) / (upper - lower + 1e-12)
+    return {"upper": upper, "middle": sma, "lower": lower, "bb_pct": bb_pct}
+
+
+def compute_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3) -> Dict[str, pd.Series]:
+    lowest_low = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    k = 100.0 * (close - lowest_low) / (highest_high - lowest_low + 1e-12)
+    d = k.rolling(d_period).mean()
+    return {"k": k, "d": d}
+
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(span=period, adjust=False).mean()
+    up_move = high.diff()
+    down_move = -low.diff()
+    pos_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    neg_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    pos_di = 100.0 * pos_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-12)
+    neg_di = 100.0 * neg_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-12)
+    dx = 100.0 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-12)
+    adx = dx.ewm(span=period, adjust=False).mean()
+    return adx
+
+
 def compute_jump_diffusion_metrics(
     close: pd.Series,
     bars_per_year: int = 252,
@@ -282,22 +325,143 @@ def compute_jump_diffusion_metrics(
         "jumps_count": jumps_count,
     }
 
-def basic_signal_from_series(close: pd.Series) -> Dict[str, Any]:
+def basic_signal_from_series(
+    close: pd.Series,
+    high: Optional[pd.Series] = None,
+    low: Optional[pd.Series] = None,
+) -> Dict[str, Any]:
     df = pd.DataFrame({"Close": close})
-    df["sma50"] = df["Close"].rolling(50).mean()
+    if high is not None:
+        df["High"] = high.values if hasattr(high, "values") else high
+    if low is not None:
+        df["Low"] = low.values if hasattr(low, "values") else low
+
+    df["sma20"]  = df["Close"].rolling(20).mean()
+    df["sma50"]  = df["Close"].rolling(50).mean()
     df["sma200"] = df["Close"].rolling(200).mean()
-    df["rsi14"] = compute_rsi(df["Close"])
+    df["rsi14"]  = compute_rsi(df["Close"])
+
+    macd_out = compute_macd(df["Close"])
+    df["macd"]      = macd_out["macd"]
+    df["macd_sig"]  = macd_out["signal"]
+    df["macd_hist"] = macd_out["histogram"]
+
+    bb_out = compute_bollinger_bands(df["Close"])
+    df["bb_upper"] = bb_out["upper"]
+    df["bb_lower"] = bb_out["lower"]
+    df["bb_pct"]   = bb_out["bb_pct"]
+
+    has_hl = "High" in df.columns and "Low" in df.columns
+    if has_hl:
+        stoch_out     = compute_stochastic(df["High"], df["Low"], df["Close"])
+        df["stoch_k"] = stoch_out["k"]
+        df["stoch_d"] = stoch_out["d"]
+        df["adx"]     = compute_adx(df["High"], df["Low"], df["Close"])
 
     df = df.dropna()
     if df.empty:
         raise ValueError("Not enough data for indicators")
 
     last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
 
-    close_v = float(last["Close"])
-    sma50 = float(last["sma50"])
-    sma200 = float(last["sma200"])
-    rsi14 = float(last["rsi14"])
+    close_v   = float(last["Close"])
+    sma20     = float(last["sma20"])
+    sma50     = float(last["sma50"])
+    sma200    = float(last["sma200"])
+    rsi14     = float(last["rsi14"])
+    macd_h    = float(last["macd_hist"])
+    macd_h_p  = float(prev["macd_hist"])
+    bb_pct    = float(last["bb_pct"])
+    macd_v    = float(last["macd"])
+    macd_s    = float(last["macd_sig"])
+
+    score = 0.0
+
+    # 1. SMA Trend (weight ~3.5)
+    if close_v > sma200 and sma50 > sma200:
+        score += 3.0
+    elif close_v > sma200:
+        score += 1.5
+    elif close_v < sma200 and sma50 < sma200:
+        score -= 3.0
+    elif close_v < sma200:
+        score -= 1.5
+    score += 0.5 if close_v > sma50 else -0.5
+
+    # 2. RSI (weight ~2.0)
+    if rsi14 >= 70:
+        score += 1.5
+    elif rsi14 >= 60:
+        score += 2.0
+    elif rsi14 >= 55:
+        score += 1.0
+    elif rsi14 >= 45:
+        score += 0.0
+    elif rsi14 >= 40:
+        score -= 1.0
+    elif rsi14 >= 30:
+        score -= 2.0
+    else:
+        score -= 1.5
+
+    # 3. MACD (weight ~2.0)
+    if macd_v > macd_s:
+        score += 1.0
+        if macd_h > macd_h_p:
+            score += 1.0
+    elif macd_v < macd_s:
+        score -= 1.0
+        if macd_h < macd_h_p:
+            score -= 1.0
+
+    # 4. Bollinger %B (weight ~1.5)
+    if bb_pct > 0.8:
+        score += 1.5
+    elif bb_pct > 0.6:
+        score += 0.75
+    elif bb_pct < 0.2:
+        score -= 1.5
+    elif bb_pct < 0.4:
+        score -= 0.75
+
+    # 5. Stochastic + ADX (weight ~1.5, only if H/L available)
+    stoch_k = stoch_d = adx_v = None
+    if has_hl and "stoch_k" in df.columns:
+        stoch_k = float(last["stoch_k"])
+        stoch_d = float(last["stoch_d"])
+        adx_v   = float(last["adx"])
+
+        if stoch_k > 80 and stoch_k > stoch_d:
+            score += 1.5
+        elif stoch_k > 60:
+            score += 0.75
+        elif stoch_k < 20 and stoch_k < stoch_d:
+            score -= 1.5
+        elif stoch_k < 40:
+            score -= 0.75
+
+        if adx_v > 25:
+            score *= 1.15
+        elif adx_v < 20:
+            score *= 0.85
+
+    score = round(float(score), 2)
+
+    if score >= 7:
+        signal, confidence = "STRONG BUY",  0.92
+    elif score >= 4:
+        signal, confidence = "BUY",          0.75
+    elif score >= 1.5:
+        signal, confidence = "WEAK BUY",     0.60
+    elif score >= -1.5:
+        signal, confidence = "HOLD",         0.50
+    elif score >= -4:
+        signal, confidence = "WEAK SELL",    0.60
+    elif score >= -7:
+        signal, confidence = "SELL",         0.75
+    else:
+        signal, confidence = "STRONG SELL",  0.92
 
     if close_v > sma200 and sma50 > sma200:
         trend = "up"
@@ -313,32 +477,27 @@ def basic_signal_from_series(close: pd.Series) -> Dict[str, Any]:
     else:
         momentum = "neutral"
 
-    if trend == "up" and momentum == "bullish":
-        signal = "STRONG BUY"
-        confidence = 0.9
-    elif trend == "up" and momentum == "neutral":
-        signal = "BUY"
-        confidence = 0.7
-    elif trend == "down" and momentum == "bearish":
-        signal = "STRONG SELL"
-        confidence = 0.9
-    elif trend == "down" and momentum == "neutral":
-        signal = "SELL"
-        confidence = 0.7
-    else:
-        signal = "HOLD"
-        confidence = 0.5
-
-    return {
-        "close": round(close_v, 4),
-        "sma50": round(sma50, 4),
-        "sma200": round(sma200, 4),
-        "rsi14": round(rsi14, 2),
-        "trend": trend,
-        "momentum": momentum,
-        "signal": signal,
+    out: Dict[str, Any] = {
+        "close":      round(close_v, 4),
+        "sma20":      round(sma20, 4),
+        "sma50":      round(sma50, 4),
+        "sma200":     round(sma200, 4),
+        "rsi14":      round(rsi14, 2),
+        "macd_hist":  round(macd_h, 6),
+        "bb_pct":     round(bb_pct, 4),
+        "score":      score,
+        "trend":      trend,
+        "momentum":   momentum,
+        "signal":     signal,
         "confidence": round(confidence, 2),
     }
+    if stoch_k is not None:
+        out["stoch_k"] = round(stoch_k, 2)
+        out["stoch_d"] = round(stoch_d, 2)
+    if adx_v is not None:
+        out["adx"] = round(adx_v, 2)
+
+    return out
 
 
 # ------------------------------------
@@ -538,19 +697,40 @@ def run_quant_gpt_analysis(brief: str) -> str:
         return "Quant GPT analysis error: OpenAI client not configured."
 
     system_prompt = """
-You are a quantitative trading analyst.
+You are a quantitative portfolio manager at a systematic hedge fund.
+Translate raw quant metrics into clear, actionable strategy insights.
+Write like a Two Sigma or Bridgewater internal memo — precise, quantitative, no filler.
 
-Rules:
-- Use ONLY the numbers provided in the brief. Do not invent prices, indicators, or news.
-- Explain what the metrics imply about: volatility regime, jump risk, tail risk, trend vs mean-reversion tendency.
-- Provide 3 strategy-style playbooks (rule-based), NOT investment advice and NOT position sizing.
-- Be explicit about limitations and what would invalidate the read.
-Output structure:
-1) Regime Summary
-2) Risk Profile (jumps/tails/drawdown)
-3) Scenario ranges (use Monte Carlo percentiles)
-4) Strategy Playbooks (3)
-5) Red flags / invalidation
+Use ONLY the numbers in the brief. Never invent prices or indicators.
+
+Output format (markdown):
+
+## REGIME SUMMARY
+What do vol regime, Hurst exponent, skew and kurtosis together reveal about market microstructure?
+Is this trending or mean-reverting? Fat-tailed or normal? State regime clearly.
+
+## RISK PROFILE
+- **Vol Regime:** interpret LOW/NORMAL/HIGH in context
+- **Jump Risk:** frequency (lambda), typical size, danger level
+- **Tail Risk:** what the VaR/CVaR numbers mean in plain terms
+- **Max Drawdown:** historical pain level and recovery context
+
+## PRICE SCENARIO RANGES (Monte Carlo)
+| Percentile | Price | Interpretation |
+|------------|-------|----------------|
+| P10 (bear) | ...   | worst 10% outcome |
+| P50 (base) | ...   | median expected   |
+| P90 (bull) | ...   | best 10% outcome  |
+
+## STRATEGY PLAYBOOKS (3 rule-based approaches)
+For each: Entry trigger | Exit condition | Risk management rule
+
+1. **[Strategy Name]:** ...
+2. **[Strategy Name]:** ...
+3. **[Strategy Name]:** ...
+
+## RED FLAGS & INVALIDATION
+What conditions would break each playbook? What data would change this analysis?
 """
 
     completion = client.chat.completions.create(
@@ -617,7 +797,9 @@ def fetch_yahoo_history(
 def analyze_yahoo_asset(name: str, ticker: str, asset_class: str) -> Optional[Dict[str, Any]]:
     try:
         df = fetch_yahoo_history(ticker, range_str="1y", interval="1d", max_points=DAYS_BACK)
-        sig = basic_signal_from_series(df["close"])
+        h = df["high"] if "high" in df.columns else None
+        l = df["low"] if "low" in df.columns else None
+        sig = basic_signal_from_series(df["close"], h, l)
 
         jm = compute_jump_diffusion_metrics(
             df["close"],
@@ -651,27 +833,18 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df = df[
-        [
-            "name",
-            "ticker",
-            "asset_class",
-            "signal",
-            "confidence",
-            "trend",
-            "momentum",
-            "rsi14",
-            "close",
-            "sma50",
-            "sma200",
-            "lambda_year",
-            "avg_jump_pct",
-            "jump_vol_pct",
-            "sigma_diffusion_pct",
-            "jump_risk_score",
-            "jumps_count",
-        ]
+    base_cols = [
+        "name", "ticker", "asset_class",
+        "signal", "confidence", "score",
+        "trend", "momentum",
+        "rsi14", "macd_hist", "bb_pct",
+        "close", "sma20", "sma50", "sma200",
+        "lambda_year", "avg_jump_pct", "jump_vol_pct",
+        "sigma_diffusion_pct", "jump_risk_score", "jumps_count",
     ]
+    optional_cols = ["adx", "stoch_k", "stoch_d"]
+    cols = [c for c in base_cols if c in df.columns] + [c for c in optional_cols if c in df.columns]
+    df = df[cols]
     return df
 
 
@@ -731,7 +904,8 @@ def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) ->
             )
             df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
             df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
             df = df.dropna(subset=["close"])
             return df
 
@@ -752,7 +926,7 @@ def run_analysis_binance(timeframe: str) -> pd.DataFrame:
     for symbol, meta in BINANCE_SYMBOLS.items():
         try:
             df = fetch_binance_klines(symbol, interval=timeframe, limit=500)
-            sig = basic_signal_from_series(df["close"])
+            sig = basic_signal_from_series(df["close"], df["high"], df["low"])
 
             bpy = bars_map.get(timeframe, 252)
 
@@ -950,31 +1124,16 @@ def df_to_brief(df: pd.DataFrame, label: str) -> str:
     df_local = df.copy()
     df_local = df_local.sort_values("confidence", ascending=False).head(10)
     cols = [
-        c
-        for c in df_local.columns
-        if c
-        in [
-    "name",
-    "ticker",
-    "symbol",
-    "asset_class",
-    "timeframe",
-    "signal",
-    "confidence",
-    "trend",
-    "momentum",
-    "rsi14",
-    "close",
-    "sma50",
-    "sma200",
-    "lambda_year",
-    "avg_jump_pct",
-    "jump_vol_pct",
-    "sigma_diffusion_pct",
-    "jump_risk_score",
-    "jumps_count",
-]
-
+        c for c in df_local.columns
+        if c in [
+            "name", "ticker", "symbol", "asset_class", "timeframe",
+            "signal", "confidence", "score",
+            "trend", "momentum",
+            "rsi14", "macd_hist", "bb_pct", "stoch_k", "adx",
+            "close", "sma20", "sma50", "sma200",
+            "lambda_year", "avg_jump_pct", "jump_vol_pct",
+            "sigma_diffusion_pct", "jump_risk_score", "jumps_count",
+        ]
     ]
     return df_local[cols].to_string(index=False)
 
@@ -1030,16 +1189,52 @@ FOCUS:
 """
 
         system_prompt = """
-You are an institutional-grade macro–financial and technical analyst.
-You analyse cross-asset signals (equities, crypto, indices, commodities, FX)
-plus news flow and generate structured, actionable insights.
+You are a senior institutional macro analyst at a bulge-bracket investment bank.
+Your analysis reads like a Goldman Sachs or JPMorgan cross-asset morning note — direct, specific, actionable.
+Your audience: professional portfolio managers and sophisticated investors.
 
-Constraints:
-- Do NOT give investment advice or position sizing.
-- Speak in probabilities and scenarios, never certainties.
-- Explicitly separate short-term (days/weeks) and medium-term (months) views.
-- Use the supplied data, do not hallucinate specific prices or indicators not present in the context.
-- You can infer relations (e.g. strong USD usually pressures gold and crypto), but mark these as "typical behaviour".
+Output format (use markdown headers):
+
+## EXECUTIVE SUMMARY
+2-3 sentences: the single most important insight right now.
+
+## MACRO REGIME
+Identify current regime: growth trend, inflation, central bank posture, risk appetite (risk-on/risk-off).
+
+## CROSS-ASSET VIEW
+Brief directional take: Equities | Fixed Income | FX | Crypto | Commodities
+
+## ASSET ANALYSIS
+(Deep dive on the target asset, or global view if no target specified)
+- Technical positioning: trend, momentum, key levels, indicator confluence
+- Macro/fundamental drivers
+- Upcoming catalysts
+
+## SCENARIOS & PROBABILITIES
+| Scenario | Probability | Trigger | Implication |
+|----------|-------------|---------|-------------|
+| Bull     | X%          | ...     | ...         |
+| Base     | X%          | ...     | ...         |
+| Bear     | X%          | ...     | ...         |
+
+## ACTIONABLE PLAYBOOK
+- **Day Trader:** ...
+- **Swing Trader (1-4 weeks):** ...
+- **Position Trader (1-3 months):** ...
+- **Long-term Investor:** ...
+
+## TOP RISKS
+3-5 concrete risks to the base case with likely market impact.
+
+## BOTTOM LINE
+1-2 sentences: what matters most and what to watch.
+
+Rules:
+- Use probabilities and scenarios, never certainties.
+- Do NOT give investment advice or specific position sizing.
+- Mark typical historical behavior as "typical behavior."
+- Be direct — no filler, no hedging every sentence.
+- Use ONLY the supplied data. Do not hallucinate prices or indicators.
 """
 
         context = base_ctx + "\n\n" + focus_block
@@ -1080,41 +1275,44 @@ def run_news_forecast(
         focus_name = focus_asset or "Global macro view"
 
         user_block = f"""
-You are analysing the asset: {focus_name}.
+ASSET UNDER ANALYSIS: {focus_name}
 
-Use the technical signals and especially the NEWS CONTEXT above (both recent and historical headlines)
-to produce a DETAILED, NEWS-DRIVEN FORECAST:
+Produce a professional, news-driven market forecast:
 
-For {focus_name}, provide:
+## NEWS SENTIMENT ASSESSMENT
+- Overall newsflow: BULLISH / BEARISH / MIXED / UNCLEAR (state confidence %)
+- 2-3 key stories currently driving the narrative
 
-1. CURRENT NEWS IMPACT
-   - Is the overall newsflow BULLISH / BEARISH / MIXED / UNCLEAR? Why?
+## SHORT-TERM VIEW (next 1-14 days)
+- Directional bias with conviction level (High/Medium/Low)
+- Key price catalysts and event risks
+- Technical setup context from the signals data
 
-2. SHORT-TERM VIEW (next days / 1-2 weeks)
-   - Directional bias (up / down / range).
-   - Key triggers that could move the price (events, data, company catalysts).
+## MEDIUM-TERM SCENARIOS (1-3 months)
+| Scenario | Probability | Required Conditions | Expected Move |
+|----------|-------------|---------------------|---------------|
+| Bull     | %           | ...                 | ...           |
+| Base     | %           | ...                 | ...           |
+| Bear     | %           | ...                 | ...           |
 
-3. MEDIUM-TERM VIEW (1-3 months)
-   - Main scenarios (bull / base / bear) with probabilities.
-   - What kind of news would confirm each scenario?
+## STRUCTURAL THEMES (3-12 months)
+Important recurring themes from the news that could drive longer-term moves.
 
-4. STRUCTURAL / LONGER-TERM POINTS (if any)
-   - Important themes from older headlines that are still relevant.
+## RISK WATCHLIST
+Top 3-5 concrete risks: "If X happens → expect Y reaction"
 
-5. RISKS & WATCHLIST
-   - 3-5 concrete risks or "if X happens, reassess" bulletpoints.
+## ACTIONABLE TAKEAWAYS BY PLAYER TYPE
+- **Momentum Trader:** ...
+- **Swing Trader:** ...
+- **Position/Long-term Investor:** ...
 
-6. TRADING / INVESTMENT TAKEAWAYS
-   - How a swing trader or position trader could use this information in practice
-     (without giving specific financial advice or position size).
-
-Write in rich detail, using bulletpoints and short paragraphs.
+Be specific. Reference the actual news where relevant. Use directional language.
 """
 
         system_prompt = """
-You are a macro/news-driven trading analyst.
-Your goal is to translate headline flows into directional views and scenarios
-for one specific asset at a time.
+You are a macro/news-driven trading analyst at a top hedge fund.
+You translate news flow into precise directional views and actionable scenarios.
+Write like a Bloomberg Intelligence or Morgan Stanley research note — direct, specific, no filler.
 """
 
         context = base_ctx + "\n\n" + user_block
@@ -1354,56 +1552,104 @@ def analyze_fomc_with_gpt(
     previous_text: str = "",
     pressconf_text: str = "",
 ) -> Dict[str, Any]:
-    """
-    Анализира FOMC statement + пресконференция.
-    Връща САМО валиден JSON dict със score, тон, ключови промени и трейдинг implications.
-    """
     client = get_openai_client()
     if client is None:
         return {"error": "OpenAI client is not configured (missing OPENAI_API_KEY)."}
 
     system_msg = """
-You are an expert macro and FOMC analyst.
+You are a senior macro strategist at a top-tier investment bank with 20+ years of Fed-watching experience.
+Analyze the FOMC statement and press conference, then deliver a complete cross-market impact assessment.
+Write as if briefing the trading desk and portfolio managers on a Fed decision day.
 
-Goal:
-- Read the CURRENT FOMC statement and (optionally) the PREVIOUS statement and PRESS CONFERENCE excerpts.
-- Produce a trading-oriented macro interpretation: hawkish/dovish evaluation, key changes, and market implications.
-- Opinions and probabilistic interpretations ARE allowed, but do NOT invent facts or quotes.
+Hard rules:
+- Return ONLY valid JSON. No markdown, no extra text.
+- Base ALL factual claims strictly on the provided text.
+- You MAY give probabilistic market interpretations using typical historical Fed transmission mechanisms.
+- Be specific, direct, and actionable — like a Goldman Sachs macro flash note.
 
-Rules:
-- Return ONLY valid JSON. No markdown, no comments, no extra text.
-- Base factual claims ONLY on the provided text.
-- Use probability-based language, not certainty.
+Direction values: "bullish" | "bearish" | "neutral"
+Magnitude values: "high" | "medium" | "low"
+Allowed tone_change: "more_hawkish" | "more_dovish" | "similar"
+Allowed trade_bias: "risk_on" | "risk_off" | "mixed"
+hawk_dove_score: -5 (extremely dovish) to +5 (extremely hawkish), decimals allowed.
 
-Allowed values:
-- tone_change: more_hawkish, more_dovish, similar
-- trade_bias: risk_on, risk_off, mixed
-
-Numeric constraints:
-- hawk_dove_score: -5 to +5 (can be decimal)
-- focus fields: integers 0–10
-
-Output MUST strictly follow this JSON structure:
+Output this exact JSON structure (fill every field):
 {
   "hawk_dove_score": 0,
   "tone_change": "similar",
   "key_changes": [],
-  "inflation_focus": 0,
-  "labor_market_focus": 0,
-  "growth_risk_focus": 0,
-  "financial_stability_focus": 0,
+  "inflation_focus": 5,
+  "labor_market_focus": 5,
+  "growth_risk_focus": 5,
+  "financial_stability_focus": 5,
   "summary": "",
   "trade_bias": "mixed",
+  "rate_path": {
+    "next_meeting_hike_pct": 5,
+    "next_meeting_hold_pct": 75,
+    "next_meeting_cut_pct": 20,
+    "year_end_trajectory": "",
+    "key_data_dependency": ""
+  },
+  "market_impact": {
+    "equities": {
+      "overall_direction": "neutral",
+      "overall_magnitude": "low",
+      "sp500": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "nasdaq": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "sectors": {
+        "financials": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "real_estate": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "technology": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "utilities": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "energy": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "consumer_staples": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+        "healthcare": {"direction": "neutral", "magnitude": "low", "rationale": ""}
+      }
+    },
+    "currencies": {
+      "usd_index": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "eurusd": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "usdjpy": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "gbpusd": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "audusd": {"direction": "neutral", "magnitude": "low", "rationale": ""}
+    },
+    "crypto": {
+      "bitcoin": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "ethereum": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "overall": {"direction": "neutral", "magnitude": "low", "rationale": ""}
+    },
+    "commodities": {
+      "gold": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "silver": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "oil_wti": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "copper": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "natural_gas": {"direction": "neutral", "magnitude": "low", "rationale": ""}
+    },
+    "bonds": {
+      "us_2y": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "us_10y": {"direction": "neutral", "magnitude": "low", "rationale": ""},
+      "yield_curve_shape": ""
+    }
+  },
   "playbook": {
-    "before_event": "",
+    "before_next_meeting": "",
     "first_15min": "",
-    "next_24h": ""
-  }
+    "next_24h": "",
+    "next_week": ""
+  },
+  "investor_guide": {
+    "day_trader": "",
+    "swing_trader": "",
+    "position_trader": "",
+    "long_term_investor": "",
+    "risk_manager": ""
+  },
+  "wall_street_take": ""
 }
 """
 
-    user_msg = f"""
-CURRENT FOMC STATEMENT:
+    user_msg = f"""CURRENT FOMC STATEMENT:
 {current_text}
 
 PREVIOUS FOMC STATEMENT (may be empty):
@@ -1413,20 +1659,23 @@ PRESS CONFERENCE EXCERPTS (may be empty):
 {pressconf_text}
 
 Instructions:
-- key_changes: max 8 bullet items, focus on wording changes/emphasis.
-- summary: 3-6 sentences, what changed + what it implies.
-- playbook: mention volatility + rates/USD/risk-assets bias + tactical behavior.
+- key_changes: up to 8 concise bullets on exact wording/emphasis shifts vs. previous.
+- summary: 4-6 sentences — what changed, what it implies for the policy path, what markets must price in.
+- market_impact: explain the Fed transmission mechanism for EACH asset. Be specific about WHY each market moves.
+  Use typical historical Fed transmission: hawkish = USD up, gold down, bonds down, growth stocks down, financials up, etc.
+- investor_guide: 2-4 sentences per player type. What should they watch? How does this change positioning?
+- wall_street_take: 1-2 punchy sentences. The "so what" headline a trader sends to their book right now.
 """
 
     completion = client.chat.completions.create(
-        model=OPENAI_MODEL,  # ако искаш gpt-5.1, направи OPENAI_MODEL="gpt-5.1"
+        model=OPENAI_MODEL,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.1,
-        max_completion_tokens=1200,
+        temperature=0.15,
+        max_completion_tokens=2500,
     )
 
     msg = completion.choices[0].message
@@ -1445,7 +1694,6 @@ Instructions:
 
     raw = str(raw)
 
-    # Ако по някаква причина raw вече е dict (рядко), върни го директно
     if isinstance(raw, dict):
         return raw
 
@@ -1562,11 +1810,6 @@ def init_fomc_state():
 
 
 def show_fomc_lab():
-    """
-    Streamlit UI за FOMC анализ – стабилна версия
-    """
-
-    # ---------------- STATE INIT ----------------
     if "fomc_current" not in st.session_state:
         st.session_state["fomc_current"] = ""
     if "fomc_previous" not in st.session_state:
@@ -1576,92 +1819,71 @@ def show_fomc_lab():
     if "fomc_meta" not in st.session_state:
         st.session_state["fomc_meta"] = {}
 
-    st.title("🏛 FOMC Lab — Speech & Macro Analyzer")
-
+    st.title("🏛 FOMC Lab — Fed Policy & Cross-Market Impact Analyzer")
     st.markdown(
-        "Автоматично зареждане на FOMC statement, предишно изявление и пресконференция директно от Fed.gov."
+        "Institutional-grade FOMC analysis: policy tone, rate path, and cross-market impact "
+        "across equities, currencies, crypto, commodities and bonds."
     )
 
-    # ---------------- BUTTONS ----------------
     col_btn1, col_btn2 = st.columns(2)
-
     with col_btn1:
         load_clicked = st.button("📥 Load latest FOMC statements from Fed.gov")
-
     with col_btn2:
         analyze_clicked = st.button("🔍 Analyze FOMC", type="primary")
 
-    # ---------------- LOAD FROM FED ----------------
     if load_clicked:
-        with st.spinner("Зареждам последните FOMC данни от Fed.gov..."):
+        with st.spinner("Loading latest FOMC data from Fed.gov..."):
             cur_text, prev_text, press_text, meta = get_latest_fomc_statements()
-
         if cur_text:
             st.session_state["fomc_current"] = cur_text
         if prev_text:
             st.session_state["fomc_previous"] = prev_text
         if press_text:
             st.session_state["fomc_press"] = press_text
-
         st.session_state["fomc_meta"] = meta or {}
-
         if meta.get("error"):
             st.error(meta["error"])
         else:
             st.success(
-                f"Loaded FOMC: {meta.get('current_date','?')} "
-                f"| Previous: {meta.get('previous_date','?')}"
+                f"Loaded FOMC: {meta.get('current_date','?')} | Previous: {meta.get('previous_date','?')}"
             )
-
             st.caption(f"Statement URL: {meta.get('current_url','')}")
             if meta.get("pressconf_url"):
                 st.caption(f"Press Conference URL: {meta.get('pressconf_url')}")
             if meta.get("pressconf_error"):
                 st.warning(meta.get("pressconf_error"))
 
-    # ---------------- AUTO PRESS CONF (BEFORE WIDGETS) ----------------
     meta = st.session_state.get("fomc_meta", {})
+    if not st.session_state["fomc_press"].strip() and meta.get("pressconf_url"):
+        auto = st.session_state.get("fomc_press", "")
+        if auto:
+            st.session_state["fomc_press"] = auto
 
-    if not st.session_state["fomc_press"].strip():
-        auto_pressconf = ""
-
-        # 1️⃣ FED.GOV (ако вече е извлечено)
-        if meta.get("pressconf_url"):
-            auto_pressconf = st.session_state.get("fomc_press", "")
-
-        if auto_pressconf:
-            st.session_state["fomc_press"] = auto_pressconf
-
-    # ---------------- TEXT AREAS ----------------
     col1, col2 = st.columns(2)
-
     with col1:
         current_text = st.text_area(
-            "Текущ FOMC Statement (задължително)",
+            "Current FOMC Statement (required)",
             height=260,
             key="fomc_current",
         )
-
     with col2:
         previous_text = st.text_area(
-            "Предишно FOMC Statement (по желание)",
+            "Previous FOMC Statement (optional)",
             height=260,
             key="fomc_previous",
         )
-
     pressconf_text = st.text_area(
-        "Извадки от пресконференцията (по желание)",
+        "Press Conference Excerpts (optional)",
         height=180,
         key="fomc_press",
     )
 
-    # ---------------- ANALYZE ----------------
     if analyze_clicked:
         if not current_text.strip():
-            st.error("Текущият FOMC statement е задължителен.")
+            st.error("Current FOMC statement is required.")
             return
 
-        with st.spinner("Анализирам FOMC текста с GPT..."):
+        with st.spinner("Analyzing FOMC with GPT — cross-market impact assessment..."):
             result = analyze_fomc_with_gpt(
                 current_text=current_text,
                 previous_text=previous_text,
@@ -1675,64 +1897,236 @@ def show_fomc_lab():
                     st.text(result["raw_response"])
             return
 
-        # ---------- RESULTS ----------
-        st.subheader("Macro Scoreboard")
+        def dir_emoji(d: str) -> str:
+            return {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(d, "⚪")
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Hawk / Dove Score", result.get("hawk_dove_score"))
-        with c2:
-            st.metric("Tone Change", result.get("tone_change"))
-        with c3:
-            st.metric("Trade Bias", result.get("trade_bias"))
+        def mag_label(m: str) -> str:
+            return {"high": "⚡⚡⚡", "medium": "⚡⚡", "low": "⚡"}.get(m, "—")
 
-        st.subheader("Focus by Topic (0–10)")
-        c4, c5, c6, c7 = st.columns(4)
-        c4.metric("Inflation", result.get("inflation_focus"))
-        c5.metric("Labor", result.get("labor_market_focus"))
-        c6.metric("Growth", result.get("growth_risk_focus"))
-        c7.metric("Stability", result.get("financial_stability_focus"))
+        # ── WALL STREET TAKE ──
+        wst = result.get("wall_street_take", "")
+        if wst:
+            st.info(f"💬 **Wall Street Take:** {wst}")
 
-        st.subheader("Key Changes")
-        for k in result.get("key_changes", []):
-            st.markdown(f"- {k}")
+        # ── MACRO SCOREBOARD ──
+        st.subheader("📊 Macro Scoreboard")
+        score = result.get("hawk_dove_score", 0)
+        if score > 1.5:
+            score_label = "🦅 Hawkish"
+        elif score < -1.5:
+            score_label = "🕊️ Dovish"
+        else:
+            score_label = "⚖️ Neutral"
 
-        st.subheader("Summary")
-        st.write(result.get("summary", ""))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Hawk/Dove Score", f"{score:+.1f}", help="-5 = extremely dovish, +5 = extremely hawkish")
+        c2.metric("Tone Change", result.get("tone_change", "").replace("_", " ").title())
+        c3.metric("Trade Bias", result.get("trade_bias", "").replace("_", " ").upper())
+        c4.metric("Policy Signal", score_label)
 
-        st.subheader("Trading Playbook")
-        pb = result.get("playbook", {})
-        st.markdown(f"**Before:** {pb.get('before_event','')}")
-        st.markdown(f"**First 15m:** {pb.get('first_15min','')}")
-        st.markdown(f"**Next 24h:** {pb.get('next_24h','')}")
+        st.markdown("#### Policy Focus (0–10)")
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("🔥 Inflation", result.get("inflation_focus"))
+        c6.metric("💼 Labor Market", result.get("labor_market_focus"))
+        c7.metric("📈 Growth Risk", result.get("growth_risk_focus"))
+        c8.metric("🏦 Fin. Stability", result.get("financial_stability_focus"))
 
-        # ---------- LEVEL 2 ----------
+        # ── RATE PATH ──
         st.markdown("---")
-        st.subheader("🧠 FOMC Press Conference — Key Topics (Level 2)")
+        st.subheader("🗺️ Rate Path Outlook")
+        rp = result.get("rate_path", {})
+        rp_c1, rp_c2, rp_c3 = st.columns(3)
+        rp_c1.metric("Next Meeting: Hike", f"{rp.get('next_meeting_hike_pct', 0)}%")
+        rp_c2.metric("Next Meeting: Hold", f"{rp.get('next_meeting_hold_pct', 0)}%")
+        rp_c3.metric("Next Meeting: Cut", f"{rp.get('next_meeting_cut_pct', 0)}%")
+        st.markdown(f"**Year-end trajectory:** {rp.get('year_end_trajectory', '')}")
+        st.markdown(f"**Key data to watch:** {rp.get('key_data_dependency', '')}")
 
+        # ── SUMMARY + KEY CHANGES ──
+        st.markdown("---")
+        col_s, col_k = st.columns([3, 2])
+        with col_s:
+            st.subheader("📝 Analysis Summary")
+            st.write(result.get("summary", ""))
+        with col_k:
+            st.subheader("🔄 Key Changes vs. Previous")
+            for kc in result.get("key_changes", []):
+                st.markdown(f"• {kc}")
+
+        # ── CROSS-MARKET IMPACT ──
+        st.markdown("---")
+        st.subheader("🌍 Cross-Market Impact")
+        mi = result.get("market_impact", {})
+
+        tab_eq, tab_fx, tab_cr, tab_cm, tab_bn = st.tabs(
+            ["📈 Equities", "💱 Currencies", "🪙 Crypto", "🛢️ Commodities", "🏛️ Bonds"]
+        )
+
+        with tab_eq:
+            eq = mi.get("equities", {})
+            overall_d = eq.get("overall_direction", "neutral")
+            overall_m = eq.get("overall_magnitude", "low")
+            st.markdown(
+                f"**Overall Equity Outlook:** {dir_emoji(overall_d)} **{overall_d.title()}** "
+                f"| Impact Strength: {mag_label(overall_m)}"
+            )
+            col_idx, col_sec = st.columns(2)
+            with col_idx:
+                st.markdown("**Indices**")
+                for idx_key, idx_label in [("sp500", "S&P 500"), ("nasdaq", "Nasdaq 100")]:
+                    d = eq.get(idx_key, {})
+                    st.markdown(
+                        f"**{idx_label}:** {dir_emoji(d.get('direction',''))} "
+                        f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
+                    )
+                    st.caption(d.get("rationale", ""))
+            with col_sec:
+                st.markdown("**Sectors**")
+                sector_labels = {
+                    "financials": "Financials", "real_estate": "Real Estate",
+                    "technology": "Technology", "utilities": "Utilities",
+                    "energy": "Energy", "consumer_staples": "Consumer Staples",
+                    "healthcare": "Healthcare",
+                }
+                for key, label in sector_labels.items():
+                    d = eq.get("sectors", {}).get(key, {})
+                    st.markdown(
+                        f"{dir_emoji(d.get('direction',''))} **{label}:** "
+                        f"{d.get('direction','').title()} — _{d.get('rationale','')}_"
+                    )
+
+        with tab_fx:
+            fx = mi.get("currencies", {})
+            fx_labels = {
+                "usd_index": "USD Index (DXY)", "eurusd": "EUR/USD",
+                "usdjpy": "USD/JPY", "gbpusd": "GBP/USD", "audusd": "AUD/USD",
+            }
+            for key, label in fx_labels.items():
+                d = fx.get(key, {})
+                st.markdown(
+                    f"**{label}:** {dir_emoji(d.get('direction',''))} "
+                    f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
+                )
+                st.caption(d.get("rationale", ""))
+                st.markdown("---")
+
+        with tab_cr:
+            cr = mi.get("crypto", {})
+            cr_labels = {"bitcoin": "Bitcoin (BTC)", "ethereum": "Ethereum (ETH)", "overall": "Overall Crypto Market"}
+            for key, label in cr_labels.items():
+                d = cr.get(key, {})
+                st.markdown(
+                    f"**{label}:** {dir_emoji(d.get('direction',''))} "
+                    f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
+                )
+                st.caption(d.get("rationale", ""))
+                st.markdown("---")
+            st.info(
+                "💡 **Why crypto reacts to the Fed:** Crypto is highly sensitive to USD liquidity conditions. "
+                "Dovish = more liquidity → risk-on → crypto up. Hawkish = tighter liquidity → risk-off → crypto down. "
+                "Bitcoin also acts as a partial inflation hedge and digital gold."
+            )
+
+        with tab_cm:
+            cm = mi.get("commodities", {})
+            cm_labels = {
+                "gold": "Gold", "silver": "Silver",
+                "oil_wti": "Oil (WTI)", "copper": "Copper", "natural_gas": "Natural Gas",
+            }
+            for key, label in cm_labels.items():
+                d = cm.get(key, {})
+                st.markdown(
+                    f"**{label}:** {dir_emoji(d.get('direction',''))} "
+                    f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
+                )
+                st.caption(d.get("rationale", ""))
+                st.markdown("---")
+            st.info(
+                "💡 **Key commodity mechanics:** Gold moves inversely to real rates and USD. "
+                "Silver follows gold but with more industrial demand exposure. "
+                "Oil is a growth proxy — Fed easing boosts demand outlook. "
+                "Copper is the global growth barometer."
+            )
+
+        with tab_bn:
+            bn = mi.get("bonds", {})
+            for key, label in [("us_2y", "US 2Y Treasury"), ("us_10y", "US 10Y Treasury")]:
+                d = bn.get(key, {})
+                st.markdown(
+                    f"**{label}:** {dir_emoji(d.get('direction',''))} "
+                    f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
+                )
+                st.caption(d.get("rationale", ""))
+                st.markdown("---")
+            yc = bn.get("yield_curve_shape", "")
+            if yc:
+                st.markdown(f"**Yield Curve Shape:** {yc}")
+            st.info(
+                "💡 **Bond mechanics:** 2Y yields are most sensitive to Fed policy expectations. "
+                "10Y yields reflect both policy and long-term growth/inflation. "
+                "Bond prices move OPPOSITE to yields — 'bullish bonds' means yields fall, prices rise."
+            )
+
+        # ── TRADING PLAYBOOK ──
+        st.markdown("---")
+        st.subheader("⚡ Trading Playbook")
+        pb = result.get("playbook", {})
+        pb_tabs = st.tabs(["Before Next Meeting", "First 15 Minutes", "Next 24 Hours", "Next Week"])
+        for tab_obj, key, default in zip(
+            pb_tabs,
+            ["before_next_meeting", "first_15min", "next_24h", "next_week"],
+            ["", "", "", ""],
+        ):
+            with tab_obj:
+                st.write(pb.get(key, default) or "No specific guidance.")
+
+        # ── INVESTOR GUIDE ──
+        st.markdown("---")
+        st.subheader("👤 Investor Guide — What This Means For You")
+        ig = result.get("investor_guide", {})
+        ig_items = [
+            ("day_trader", "🏃 Day Trader", "Short-term volatility plays, intraday positioning"),
+            ("swing_trader", "📊 Swing Trader", "1-4 week directional trades"),
+            ("position_trader", "📅 Position Trader", "1-3 month thesis-driven positions"),
+            ("long_term_investor", "🏛️ Long-term Investor", "Portfolio allocation changes, multi-month view"),
+            ("risk_manager", "🛡️ Risk Manager", "Hedging, correlation changes, tail risk"),
+        ]
+        for key, label, subtitle in ig_items:
+            text = ig.get(key, "")
+            if text:
+                with st.expander(f"{label} — {subtitle}"):
+                    st.write(text)
+
+        # ── PRESS CONF LEVEL 2 ──
+        st.markdown("---")
+        st.subheader("🧠 FOMC Press Conference — Key Topics")
         if pressconf_text.strip():
             with st.spinner("Extracting key topics..."):
                 lvl2 = extract_fomc_pressconf_topics(pressconf_text)
-
             if "error" in lvl2:
                 st.warning(lvl2.get("error"))
             else:
+                c_tone, c_bias = st.columns(2)
+                c_tone.metric("Overall Tone", lvl2.get("overall_tone", "").title())
+                c_bias.metric("Trade Bias", lvl2.get("trade_bias", "").replace("_", " ").upper())
+                st.markdown(f"**Change vs. previous:** {lvl2.get('implied_change_vs_previous', '')}")
+                st.markdown("**Topics discussed:**")
                 for t in lvl2.get("topics", []):
                     st.markdown(
-                        f"- **{t['topic']}** → {t['summary']} (_{t['stance']}_)"
+                        f"- **{t.get('topic','')}** ({t.get('stance','')}) — "
+                        f"{t.get('summary','')} | _Market take: {t.get('market_take','')}_"
                     )
-
-                st.markdown(f"**Overall tone:** `{lvl2.get('overall_tone')}`")
-                st.markdown(
-                    f"**Change vs previous:** {lvl2.get('implied_change_vs_previous')}"
-                )
-
+                st.markdown("**Scenarios:**")
+                for sc in lvl2.get("scenarios", []):
+                    st.markdown(
+                        f"- **{sc.get('name','')}** ({sc.get('probability',0)}%): {sc.get('description','')}"
+                    )
                 with st.expander("Raw Level 2 JSON"):
                     st.json(lvl2)
         else:
-            st.info("Няма наличен текст от пресконференция.")
+            st.info("No press conference text available. Load from Fed.gov or paste manually.")
 
-        with st.expander("Raw JSON result"):
+        with st.expander("🔍 Raw JSON (full result)"):
             st.json(result)
 
 

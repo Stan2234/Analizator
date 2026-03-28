@@ -2932,7 +2932,7 @@ tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
 
 # -------- GLOBAL TAB --------
 with tab_global:
-    st.subheader("🌍 Global Signals — Multi-Asset Dashboard")
+    st.subheader("Global Signals — Yahoo Finance (1D, ~1y history)")
 
     all_classes = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
     selected_classes = st.multiselect(
@@ -2940,6 +2940,9 @@ with tab_global:
         options=all_classes,
         default=all_classes,
     )
+
+    st.write("Data source: Yahoo Finance chart API.")
+    st.write("Logic: Multi-indicator scoring (SMA + RSI + MACD + Bollinger + Stochastic + ADX).")
 
     refresh = st.button("🔄 Refresh global signals")
 
@@ -2952,43 +2955,22 @@ with tab_global:
     if df_global.empty:
         st.error("No global results. Possibly no data or connection issue.")
     else:
-        def color_global_row(row):
-            sig = row.get("signal", "")
-            if "BUY" in str(sig):
-                return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
-            elif "SELL" in str(sig):
-                return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
-            return ["color: #cccccc; background-color: #000000;" for _ in row]
+        def color_terminal(row):
+            return ["color: #00ff00; background-color: #000000;" for _ in row]
 
-        styled_df = df_global.style.apply(color_global_row, axis=1)
+        styled_df = df_global.style.apply(color_terminal, axis=1)
         st.dataframe(styled_df, use_container_width=True)
 
-        # Signal cards by asset class
         st.markdown("---")
-        for ac in selected_classes:
-            ac_df = df_global[df_global["asset_class"] == ac]
-            if ac_df.empty:
-                continue
-            st.subheader(f"{ac.title()}")
-            n_cols = min(5, len(ac_df))
-            cols_row = st.columns(n_cols)
-            for i, (_, row) in enumerate(ac_df.iterrows()):
-                col = cols_row[i % n_cols]
-                sig = row["signal"]
-                if "BUY" in sig:
-                    sig_icon = "🟢"
-                elif "SELL" in sig:
-                    sig_icon = "🔴"
-                else:
-                    sig_icon = "⚪"
-                with col:
-                    st.markdown(
-                        f"**{row['name']}**\n\n"
-                        f"{sig_icon} **{sig}**\n\n"
-                        f"Score: `{row.get('score','N/A')}` | RSI: `{row['rsi14']}`\n\n"
-                        f"Close: `{row['close']}`\n\n"
-                        f"Trend: `{row['trend']}` | Mom: `{row['momentum']}`"
-                    )
+        st.subheader("Summary")
+        for _, row in df_global.iterrows():
+            st.markdown(
+                f"**{row['name']}** (`{row['ticker']}`) — "
+                f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
+                f"Score: `{row.get('score','N/A')}`, "
+                f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
+                f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
+            )
 
 # -------- FX / CURRENCIES TAB --------
 with tab_fx:
@@ -3026,12 +3008,7 @@ with tab_fx:
             st.error("No FX data available. Check connection.")
         else:
             def color_fx_row(row):
-                sig = row.get("signal", "")
-                if "BUY" in str(sig):
-                    return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
-                elif "SELL" in str(sig):
-                    return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
-                return ["color: #cccccc; background-color: #000000;" for _ in row]
+                return ["color: #00ff00; background-color: #000000;" for _ in row]
             styled_fx = df_fx.style.apply(color_fx_row, axis=1)
             st.dataframe(styled_fx, use_container_width=True)
 
@@ -3205,12 +3182,7 @@ with tab_crypto:
                 st.error("No Binance crypto results.")
             else:
                 def color_crypto_row(row):
-                    sig = row.get("signal", "")
-                    if "BUY" in str(sig):
-                        return ["color: #00ff00; background-color: #0a1a0a;" for _ in row]
-                    elif "SELL" in str(sig):
-                        return ["color: #ff4d4d; background-color: #1a0a0a;" for _ in row]
-                    return ["color: #cccccc; background-color: #000000;" for _ in row]
+                    return ["color: #00ff00; background-color: #000000;" for _ in row]
 
                 styled_crypto = df_crypto.style.apply(color_crypto_row, axis=1)
                 st.dataframe(styled_crypto, use_container_width=True)

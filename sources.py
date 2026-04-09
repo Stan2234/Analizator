@@ -337,20 +337,88 @@ def fetch_crypto_fear_greed() -> Optional[Dict[str, Any]]:
 
 
 def fetch_stocks_fear_greed() -> Optional[Dict[str, Any]]:
-    """CNN Fear & Greed for US stocks (production.dataviz.cnn.io)."""
-    r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-    if not r:
-        return None
+    """
+    CNN Fear & Greed first; on failure, build a synthetic stocks F&G from:
+      - VIX (inverted): low VIX = greed
+      - S&P 500 14d momentum
+      - S&P 500 distance from 50-day MA
+      - 52-week high proximity
+      - Put/Call (skipped if unavailable)
+    """
+    # Try CNN first (works from some IPs / browsers)
     try:
-        d = r.json() or {}
-        fg = d.get("fear_and_greed") or {}
-        val = fg.get("score")
-        if val is None:
+        r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+                 headers={
+                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                     "Accept": "application/json, text/plain, */*",
+                     "Origin": "https://www.cnn.com",
+                     "Referer": "https://www.cnn.com/",
+                 })
+        if r:
+            d = r.json() or {}
+            fg = d.get("fear_and_greed") or {}
+            val = fg.get("score")
+            if val is not None:
+                return {"value": int(round(float(val))),
+                        "label": fg.get("rating") or _label_from_score(int(round(float(val)))),
+                        "timestamp": fg.get("timestamp"),
+                        "source": "CNN"}
+    except Exception:
+        pass
+
+    # Fallback: synthetic from Yahoo
+    try:
+        scores = []
+        details: Dict[str, Any] = {}
+
+        # VIX
+        r = _get(YAHOO_QUOTE.format("^VIX"), params={"interval": "1d", "range": "1mo"})
+        if r:
+            try:
+                result = (r.json().get("chart") or {}).get("result") or []
+                closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [c for c in closes if c is not None]
+                if closes:
+                    vix = closes[-1]
+                    details["VIX"] = round(vix, 2)
+                    z = (20.0 - vix) / 6.0  # 14=greed, 26=fear
+                    scores.append(z)
+            except Exception:
+                pass
+
+        # S&P 500 — momentum + 50d distance + 52w high proximity
+        r = _get(YAHOO_QUOTE.format("^GSPC"), params={"interval": "1d", "range": "1y"})
+        if r:
+            try:
+                result = (r.json().get("chart") or {}).get("result") or []
+                closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [c for c in closes if c is not None]
+                if len(closes) >= 60:
+                    last = closes[-1]
+                    # 14d momentum
+                    ret_14d = (last / closes[-14] - 1.0) * 100.0
+                    details["SPX_14d_pct"] = round(ret_14d, 2)
+                    scores.append(ret_14d / 2.0)  # +2% over 14d ≈ +1z
+                    # Distance from 50d MA
+                    sma50 = sum(closes[-50:]) / 50.0
+                    dist = (last / sma50 - 1.0) * 100.0
+                    details["SPX_vs_50dMA_pct"] = round(dist, 2)
+                    scores.append(dist / 2.0)
+                    # 52w high proximity
+                    hi = max(closes[-252:]) if len(closes) >= 252 else max(closes)
+                    drawdown = (last / hi - 1.0) * 100.0  # negative
+                    details["SPX_drawdown_from_52wk_pct"] = round(drawdown, 2)
+                    # 0% = greed, -10% = fear
+                    scores.append((drawdown + 5.0) / 3.0)
+            except Exception:
+                pass
+
+        if not scores:
             return None
-        return {"value": int(round(float(val))),
-                "label": fg.get("rating") or _label_from_score(int(round(float(val)))),
-                "timestamp": fg.get("timestamp")}
+        avg_z = sum(scores) / len(scores)
+        v = _z_to_score(avg_z)
+        return {"value": v, "label": _label_from_score(v),
+                "details": details, "source": "synthetic"}
     except Exception:
         return None
 

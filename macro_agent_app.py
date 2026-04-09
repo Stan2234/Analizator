@@ -16,8 +16,28 @@ from bs4 import BeautifulSoup
 import streamlit.components.v1 as components
 import pdfplumber
 import io
+import uuid
+
+# New modules: SQLite data layer, source clients, background scheduler, Claude agent
+try:
+    import data_layer as dl
+    import scheduler as bg_scheduler
+    import agent as ai_agent
+    _HAS_AGENT = True
+except Exception as _e:
+    _HAS_AGENT = False
+    _AGENT_IMPORT_ERROR = str(_e)
 
 st.set_page_config(page_title="AI Macro Agent", layout="wide")
+
+# Start background scheduler exactly once per process
+if _HAS_AGENT and "scheduler_started" not in st.session_state:
+    try:
+        bg_scheduler.start_scheduler(run_now=True)
+        st.session_state["scheduler_started"] = True
+    except Exception as _e:
+        st.session_state["scheduler_started"] = False
+        st.session_state["scheduler_error"] = str(_e)
 if "yahoo_live_errors" not in st.session_state:
     st.session_state["yahoo_live_errors"] = {}
 def password_gate():
@@ -81,7 +101,34 @@ DAYS_BACK = 365
 RSI_PERIOD = 14
 
 NEWS_HISTORY_FILE = "news_history.csv"
-NEWS_RETENTION_DAYS = 90  # колко дни назад пазим новини в памет
+NEWS_RETENTION_DAYS = 90
+NEWS_LAST_FETCH_FILE = "news_last_fetch.json"
+
+# Schedule: 3 fetches per day at these UTC hours
+# 08:00 UTC = before EU open, 14:00 UTC = US open, 21:00 UTC = after US close
+NEWS_FETCH_HOURS_UTC = [8, 14, 21]
+
+# Split keywords into 3 rotation groups to stay under NewsAPI rate limits
+# (~12 keywords per group x 3 articles = ~36 calls per fetch, well under 100/day limit)
+NEWS_KEYWORD_GROUPS = {
+    0: [  # Group A: Crypto + Commodities + Major macro
+        "Bitcoin", "Ethereum", "Gold", "Silver",
+        "S&P 500", "Nasdaq 100", "Federal Reserve",
+        "Jerome Powell", "United States economy",
+        "ECB", "Christine Lagarde", "China economy",
+    ],
+    1: [  # Group B: Big tech + Key figures
+        "Nvidia", "Apple", "Microsoft", "Tesla",
+        "Alphabet", "Google", "Amazon", "Netflix",
+        "BlackRock", "JPMorgan", "Elon Musk", "Bill Gates",
+    ],
+    2: [  # Group C: Defense + Macro + Institutions
+        "ASML", "L3Harris", "AeroVironment", "Kratos Defense",
+        "Allianz", "Rheinmetall", "European defense spending",
+        "NATO defense", "Bank of Japan", "Bank of England",
+        "IMF", "World Bank", "EU economy",
+    ],
+}
 
 # Retro CSS: фон черен, текст бял; таблиците ги оцветяваме отделно
 retro_css = """
@@ -1289,6 +1336,199 @@ def aggregate_news(keywords: List[str]) -> List[Dict[str, Any]]:
     all_news_sorted = sorted(all_news, key=lambda x: x.get("published_at", ""), reverse=True)
     update_news_history(all_news_sorted)
     return all_news_sorted
+
+
+# ------------------------------------
+# SCHEDULED NEWS AUTO-FETCH
+# ------------------------------------
+
+def _load_fetch_state() -> Dict[str, Any]:
+    """Load the last fetch timestamp and group index."""
+    if os.path.exists(NEWS_LAST_FETCH_FILE):
+        try:
+            with open(NEWS_LAST_FETCH_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_fetch_utc": None, "last_group": -1, "fetch_count_today": 0, "last_date": None}
+
+
+def _save_fetch_state(state: Dict[str, Any]) -> None:
+    try:
+        with open(NEWS_LAST_FETCH_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def _get_current_fetch_slot() -> Optional[int]:
+    """
+    Determine which scheduled slot we're in based on current UTC hour.
+    Returns the slot index (0, 1, 2) if it's time to fetch, or None if not.
+    """
+    now_utc = dt.datetime.utcnow()
+    current_hour = now_utc.hour
+
+    # Find which slot matches (allow 1-hour window after each scheduled hour)
+    for i, sched_hour in enumerate(NEWS_FETCH_HOURS_UTC):
+        if sched_hour <= current_hour < sched_hour + 1:
+            return i
+    return None
+
+
+def _get_nearest_slot_group() -> int:
+    """Get the keyword group index for the nearest past fetch slot."""
+    now_utc = dt.datetime.utcnow()
+    current_hour = now_utc.hour
+
+    # Find the most recent scheduled hour
+    best_slot = 0
+    for i, sched_hour in enumerate(NEWS_FETCH_HOURS_UTC):
+        if current_hour >= sched_hour:
+            best_slot = i
+    return best_slot
+
+
+def auto_fetch_news_if_needed() -> Optional[List[Dict[str, Any]]]:
+    """
+    Smart scheduled news fetching — runs automatically on page load.
+
+    Strategy:
+    - 3 fetch windows per day at 08:00, 14:00, 21:00 UTC
+    - Each window fetches a different keyword group (~12 keywords)
+    - Total: ~36 calls x 3 = ~108 calls/day (fits NewsAPI free tier with margin)
+    - If already fetched this window, uses cached history instead
+    - Returns new items if fetched, None if skipped (use history)
+    """
+    if not NEWSAPI_KEY:
+        return None
+
+    state = _load_fetch_state()
+    now_utc = dt.datetime.utcnow()
+    today_str = now_utc.strftime("%Y-%m-%d")
+    current_hour = now_utc.hour
+
+    # Reset daily counter if new day
+    if state.get("last_date") != today_str:
+        state["fetch_count_today"] = 0
+        state["last_date"] = today_str
+
+    # Safety: max 3 fetches per day
+    if state.get("fetch_count_today", 0) >= 3:
+        return None
+
+    # Check if we're in a fetch window
+    slot = _get_current_fetch_slot()
+
+    # If not in an exact window, check if we missed any fetches today
+    if slot is None:
+        # Check if any scheduled slot has been missed today
+        last_fetch_str = state.get("last_fetch_utc")
+        if last_fetch_str:
+            try:
+                last_fetch = dt.datetime.fromisoformat(last_fetch_str)
+                hours_since = (now_utc - last_fetch).total_seconds() / 3600
+                if hours_since < 4:  # fetched recently enough
+                    return None
+            except Exception:
+                pass
+
+        # Find the group for the nearest past slot
+        slot = _get_nearest_slot_group()
+
+        # Check if we already fetched for this slot today
+        last_group = state.get("last_group", -1)
+        if last_group == slot and state.get("last_date") == today_str:
+            return None
+    else:
+        # We're in an exact window — check if already fetched this slot
+        last_group = state.get("last_group", -1)
+        if last_group == slot and state.get("last_date") == today_str:
+            return None
+
+    # Determine which keyword group to fetch
+    group_idx = slot % len(NEWS_KEYWORD_GROUPS)
+    keywords = NEWS_KEYWORD_GROUPS[group_idx]
+
+    # Fetch!
+    all_news: List[Dict[str, Any]] = []
+    try:
+        for kw in keywords:
+            items = fetch_news_for_keyword(kw, page_size=3)
+            all_news.extend(items)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            # Rate limited — don't count as a fetch, try again later
+            return None
+        return None
+    except Exception:
+        return None
+
+    if all_news:
+        all_news_sorted = sorted(all_news, key=lambda x: x.get("published_at", ""), reverse=True)
+        update_news_history(all_news_sorted)
+
+        # Update state
+        state["last_fetch_utc"] = now_utc.isoformat()
+        state["last_group"] = group_idx
+        state["fetch_count_today"] = state.get("fetch_count_today", 0) + 1
+        state["last_date"] = today_str
+        _save_fetch_state(state)
+
+        return all_news_sorted
+
+    return None
+
+
+def get_news_with_auto_fetch() -> List[Dict[str, Any]]:
+    """
+    Main entry point for getting news. Tries auto-fetch first,
+    falls back to cached history.
+    """
+    # Try scheduled auto-fetch
+    new_items = auto_fetch_news_if_needed()
+
+    if new_items:
+        return new_items
+
+    # Fall back to history
+    hist = load_news_history_df()
+    if hist.empty:
+        return []
+    return hist.sort_values("published_at", ascending=False).to_dict("records")
+
+
+def get_news_fetch_status() -> Dict[str, Any]:
+    """Return current fetch schedule status for display."""
+    state = _load_fetch_state()
+    now_utc = dt.datetime.utcnow()
+    today_str = now_utc.strftime("%Y-%m-%d")
+
+    fetches_today = state.get("fetch_count_today", 0) if state.get("last_date") == today_str else 0
+    last_fetch = state.get("last_fetch_utc", "Never")
+    last_group = state.get("last_group", -1)
+
+    # Next fetch time
+    current_hour = now_utc.hour
+    next_fetch_hour = None
+    for h in NEWS_FETCH_HOURS_UTC:
+        if current_hour < h:
+            next_fetch_hour = h
+            break
+    if next_fetch_hour is None:
+        next_fetch_hour = NEWS_FETCH_HOURS_UTC[0]  # tomorrow
+
+    group_names = {0: "Crypto + Macro", 1: "Tech + Key Figures", 2: "Defense + Institutions"}
+    last_group_name = group_names.get(last_group, "None")
+
+    return {
+        "fetches_today": fetches_today,
+        "max_fetches": 3,
+        "last_fetch": last_fetch,
+        "last_group": last_group_name,
+        "next_fetch_hour_utc": f"{next_fetch_hour:02d}:00 UTC",
+        "schedule": [f"{h:02d}:00 UTC" for h in NEWS_FETCH_HOURS_UTC],
+    }
 
 
 def get_relevant_news_for_asset(focus_asset: str, max_items: int = 40) -> List[Dict[str, Any]]:
@@ -3361,10 +3601,46 @@ with tab_news:
             "NEWSAPI_KEY is missing in .env. Add NEWSAPI_KEY=... to load news."
         )
     else:
-        st.write(
-            "Tracking news for major assets (BTC, ETH, Gold, Silver, Nvidia, Apple, Microsoft, Tesla, Amazon, etc.), "
-            "major indices, central banks and key figures."
-        )
+        # ── AUTO-FETCH on page load ──
+        if "news_auto_fetched" not in st.session_state:
+            auto_items = auto_fetch_news_if_needed()
+            if auto_items:
+                st.session_state["news_items"] = auto_items
+                st.session_state["news_auto_fetch_msg"] = "Auto-fetched new articles on schedule."
+            st.session_state["news_auto_fetched"] = True
+
+        # If no news at all, load from history
+        if "news_items" not in st.session_state or not st.session_state.get("news_items"):
+            hist = load_news_history_df()
+            if not hist.empty:
+                st.session_state["news_items"] = hist.sort_values("published_at", ascending=False).to_dict("records")
+
+        # ── SCHEDULE STATUS ──
+        fetch_status = get_news_fetch_status()
+        with st.expander("📅 News Fetch Schedule"):
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Fetches Today", f"{fetch_status['fetches_today']}/{fetch_status['max_fetches']}")
+            sc2.metric("Last Group", fetch_status["last_group"])
+            sc3.metric("Next Fetch", fetch_status["next_fetch_hour_utc"])
+
+            st.markdown(
+                f"**Schedule (UTC):** {', '.join(fetch_status['schedule'])}\n\n"
+                f"**Last fetch:** {fetch_status['last_fetch']}\n\n"
+                "**How it works:** News keywords are split into 3 rotation groups. "
+                "Each scheduled window fetches one group (~12 keywords x 3 articles = ~36 API calls). "
+                "Total: ~108 calls/day — fits within NewsAPI free tier limits."
+            )
+
+            st.markdown(
+                "**Group A (08:00 UTC):** Crypto + Commodities + Major Macro\n\n"
+                "**Group B (14:00 UTC):** Big Tech + Key Figures\n\n"
+                "**Group C (21:00 UTC):** Defense + Institutions + Central Banks"
+            )
+
+        # Show auto-fetch notification
+        auto_msg = st.session_state.pop("news_auto_fetch_msg", None)
+        if auto_msg:
+            st.success(auto_msg)
 
         df_global_for_ai = st.session_state.get("df_signals_global", pd.DataFrame())
         df_crypto_for_ai = st.session_state.get("df_signals_binance", pd.DataFrame())
@@ -3398,43 +3674,43 @@ with tab_news:
         )
         st.session_state["news_focus_asset"] = focus_asset
 
-        # авто-фетч при първо зареждане
-        if "news_items" not in st.session_state:
-            news_items_initial = aggregate_news(NEWS_KEYWORDS)
-            st.session_state["news_items"] = news_items_initial
-            if news_items_initial:
-                news_forecast_init = run_news_forecast(
-                    df_global=df_global_for_ai,
-                    df_crypto=df_crypto_for_ai,
-                    latest_news_items=news_items_initial,
-                    focus_asset=focus_asset,
-                )
-                st.session_state["news_forecast"] = news_forecast_init
-                st.session_state["news_forecast_asset"] = focus_asset
+        # ── BUTTONS ──
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-        # бутони
-        if st.button("🔄 Refresh news"):
-            news_items_prev = st.session_state.get("news_items", [])
-            news_items = aggregate_news(NEWS_KEYWORDS)
+        with btn_col1:
+            manual_refresh = st.button("🔄 Manual Refresh (uses API quota)")
+        with btn_col2:
+            rerun_forecast = st.button("♻️ Re-run forecast (no API calls)")
+        with btn_col3:
+            force_fetch = st.button("⚡ Force fetch all groups (uses 3x quota)")
+
+        if manual_refresh:
+            # Fetch only the current rotation group (saves quota)
+            slot = _get_nearest_slot_group()
+            keywords = NEWS_KEYWORD_GROUPS.get(slot, NEWS_KEYWORD_GROUPS[0])
+            news_items = aggregate_news(keywords)
 
             if news_items:
                 st.session_state["news_items"] = news_items
-            else:
-                news_items = news_items_prev
-                if not news_items:
-                    st.warning("No news available yet (even from history).")
+                state = _load_fetch_state()
+                now_utc = dt.datetime.utcnow()
+                state["last_fetch_utc"] = now_utc.isoformat()
+                state["last_group"] = slot
+                state["fetch_count_today"] = state.get("fetch_count_today", 0) + 1
+                state["last_date"] = now_utc.strftime("%Y-%m-%d")
+                _save_fetch_state(state)
+                st.success(f"Fetched group {slot} ({len(keywords)} keywords). {len(news_items)} articles.")
 
+        if force_fetch:
+            all_kw = []
+            for g in NEWS_KEYWORD_GROUPS.values():
+                all_kw.extend(g)
+            news_items = aggregate_news(all_kw)
             if news_items:
-                news_forecast = run_news_forecast(
-                    df_global=df_global_for_ai,
-                    df_crypto=df_crypto_for_ai,
-                    latest_news_items=news_items,
-                    focus_asset=focus_asset,
-                )
-                st.session_state["news_forecast"] = news_forecast
-                st.session_state["news_forecast_asset"] = focus_asset
+                st.session_state["news_items"] = news_items
+                st.success(f"Force-fetched all groups. {len(news_items)} articles total.")
 
-        if st.button("♻️ Re-run forecast for selected asset (no refresh)"):
+        if rerun_forecast or manual_refresh or force_fetch:
             news_items_for_run = st.session_state.get("news_items", [])
             if news_items_for_run:
                 news_forecast = run_news_forecast(
@@ -3450,6 +3726,7 @@ with tab_news:
         news_forecast = st.session_state.get("news_forecast")
         news_forecast_asset = st.session_state.get("news_forecast_asset")
 
+        # Auto-run forecast if asset changed
         if news_items and (not news_forecast or news_forecast_asset != focus_asset):
             news_forecast = run_news_forecast(
                 df_global=df_global_for_ai,
@@ -3461,24 +3738,23 @@ with tab_news:
             st.session_state["news_forecast_asset"] = focus_asset
 
         st.markdown("### 🤖 AI News-driven forecast")
-        st.write(
-            "Detailed forecast based on the news flow and signals for the selected asset."
-        )
 
         if news_forecast:
             st.markdown("---")
             st.markdown(news_forecast)
         else:
             st.info(
-                "No forecast yet. Press 'Refresh news' or 'Re-run forecast' for the selected asset."
+                "No forecast yet. News will auto-fetch at the next scheduled window, "
+                "or press 'Manual Refresh' to fetch now."
             )
 
         st.markdown("---")
         st.markdown("### Latest raw headlines")
 
         if not news_items:
-            st.warning("No news loaded yet. Press 'Refresh news'.")
+            st.warning("No news in history. Press 'Manual Refresh' or wait for the next scheduled fetch.")
         else:
+            st.caption(f"Showing {min(20, len(news_items))} of {len(news_items)} articles in history.")
             for item in news_items[:20]:
                 with st.container():
                     st.markdown(f"**[{item['title']}]({item['url']})**")
@@ -3707,10 +3983,90 @@ with tab_quant:
             except Exception as e:
                 st.error(f"Quant Lab error: {type(e).__name__}: {e}")
 
-# -------- AI TAB (можеш да го ползваш по-късно за други модули) --------
+# -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:
-    st.subheader("AI Market Analyst (bottom of page)")
-    st.info("Основният AI Market Analyst панел е по-долу на страницата. Тук може да добавиш допълнителни AI модули в бъдеще.")
+    st.subheader("🤖 Analizator — Conversational Agent")
+    st.caption("Powered by Claude. Has tool access to news (NewsAPI + 25 RSS feeds), market quotes (Yahoo + Binance), technical signals, FRED macro data, economic calendar, SEC filings (JPM/GS/BlackRock/Berkshire/Bridgewater/Renaissance/Citadel/Two Sigma/Point72/Tiger Global), Finnhub analyst recs, and the global crypto market overview. Ask anything.")
+
+    if not _HAS_AGENT:
+        st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
+    else:
+        # Status row
+        col_s1, col_s2, col_s3 = st.columns(3)
+        try:
+            health = dl.db_health()
+            sched_st = bg_scheduler.scheduler_status()
+            col_s1.metric("News stored", health.get("news_count", 0))
+            col_s2.metric("Market snapshots", health.get("market_count", 0))
+            col_s3.metric("SEC filings", health.get("sec_filings", 0))
+            with st.expander("Background scheduler"):
+                st.json(sched_st)
+                st.json(health)
+                col_a, col_b, col_c, col_d = st.columns(4)
+                if col_a.button("🔄 Refresh news now"):
+                    bg_scheduler.job_refresh_news()
+                    bg_scheduler.job_refresh_rss()
+                    st.success("Done")
+                if col_b.button("💹 Refresh quotes now"):
+                    bg_scheduler.job_refresh_quotes()
+                    st.success("Done")
+                if col_c.button("🪙 Refresh crypto now"):
+                    bg_scheduler.job_refresh_crypto_market()
+                    st.success("Done")
+                if col_d.button("🏛 Refresh SEC now"):
+                    bg_scheduler.job_refresh_sec()
+                    st.success("Done")
+        except Exception as e:
+            st.warning(f"Status unavailable: {e}")
+
+        # Chat session
+        if "agent_session_id" not in st.session_state:
+            st.session_state["agent_session_id"] = uuid.uuid4().hex
+        if "agent_messages" not in st.session_state:
+            st.session_state["agent_messages"] = []
+
+        col_clear, _ = st.columns([1, 5])
+        if col_clear.button("🧹 Clear chat"):
+            st.session_state["agent_messages"] = []
+            st.session_state["agent_session_id"] = uuid.uuid4().hex
+            st.rerun()
+
+        # Render history
+        for m in st.session_state["agent_messages"]:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # Pull text blocks for display
+                txt_parts = []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        txt_parts.append(c.get("text", ""))
+                display_text = "\n".join(txt_parts).strip()
+            else:
+                display_text = str(content)
+            if not display_text:
+                continue
+            with st.chat_message("user" if role == "user" else "assistant"):
+                st.markdown(display_text)
+
+        # Input
+        user_input = st.chat_input("Ask the agent anything about markets, macro, news, or institutions...")
+        if user_input:
+            st.session_state["agent_messages"].append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.markdown(user_input)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        result = ai_agent.run_agent_turn(st.session_state["agent_messages"])
+                        st.session_state["agent_messages"] = result["messages"]
+                        st.markdown(result["text"])
+                        if result.get("tool_calls"):
+                            with st.expander(f"🔧 Tools used ({len(result['tool_calls'])})"):
+                                for tc in result["tool_calls"]:
+                                    st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
+                    except Exception as e:
+                        st.error(f"Agent error: {e}")
 
 # -------- FOMC TAB --------
 with tab_fomc:

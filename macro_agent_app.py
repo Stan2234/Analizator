@@ -48,11 +48,22 @@ def password_gate():
         st.title("Login")
         pwd = st.text_input("Password", type="password")
 
-        if pwd and pwd == st.secrets["APP_PASSWORD"]:
+        # Read APP_PASSWORD from env first (Render), then Streamlit secrets (Streamlit Cloud)
+        expected = os.environ.get("APP_PASSWORD", "")
+        if not expected:
+            try:
+                if "APP_PASSWORD" in st.secrets:
+                    expected = str(st.secrets["APP_PASSWORD"])
+            except Exception:
+                expected = ""
+
+        if pwd and expected and pwd == expected:
             st.session_state.auth = True
             st.rerun()
         elif pwd:
             st.error("Wrong password")
+        elif not expected:
+            st.warning("APP_PASSWORD not configured on the server.")
 
         st.stop()
 
@@ -60,15 +71,24 @@ password_gate()
 
 
 def inject_secrets_to_env():
-    for key in [
+    keys = [
         "NEWSAPI_KEY",
         "BINANCE_API_KEY",
         "BINANCE_API_SECRET",
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
-    ]:
-        if key in st.secrets and not os.getenv(key):
-            os.environ[key] = str(st.secrets[key])
+        "ANTHROPIC_API_KEY",
+        "FRED_API_KEY",
+        "FINNHUB_API_KEY",
+        "APP_PASSWORD",
+    ]
+    try:
+        for key in keys:
+            if key in st.secrets and not os.getenv(key):
+                os.environ[key] = str(st.secrets[key])
+    except Exception:
+        # No secrets.toml available (e.g. Render) — env vars are already set
+        pass
 
 inject_secrets_to_env()
 

@@ -181,6 +181,11 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "get_sentiment_indexes",
+        "description": "Get all 4 sentiment / fear & greed indexes: crypto (alternative.me), US stocks (CNN), commodities (synthetic from gold/silver/oil momentum), and global macro risk (synthetic from VIX, yield curve, HY spread, DXY). Each returns 0-100 (higher = greedier/risk-on).",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "get_db_health",
         "description": "Diagnostics: how many news/market/signal/SEC rows are stored, and the timestamp of the latest news.",
         "input_schema": {"type": "object", "properties": {}}
@@ -309,6 +314,16 @@ def _tool_get_db_health(_args: Dict[str, Any]) -> Any:
     return dl.db_health()
 
 
+def _tool_get_sentiment_indexes(_args: Dict[str, Any]) -> Any:
+    fred_key = _get_secret("FRED_API_KEY")
+    return {
+        "crypto":      src.fetch_crypto_fear_greed(),
+        "stocks":      src.fetch_stocks_fear_greed(),
+        "commodities": src.fetch_commodities_sentiment(),
+        "macro":       src.fetch_macro_sentiment(fred_key),
+    }
+
+
 TOOL_DISPATCH = {
     "search_news":                  _tool_search_news,
     "get_market_quote":             _tool_get_market_quote,
@@ -323,6 +338,7 @@ TOOL_DISPATCH = {
     "get_analyst_recommendations":  _tool_get_analyst_recommendations,
     "list_all_symbols":             _tool_list_all_symbols,
     "get_db_health":                _tool_get_db_health,
+    "get_sentiment_indexes":        _tool_get_sentiment_indexes,
 }
 
 

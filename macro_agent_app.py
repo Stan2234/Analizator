@@ -3174,6 +3174,50 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 """)
 
 components.html(live_ticker_html, height=120, scrolling=False)
+
+# ===== FEAR & GREED INDEXES =====
+def _fg_color(v):
+    if v is None: return "#888"
+    if v >= 75: return "#00cc44"
+    if v >= 55: return "#88cc00"
+    if v >= 45: return "#cccc00"
+    if v >= 25: return "#ff8800"
+    return "#ff2222"
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_sentiments():
+    try:
+        import sources as _src
+        fred_key = os.environ.get("FRED_API_KEY", "")
+        return {
+            "crypto":      _src.fetch_crypto_fear_greed(),
+            "stocks":      _src.fetch_stocks_fear_greed(),
+            "commodities": _src.fetch_commodities_sentiment(),
+            "macro":       _src.fetch_macro_sentiment(fred_key),
+        }
+    except Exception as _e:
+        return {"error": str(_e)}
+
+_sents = _load_sentiments()
+sc1, sc2, sc3, sc4 = st.columns(4)
+def _render_fg(col, title, data):
+    if not data:
+        col.metric(title, "—", "no data")
+        return
+    v = data.get("value")
+    lbl = data.get("label") or ""
+    col.markdown(
+        f"<div style='padding:8px;border-radius:8px;background:#0a0a0a;border:1px solid #222'>"
+        f"<div style='font-size:12px;color:#aaa'>{title}</div>"
+        f"<div style='font-size:28px;font-weight:bold;color:{_fg_color(v)}'>{v if v is not None else '—'}</div>"
+        f"<div style='font-size:13px;color:{_fg_color(v)}'>{lbl}</div>"
+        f"</div>", unsafe_allow_html=True)
+
+_render_fg(sc1, "🪙 Crypto F&G",       _sents.get("crypto"))
+_render_fg(sc2, "📈 Stocks F&G (CNN)", _sents.get("stocks"))
+_render_fg(sc3, "🛢 Commodities Mood", _sents.get("commodities"))
+_render_fg(sc4, "🌍 Global Macro Risk", _sents.get("macro"))
+
 with st.expander("Yahoo Live Debug"):
     st.write(st.session_state.get("yahoo_live_errors", {}))
 
@@ -3220,17 +3264,6 @@ with tab_global:
 
         styled_df = df_global.style.apply(color_terminal, axis=1)
         st.dataframe(styled_df, use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("Summary")
-        for _, row in df_global.iterrows():
-            st.markdown(
-                f"**{row['name']}** (`{row['ticker']}`) — "
-                f"Signal: **{row['signal']}** (conf: {int(row['confidence']*100)}%), "
-                f"Score: `{row.get('score','N/A')}`, "
-                f"trend: `{row['trend']}`, momentum: `{row['momentum']}`, "
-                f"RSI: `{row['rsi14']}`, Close: `{row['close']}`"
-            )
 
 # -------- FX / CURRENCIES TAB --------
 with tab_fx:

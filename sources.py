@@ -336,6 +336,161 @@ def fetch_crypto_fear_greed() -> Optional[Dict[str, Any]]:
         return None
 
 
+def fetch_stocks_fear_greed() -> Optional[Dict[str, Any]]:
+    """CNN Fear & Greed for US stocks (production.dataviz.cnn.io)."""
+    r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    if not r:
+        return None
+    try:
+        d = r.json() or {}
+        fg = d.get("fear_and_greed") or {}
+        val = fg.get("score")
+        if val is None:
+            return None
+        return {"value": int(round(float(val))),
+                "label": fg.get("rating") or _label_from_score(int(round(float(val)))),
+                "timestamp": fg.get("timestamp")}
+    except Exception:
+        return None
+
+
+def _label_from_score(v: int) -> str:
+    if v >= 75: return "Extreme Greed"
+    if v >= 55: return "Greed"
+    if v >= 45: return "Neutral"
+    if v >= 25: return "Fear"
+    return "Extreme Fear"
+
+
+def _z_to_score(z: float) -> int:
+    """Map a z-score (-2..+2) to 0..100 (higher = more bullish/greedy)."""
+    import math
+    s = 50 + 25 * max(min(z, 2.0), -2.0)
+    return int(round(max(0, min(100, s))))
+
+
+def fetch_commodities_sentiment() -> Optional[Dict[str, Any]]:
+    """
+    Synthetic commodities sentiment from gold/silver/oil 14d momentum.
+    Higher = risk-on / commodities rallying.
+    """
+    try:
+        symbols = ["GC=F", "SI=F", "DCOILWTICO"]  # gold, silver, WTI (via Yahoo: CL=F)
+        # Use Yahoo for all three for consistency
+        ymap = {"GC=F": "GC=F", "SI=F": "SI=F", "WTI": "CL=F"}
+        scores = []
+        details = {}
+        for label, sym in ymap.items():
+            r = _get(YAHOO_QUOTE.format(quote_plus(sym)),
+                     params={"interval": "1d", "range": "1mo"})
+            if not r:
+                continue
+            try:
+                result = (r.json().get("chart") or {}).get("result") or []
+                closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [c for c in closes if c is not None]
+                if len(closes) < 10:
+                    continue
+                ret_14d = (closes[-1] / closes[-min(14, len(closes))] - 1.0) * 100.0
+                # Commodities z: ~5% over 14d ≈ +1z
+                z = ret_14d / 5.0
+                scores.append(z)
+                details[label] = round(ret_14d, 2)
+            except Exception:
+                continue
+        if not scores:
+            return None
+        avg_z = sum(scores) / len(scores)
+        v = _z_to_score(avg_z)
+        return {"value": v, "label": _label_from_score(v), "details": details}
+    except Exception:
+        return None
+
+
+def fetch_macro_sentiment(fred_api_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Synthetic global macro risk sentiment.
+    Inputs (higher score = risk-on / greedy):
+      - VIX (inverted): low VIX = greed
+      - 10Y-2Y yield curve (inverted = fear)
+      - HY OAS spread (inverted)
+      - DXY momentum (strong USD = risk-off, inverted)
+    Falls back to Yahoo if FRED key missing.
+    """
+    try:
+        details: Dict[str, Any] = {}
+        scores = []
+
+        # VIX via Yahoo ^VIX
+        r = _get(YAHOO_QUOTE.format("^VIX"), params={"interval": "1d", "range": "1mo"})
+        try:
+            if r:
+                result = (r.json().get("chart") or {}).get("result") or []
+                closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [c for c in closes if c is not None]
+                if closes:
+                    vix = closes[-1]
+                    details["VIX"] = round(vix, 2)
+                    # VIX 12 = greed, 30 = fear
+                    z = (20.0 - vix) / 6.0
+                    scores.append(z)
+        except Exception:
+            pass
+
+        # Yield curve via FRED T10Y2Y or fallback to Yahoo ^TNX-^IRX
+        if fred_api_key:
+            obs = fetch_fred_observations(fred_api_key, "T10Y2Y", limit=5)
+            for o in obs:
+                try:
+                    val = float(o.get("value"))
+                    details["T10Y2Y"] = round(val, 2)
+                    # Inverted (-0.5) = fear, steep (+1) = greed
+                    z = val / 0.5
+                    scores.append(z)
+                    break
+                except Exception:
+                    continue
+
+        # HY spread via FRED BAMLH0A0HYM2
+        if fred_api_key:
+            obs = fetch_fred_observations(fred_api_key, "BAMLH0A0HYM2", limit=5)
+            for o in obs:
+                try:
+                    val = float(o.get("value"))
+                    details["HY_OAS"] = round(val, 2)
+                    # 3% = greed, 6% = fear
+                    z = (4.5 - val) / 1.0
+                    scores.append(z)
+                    break
+                except Exception:
+                    continue
+
+        # DXY via Yahoo DX-Y.NYB momentum
+        r = _get(YAHOO_QUOTE.format("DX-Y.NYB"), params={"interval": "1d", "range": "1mo"})
+        try:
+            if r:
+                result = (r.json().get("chart") or {}).get("result") or []
+                closes = ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [c for c in closes if c is not None]
+                if len(closes) >= 14:
+                    ret_14d = (closes[-1] / closes[-14] - 1.0) * 100.0
+                    details["DXY_14d_pct"] = round(ret_14d, 2)
+                    # Strong USD (>+1.5%) = risk-off
+                    z = -ret_14d / 1.5
+                    scores.append(z)
+        except Exception:
+            pass
+
+        if not scores:
+            return None
+        avg_z = sum(scores) / len(scores)
+        v = _z_to_score(avg_z)
+        return {"value": v, "label": _label_from_score(v), "details": details}
+    except Exception:
+        return None
+
+
 # ---------------- FRED ----------------
 
 FRED_BASE = "https://api.stlouisfed.org/fred"

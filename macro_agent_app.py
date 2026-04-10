@@ -4077,46 +4077,56 @@ with tab_ai:
             st.session_state["agent_session_id"] = uuid.uuid4().hex
         if "agent_messages" not in st.session_state:
             st.session_state["agent_messages"] = []
+        # display_history: list of {"q": str, "a": str, "tools": list}
+        if "agent_display_history" not in st.session_state:
+            st.session_state["agent_display_history"] = []
 
         col_clear, _ = st.columns([1, 5])
         if col_clear.button("🧹 Clear chat"):
             st.session_state["agent_messages"] = []
+            st.session_state["agent_display_history"] = []
             st.session_state["agent_session_id"] = uuid.uuid4().hex
             st.rerun()
 
-        # Render history
-        for m in st.session_state["agent_messages"]:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                # Pull text blocks for display
-                txt_parts = []
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        txt_parts.append(c.get("text", ""))
-                display_text = "\n".join(txt_parts).strip()
-            else:
-                display_text = str(content)
-            if not display_text:
-                continue
-            with st.chat_message("user" if role == "user" else "assistant"):
-                st.markdown(display_text)
+        # Render old Q&As as collapsed expanders
+        history = st.session_state["agent_display_history"]
+        for i, entry in enumerate(history):
+            q = entry.get("q", "")
+            a = entry.get("a", "")
+            tools = entry.get("tools", [])
+            # Truncate question for expander label
+            label = q[:80] + ("..." if len(q) > 80 else "")
+            with st.expander(f"💬 {label}", expanded=False):
+                st.markdown(f"**You:** {q}")
+                st.markdown("---")
+                st.markdown(a)
+                if tools:
+                    with st.expander(f"🔧 Tools used ({len(tools)})", expanded=False):
+                        for tc in tools:
+                            st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
 
         # Input
         user_input = st.chat_input("Ask the agent anything about markets, macro, news, or institutions...")
         if user_input:
             st.session_state["agent_messages"].append({"role": "user", "content": user_input})
-            with st.chat_message("user"):
-                st.markdown(user_input)
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
                         result = ai_agent.run_agent_turn(st.session_state["agent_messages"])
                         st.session_state["agent_messages"] = result["messages"]
-                        st.markdown(result["text"])
-                        if result.get("tool_calls"):
-                            with st.expander(f"🔧 Tools used ({len(result['tool_calls'])})"):
-                                for tc in result["tool_calls"]:
+                        answer_text = result["text"]
+                        tool_calls = result.get("tool_calls", [])
+                        # Save to display history
+                        st.session_state["agent_display_history"].append({
+                            "q": user_input,
+                            "a": answer_text,
+                            "tools": tool_calls,
+                        })
+                        # Show the latest answer fully visible
+                        st.markdown(answer_text)
+                        if tool_calls:
+                            with st.expander(f"🔧 Tools used ({len(tool_calls)})"):
+                                for tc in tool_calls:
                                     st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
                     except Exception as e:
                         st.error(f"Agent error: {e}")
@@ -4125,90 +4135,7 @@ with tab_ai:
 with tab_fomc:
     show_fomc_lab()
 
-# ================= AI MARKET ANALYST (GPT) =================
-
-st.markdown("---")
-st.subheader("🤖 AI Market Analyst")
-
-col_left, col_right = st.columns([2, 3])
-
-with col_left:
-    all_assets: List[str] = []
-
-    df_global_for_ai = st.session_state.get("df_signals_global", pd.DataFrame())
-    df_crypto_for_ai = st.session_state.get("df_signals_binance", pd.DataFrame())
-
-    if not df_global_for_ai.empty:
-        all_assets.extend(
-            df_global_for_ai["name"].astype(str)
-            + " ("
-            + df_global_for_ai["ticker"].astype(str)
-            + ")"
-        )
-    if not df_crypto_for_ai.empty:
-        all_assets.extend(
-            df_crypto_for_ai["name"].astype(str)
-            + " ("
-            + df_crypto_for_ai["symbol"].astype(str)
-            + ")"
-        )
-
-    all_assets = sorted(set(all_assets))
-
-    target_asset = st.selectbox(
-        "Asset to focus on (optional):",
-        options=["(none)"] + all_assets,
-        index=0,
-    )
-
-    horizon = st.selectbox(
-        "Time horizon:",
-        options=[
-            "1 day",
-            "1 week",
-            "1 month",
-            "3 months",
-            "6 months",
-            "1 year",
-        ],
-        index=2,
-    )
-
-with col_right:
-    user_question = st.text_area(
-        "Question to the AI analyst (can be general or asset-specific):",
-        value="Provide a detailed analysis and trading scenarios for the current markets.",
-        height=160,
-    )
-
-    if st.button("🚀 Run AI analysis"):
-        asset_for_ai = "" if target_asset == "(none)" else target_asset
-
-    # ✅ ВИНАГИ взимай новини при AI анализа (с fallback към history при 429/грешка)
-        news_items_for_ai = aggregate_news(NEWS_KEYWORDS)
-        st.session_state["news_items"] = news_items_for_ai
-
-        answer = run_ai_analyst(
-            df_global=df_global_for_ai,
-            df_crypto=df_crypto_for_ai,
-            news_items=news_items_for_ai,
-            target_asset=asset_for_ai,
-            horizon=horizon,
-            user_question=user_question,
-    )
-
-        st.markdown("---")
-        st.markdown(answer)
-
-
 # ================= END OF APP LAYOUT =================
-
-st.markdown("---")
-st.write("Application loaded successfully.")
-st.write(
-    "Use the tabs above to view Global Signals, Crypto Signals, News & Macro, the FOMC Lab, "
-    "or run the AI Market Analyst."
-)
 
 
 

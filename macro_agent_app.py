@@ -3823,17 +3823,20 @@ with tab_news:
                     
 # -------- QUANT TAB --------
 with tab_quant:
-    st.subheader("🧮 Quant Lab — Renaissance-Grade Quantitative Analysis")
-    st.markdown(
-        "Institutional systematic analysis inspired by Renaissance Technologies / Two Sigma. "
-        "Multi-factor scoring: regime detection, mean-reversion, momentum, tail risk, and Monte Carlo."
-    )
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
+    st.markdown("""
+    <div style="padding:12px 0 4px 0">
+    <span style="font-size:28px;font-weight:800;letter-spacing:-1px">QUANT LAB</span>
+    <span style="font-size:14px;color:#888;margin-left:12px">Institutional systematic analysis · Regime · Momentum · Tail risk · Monte Carlo</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── ASSET SELECTOR (horizontal, compact) ──
     df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
     df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
-
-    asset_options_q: List[str] = ["(choose)"]
-
+    asset_options_q: List[str] = []
     if not df_global_for_q.empty:
         asset_options_q.extend(
             df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
@@ -3842,28 +3845,30 @@ with tab_quant:
         asset_options_q.extend(
             df_crypto_for_q["name"].astype(str) + " (" + df_crypto_for_q["symbol"].astype(str) + ")"
         )
+    asset_options_q = ["(choose)"] + sorted(set(asset_options_q))
 
-    asset_options_q = sorted(set(asset_options_q))
+    qc1, qc2, qc3, qc4, qc5 = st.columns([2.5, 1, 1.5, 1.5, 1])
+    with qc1:
+        focus_asset_q = st.selectbox("Asset", options=asset_options_q, index=0, key="quant_asset", label_visibility="collapsed")
+    with qc2:
+        source_pref_q = st.selectbox("Src", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source", label_visibility="collapsed")
+    with qc3:
+        lookback_days_q = st.select_slider("Lookback", options=[90, 180, 365, 540, 730], value=365, key="quant_lookback", label_visibility="collapsed")
+    with qc4:
+        horizon_label_q = st.selectbox("Horizon", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon", label_visibility="collapsed")
+    with qc5:
+        run_quant_btn = st.button("▶ Run", type="primary", key="run_quant_btn", use_container_width=True)
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        focus_asset_q = st.selectbox("Asset:", options=asset_options_q, index=0, key="quant_asset")
-        source_pref_q = st.selectbox("Source:", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source")
-
-    with colB:
-        lookback_days_q = st.slider("Lookback (days):", 90, 730, 365, 30, key="quant_lookback")
-        jump_z_q = st.slider("Jump threshold (z):", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
-
-    with colC:
-        tf_binance_q = st.selectbox("Binance timeframe:", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
-        horizon_label_q = st.selectbox("Horizon:", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon")
-
-    run_quant_btn = st.button("🧮 Run Quant Analysis", type="primary", key="run_quant_btn")
+    with st.expander("⚙ Advanced", expanded=False):
+        ac1, ac2, ac3 = st.columns(3)
+        jump_z_q = ac1.slider("Jump threshold (z)", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
+        tf_binance_q = ac2.selectbox("Binance timeframe", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
+        mc_sims_q = ac3.number_input("Monte Carlo sims", min_value=1000, max_value=50000, value=10000, step=1000, key="quant_sims")
 
     if run_quant_btn:
         sym = parse_selected_asset_to_symbol(focus_asset_q)
         if not sym:
-            st.warning("Select an asset.")
+            st.warning("Select an asset first.")
         else:
             source = detect_source_for_symbol(sym, preferred=source_pref_q)
             mpd = bars_per_day_for_tf(source, tf_binance_q)
@@ -3872,169 +3877,413 @@ with tab_quant:
             tf_used = "1d" if source == "Yahoo" else tf_binance_q
             bpy = bars_per_year_for_timeframe(source, tf_used)
 
-            try:
-                close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
-                returns = np.log(close_series).diff().dropna()
-
-                # Core quant metrics
-                qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q), horizon_bars=int(horizon_bars))
-
-                if "error" in qm:
-                    st.error(qm["error"])
-                else:
-                    # Advanced metrics
-                    regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3))
-                    mean_rev = compute_mean_reversion_signals(close_series)
-                    mom_feat = compute_momentum_features(close_series)
-                    tail_risk = compute_tail_risk_metrics(returns)
-                    acf = compute_autocorrelation(returns, max_lag=5)
-
-                    # ── REGIME & SIGNAL OVERVIEW ──
-                    st.markdown("---")
-                    st.subheader("📊 Regime & Signal Overview")
-                    rc1, rc2, rc3, rc4 = st.columns(4)
-                    rc1.metric("Vol Regime", regime.get("current_regime", "?"))
-                    rc2.metric("Vol Percentile", f"{regime.get('regime_percentile', 0):.0f}%")
-                    rc3.metric("Regime Duration", f"{regime.get('regime_duration_bars', 0)} bars")
-                    rc4.metric("Ann. Volatility", f"{regime.get('current_vol_annualized', 0):.1%}")
-
-                    # Hurst interpretation
-                    hurst = qm.get("hurst")
-                    if hurst is not None:
-                        if hurst > 0.55:
-                            hurst_label = "🟢 Trending (H > 0.55)"
-                        elif hurst < 0.45:
-                            hurst_label = "🔵 Mean-Reverting (H < 0.45)"
-                        else:
-                            hurst_label = "⚪ Random Walk (H ≈ 0.5)"
+            with st.spinner("Crunching numbers..."):
+                try:
+                    close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
+                    returns = np.log(close_series).diff().dropna()
+                    qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q), horizon_bars=int(horizon_bars))
+                    if "error" in qm:
+                        st.error(qm["error"])
                     else:
-                        hurst_label = "N/A"
+                        regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3))
+                        mean_rev = compute_mean_reversion_signals(close_series)
+                        mom_feat = compute_momentum_features(close_series)
+                        tail_risk = compute_tail_risk_metrics(returns)
+                        acf = compute_autocorrelation(returns, max_lag=5)
 
-                    rc5, rc6, rc7, rc8 = st.columns(4)
-                    rc5.metric("Hurst Exponent", f"{hurst:.3f}" if hurst else "N/A", help=hurst_label)
-                    rc6.metric("Z-Score (20d)", f"{mean_rev.get('z_score_20', 'N/A')}")
-                    rc7.metric("Z-Score (50d)", f"{mean_rev.get('z_score_50', 'N/A')}")
-                    half_life = mean_rev.get("ou_half_life")
-                    rc8.metric("O-U Half-Life", f"{half_life:.0f} bars" if half_life else "N/A (trending)")
+                        last_p = qm.get("last_price", float(close_series.iloc[-1]))
+                        hurst = qm.get("hurst")
 
-                    # ── MOMENTUM DASHBOARD ──
-                    st.markdown("---")
-                    st.subheader("🚀 Multi-Timeframe Momentum")
-                    if mom_feat:
-                        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                        mc1.metric("5-Day", f"{mom_feat.get('return_5d_pct', 'N/A')}%")
-                        mc2.metric("1-Month", f"{mom_feat.get('return_21d_pct', 'N/A')}%")
-                        mc3.metric("3-Month", f"{mom_feat.get('return_63d_pct', 'N/A')}%")
-                        mc4.metric("6-Month", f"{mom_feat.get('return_126d_pct', 'N/A')}%")
-                        mc5.metric("12-Month", f"{mom_feat.get('return_252d_pct', 'N/A')}%")
-
+                        # ═══════════════════════════════════════
+                        # ROW 1: VERDICT CARD + KEY METRICS
+                        # ═══════════════════════════════════════
+                        # Build a composite quant verdict
+                        _qv_scores = []
+                        if hurst is not None:
+                            _qv_scores.append(("Hurst", (hurst - 0.5) * 10))  # >0.5 trending = bullish lean
                         mom_score = mom_feat.get("momentum_composite_score")
                         if mom_score is not None:
-                            if mom_score > 5:
-                                mom_label = "🟢 Strong Bullish Momentum"
-                            elif mom_score > 1:
-                                mom_label = "🟢 Bullish Momentum"
-                            elif mom_score > -1:
-                                mom_label = "⚪ Neutral / Flat"
-                            elif mom_score > -5:
-                                mom_label = "🔴 Bearish Momentum"
+                            _qv_scores.append(("Momentum", mom_score / 2))
+                        z20 = mean_rev.get("z_score_20")
+                        if z20 is not None:
+                            _qv_scores.append(("Mean-Rev Z", -float(z20) / 2))  # high z = overbought = slight negative
+                        _ann_ret = tail_risk.get("annualized_return_pct")
+                        if _ann_ret is not None:
+                            _qv_scores.append(("Returns", float(_ann_ret) / 10))
+                        _qv_total = sum(s for _, s in _qv_scores) / max(len(_qv_scores), 1) if _qv_scores else 0
+                        if _qv_total > 3: _qv_label, _qv_color = "STRONG BULLISH", "#00ff44"
+                        elif _qv_total > 1: _qv_label, _qv_color = "BULLISH", "#88cc00"
+                        elif _qv_total > -1: _qv_label, _qv_color = "NEUTRAL", "#cccc00"
+                        elif _qv_total > -3: _qv_label, _qv_color = "BEARISH", "#ff8800"
+                        else: _qv_label, _qv_color = "STRONG BEARISH", "#ff2222"
+
+                        v1, v2 = st.columns([1, 3])
+                        with v1:
+                            st.markdown(f"""
+                            <div style="background:#111;border:2px solid {_qv_color};border-radius:12px;padding:20px;text-align:center">
+                            <div style="font-size:12px;color:#888">QUANT VERDICT</div>
+                            <div style="font-size:32px;font-weight:900;color:{_qv_color}">{_qv_label}</div>
+                            <div style="font-size:42px;font-weight:900;color:#fff">{_qv_total:+.1f}</div>
+                            <div style="font-size:13px;color:#888">{sym} · {tf_used} · {lookback_days_q}d</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with v2:
+                            m1, m2, m3, m4, m5, m6 = st.columns(6)
+                            m1.metric("Price", f"${last_p:,.2f}")
+                            m2.metric("Ann. Vol", f"{regime.get('current_vol_annualized', 0):.1%}")
+                            m3.metric("Ann. Return", f"{tail_risk.get('annualized_return_pct', 'N/A')}%")
+                            m4.metric("Max DD", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
+                            m5.metric("Sharpe", f"{qm.get('sharpe', 'N/A')}" if qm.get('sharpe') else f"{(float(tail_risk.get('annualized_return_pct',0)) / max(float(regime.get('current_vol_annualized',1))*100, 1)):.2f}")
+                            m6.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
+
+                        # ═══════════════════════════════════════
+                        # ROW 2: PRICE CHART + BOLLINGER + VOLUME-like indicator
+                        # ═══════════════════════════════════════
+                        st.markdown("---")
+                        _cs = close_series.reset_index(drop=True)
+                        _sma20 = _cs.rolling(20).mean()
+                        _sma50 = _cs.rolling(50).mean()
+                        _bb = compute_bollinger_bands(_cs)
+
+                        fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                                  row_heights=[0.75, 0.25], vertical_spacing=0.03)
+                        fig_price.add_trace(go.Scatter(y=_cs, name="Close", line=dict(color="#00cc66", width=1.5)), row=1, col=1)
+                        fig_price.add_trace(go.Scatter(y=_sma20, name="SMA 20", line=dict(color="#ffaa00", width=1, dash="dot")), row=1, col=1)
+                        fig_price.add_trace(go.Scatter(y=_sma50, name="SMA 50", line=dict(color="#ff5566", width=1, dash="dot")), row=1, col=1)
+                        fig_price.add_trace(go.Scatter(y=_bb["upper"], name="BB Upper", line=dict(color="#444", width=0.5), showlegend=False), row=1, col=1)
+                        fig_price.add_trace(go.Scatter(y=_bb["lower"], name="BB Lower", line=dict(color="#444", width=0.5), fill="tonexty", fillcolor="rgba(100,100,100,0.1)", showlegend=False), row=1, col=1)
+                        # RSI subplot
+                        _rsi = compute_rsi(_cs)
+                        fig_price.add_trace(go.Scatter(y=_rsi, name="RSI(14)", line=dict(color="#aa88ff", width=1)), row=2, col=1)
+                        fig_price.add_hline(y=70, line_dash="dash", line_color="#ff4444", line_width=0.5, row=2, col=1)
+                        fig_price.add_hline(y=30, line_dash="dash", line_color="#44ff44", line_width=0.5, row=2, col=1)
+                        fig_price.update_layout(
+                            template="plotly_dark", height=420, margin=dict(l=0, r=0, t=30, b=0),
+                            title=dict(text=f"{sym} — Price + Bollinger + RSI", font=dict(size=14)),
+                            legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                        )
+                        fig_price.update_yaxes(title_text="Price", row=1, col=1, gridcolor="#1a1a1a")
+                        fig_price.update_yaxes(title_text="RSI", row=2, col=1, gridcolor="#1a1a1a", range=[0, 100])
+                        fig_price.update_xaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_price, use_container_width=True)
+
+                        # ═══════════════════════════════════════
+                        # ROW 3: REGIME | MOMENTUM | MEAN REVERSION (3 columns, visual)
+                        # ═══════════════════════════════════════
+                        qt1, qt2, qt3 = st.tabs(["📊 Regime & Structure", "🚀 Momentum", "🔄 Mean Reversion"])
+
+                        with qt1:
+                            rc1, rc2 = st.columns([1, 1])
+                            with rc1:
+                                # Regime gauge
+                                vol_pct = regime.get("regime_percentile", 50)
+                                fig_gauge = go.Figure(go.Indicator(
+                                    mode="gauge+number+delta",
+                                    value=vol_pct,
+                                    title={"text": "Volatility Regime Percentile", "font": {"size": 14}},
+                                    delta={"reference": 50, "increasing": {"color": "#ff4444"}, "decreasing": {"color": "#44ff44"}},
+                                    gauge={
+                                        "axis": {"range": [0, 100], "tickcolor": "#888"},
+                                        "bar": {"color": "#00cc66" if vol_pct < 40 else "#ffaa00" if vol_pct < 70 else "#ff4444"},
+                                        "bgcolor": "#111",
+                                        "steps": [
+                                            {"range": [0, 33], "color": "#0a2a0a"},
+                                            {"range": [33, 66], "color": "#2a2a0a"},
+                                            {"range": [66, 100], "color": "#2a0a0a"},
+                                        ],
+                                    }
+                                ))
+                                fig_gauge.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=50, b=10),
+                                                        paper_bgcolor="#000", plot_bgcolor="#000")
+                                st.plotly_chart(fig_gauge, use_container_width=True)
+
+                            with rc2:
+                                st.markdown("##### Market Structure")
+                                _struct_data = {
+                                    "Metric": ["Vol Regime", "Ann. Volatility", "Regime Duration", "Hurst Exponent", "Hurst Signal", "Skewness", "Excess Kurtosis", "VaR 95%", "CVaR 95%"],
+                                    "Value": [
+                                        regime.get("current_regime", "?"),
+                                        f"{regime.get('current_vol_annualized', 0):.1%}",
+                                        f"{regime.get('regime_duration_bars', 0)} bars",
+                                        f"{hurst:.3f}" if hurst else "N/A",
+                                        "🟢 Trending" if (hurst and hurst > 0.55) else ("🔵 Mean-Reverting" if (hurst and hurst < 0.45) else "⚪ Random Walk"),
+                                        f"{qm.get('skew', 'N/A')}",
+                                        f"{qm.get('kurtosis', 'N/A')}",
+                                        f"{qm.get('VaR_95_logret', 'N/A')}",
+                                        f"{qm.get('CVaR_95_logret', 'N/A')}",
+                                    ]
+                                }
+                                st.dataframe(pd.DataFrame(_struct_data).set_index("Metric"), use_container_width=True)
+
+                            # Rolling vol chart
+                            _rvol_20 = returns.rolling(20).std() * np.sqrt(bpy)
+                            _rvol_60 = returns.rolling(60).std() * np.sqrt(bpy)
+                            fig_rvol = go.Figure()
+                            fig_rvol.add_trace(go.Scatter(y=_rvol_20 * 100, name="20d Rolling Vol %", line=dict(color="#ff8800", width=1)))
+                            fig_rvol.add_trace(go.Scatter(y=_rvol_60 * 100, name="60d Rolling Vol %", line=dict(color="#4488ff", width=1)))
+                            fig_rvol.update_layout(template="plotly_dark", height=200, margin=dict(l=0, r=0, t=30, b=0),
+                                                    title=dict(text="Rolling Volatility", font=dict(size=13)),
+                                                    paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                    legend=dict(orientation="h", font=dict(size=10)))
+                            fig_rvol.update_yaxes(gridcolor="#1a1a1a")
+                            fig_rvol.update_xaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_rvol, use_container_width=True)
+
+                            # Autocorrelation bar chart
+                            if acf:
+                                acf_lags = list(acf.keys())
+                                acf_vals = list(acf.values())
+                                acf_colors = ["#44ff44" if v > 0.05 else "#ff4444" if v < -0.05 else "#888" for v in acf_vals]
+                                fig_acf = go.Figure(go.Bar(x=[f"Lag {k.split('_')[1]}" for k in acf_lags], y=acf_vals,
+                                                            marker_color=acf_colors))
+                                fig_acf.add_hline(y=0.05, line_dash="dash", line_color="#444", line_width=0.5)
+                                fig_acf.add_hline(y=-0.05, line_dash="dash", line_color="#444", line_width=0.5)
+                                fig_acf.update_layout(template="plotly_dark", height=180, margin=dict(l=0, r=0, t=30, b=0),
+                                                       title=dict(text="Autocorrelation", font=dict(size=13)),
+                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a")
+                                fig_acf.update_yaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_acf, use_container_width=True)
+                                lag1 = acf.get("lag_1", 0)
+                                if lag1 > 0.05:
+                                    st.caption("📈 Positive autocorrelation — trend continuation likely. Trend-following favored.")
+                                elif lag1 < -0.05:
+                                    st.caption("🔄 Negative autocorrelation — mean-reversion signal. Contrarian strategies favored.")
+                                else:
+                                    st.caption("⚪ Near-zero — no strong serial pattern at this timeframe.")
+
+                        with qt2:
+                            # Momentum visual
+                            if mom_feat:
+                                _mom_periods = ["5d", "21d", "63d", "126d", "252d"]
+                                _mom_keys = ["return_5d_pct", "return_21d_pct", "return_63d_pct", "return_126d_pct", "return_252d_pct"]
+                                _mom_vals = [float(mom_feat.get(k, 0) or 0) for k in _mom_keys]
+                                _mom_colors = ["#00cc44" if v > 0 else "#ff4444" for v in _mom_vals]
+
+                                fig_mom = go.Figure(go.Bar(x=_mom_periods, y=_mom_vals, marker_color=_mom_colors,
+                                                            text=[f"{v:+.1f}%" for v in _mom_vals], textposition="outside"))
+                                fig_mom.update_layout(template="plotly_dark", height=280, margin=dict(l=0, r=0, t=40, b=0),
+                                                       title=dict(text="Multi-Timeframe Returns", font=dict(size=14)),
+                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                       yaxis_title="%")
+                                fig_mom.update_yaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_mom, use_container_width=True)
+
+                                mom_score_v = mom_feat.get("momentum_composite_score")
+                                if mom_score_v is not None:
+                                    if mom_score_v > 5: mom_label = "🟢 STRONG BULLISH"
+                                    elif mom_score_v > 1: mom_label = "🟢 Bullish"
+                                    elif mom_score_v > -1: mom_label = "⚪ Neutral"
+                                    elif mom_score_v > -5: mom_label = "🔴 Bearish"
+                                    else: mom_label = "🔴 STRONG BEARISH"
+                                    _mc = "#00ff44" if mom_score_v > 1 else "#ff4444" if mom_score_v < -1 else "#cccc00"
+                                    st.markdown(f"""
+                                    <div style="text-align:center;padding:10px;background:#111;border-radius:8px;border:1px solid {_mc}">
+                                    <span style="font-size:14px;color:#888">Composite Momentum Score</span><br>
+                                    <span style="font-size:36px;font-weight:900;color:{_mc}">{mom_score_v:+.2f}</span>
+                                    <span style="font-size:16px;color:{_mc};margin-left:10px">{mom_label}</span>
+                                    </div>
+                                    """, unsafe_allow_html=True)
                             else:
-                                mom_label = "🔴 Strong Bearish Momentum"
-                            st.markdown(f"**Composite Momentum Score:** `{mom_score:.2f}` → {mom_label}")
-                    else:
-                        st.info("Not enough data for momentum analysis (need 252+ bars).")
+                                st.info("Not enough data for momentum (need 252+ bars).")
 
-                    # ── TAIL RISK & PERFORMANCE ──
-                    st.markdown("---")
-                    st.subheader("🛡️ Tail Risk & Performance")
-                    if tail_risk:
-                        tr1, tr2, tr3, tr4 = st.columns(4)
-                        tr1.metric("Sortino Ratio", tail_risk.get("sortino_ratio", "N/A"))
-                        tr2.metric("Calmar Ratio", tail_risk.get("calmar_ratio", "N/A"))
-                        tr3.metric("Tail Ratio", tail_risk.get("tail_ratio", "N/A"), help="P95 gain / P5 loss — higher is better")
-                        tr4.metric("Gain/Pain", tail_risk.get("gain_pain_ratio", "N/A"))
+                        with qt3:
+                            # Mean reversion dashboard
+                            if mean_rev:
+                                zc1, zc2 = st.columns(2)
+                                z20v = mean_rev.get("z_score_20")
+                                z50v = mean_rev.get("z_score_50")
+                                hlv = mean_rev.get("ou_half_life")
 
-                        tr5, tr6, tr7, tr8 = st.columns(4)
-                        tr5.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
-                        tr6.metric("Max Drawdown", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
-                        tr7.metric("Ann. Return", f"{tail_risk.get('annualized_return_pct', 'N/A')}%")
-                        var95 = qm.get("VaR_95_logret")
-                        tr8.metric("VaR 95%", f"{var95:.4f}" if var95 else "N/A", help="Worst daily loss at 95% confidence")
+                                with zc1:
+                                    # Z-score gauge
+                                    _zval = float(z20v) if z20v is not None else 0
+                                    fig_z = go.Figure(go.Indicator(
+                                        mode="gauge+number",
+                                        value=_zval,
+                                        title={"text": "Z-Score (20d)", "font": {"size": 14}},
+                                        gauge={
+                                            "axis": {"range": [-3, 3], "tickcolor": "#888"},
+                                            "bar": {"color": "#00cc66" if abs(_zval) < 1 else "#ffaa00" if abs(_zval) < 2 else "#ff4444"},
+                                            "bgcolor": "#111",
+                                            "steps": [
+                                                {"range": [-3, -2], "color": "#0a2a0a"},
+                                                {"range": [-2, -1], "color": "#1a2a1a"},
+                                                {"range": [-1, 1], "color": "#1a1a1a"},
+                                                {"range": [1, 2], "color": "#2a1a1a"},
+                                                {"range": [2, 3], "color": "#2a0a0a"},
+                                            ],
+                                        }
+                                    ))
+                                    fig_z.update_layout(template="plotly_dark", height=220, margin=dict(l=20, r=20, t=50, b=0),
+                                                         paper_bgcolor="#000", plot_bgcolor="#000")
+                                    st.plotly_chart(fig_z, use_container_width=True)
 
-                    # ── JUMP DIFFUSION ──
-                    st.markdown("---")
-                    st.subheader("⚡ Jump-Diffusion Analysis (Merton Model)")
-                    jc1, jc2, jc3, jc4 = st.columns(4)
-                    jc1.metric("Jumps/Year (λ)", qm.get("lambda_year", "N/A"))
-                    jc2.metric("Avg Jump Size", f"{qm.get('avg_jump_pct', 'N/A')}%")
-                    jc3.metric("Jump Volatility", f"{qm.get('jump_vol_pct', 'N/A')}%")
-                    jc4.metric("Jump Risk Score", qm.get("jump_risk_score", "N/A"))
+                                with zc2:
+                                    st.markdown("##### Mean Reversion Signals")
+                                    _mr_data = {
+                                        "Metric": ["Z-Score (20d)", "Z-Score (50d)", "O-U Half-Life", "BB %B", "RSI(14)",
+                                                    "Signal"],
+                                        "Value": [
+                                            f"{z20v}" if z20v is not None else "N/A",
+                                            f"{z50v}" if z50v is not None else "N/A",
+                                            f"{hlv:.0f} bars" if hlv else "N/A (trending)",
+                                            f"{mean_rev.get('bb_pct', 'N/A')}",
+                                            f"{mean_rev.get('rsi_14', 'N/A')}",
+                                            mean_rev.get("mean_reversion_signal", "N/A"),
+                                        ]
+                                    }
+                                    st.dataframe(pd.DataFrame(_mr_data).set_index("Metric"), use_container_width=True)
 
-                    # ── AUTOCORRELATION ──
-                    st.markdown("---")
-                    st.subheader("🔄 Serial Correlation (Autocorrelation)")
-                    if acf:
-                        acf_data = pd.DataFrame([acf])
-                        acf_data.columns = [f"Lag {c.split('_')[1]}" for c in acf_data.columns]
-                        st.dataframe(acf_data, use_container_width=True)
-                        lag1 = acf.get("lag_1", 0)
-                        if lag1 > 0.05:
-                            st.markdown("📈 **Positive autocorrelation** — momentum/trend continuation likely. Trend-following strategies favored.")
-                        elif lag1 < -0.05:
-                            st.markdown("🔄 **Negative autocorrelation** — mean-reversion signal. Contrarian/reversion strategies favored.")
-                        else:
-                            st.markdown("⚪ **Near-zero autocorrelation** — no strong serial pattern. Market is efficient at this timeframe.")
+                                    _mr_sig = mean_rev.get("mean_reversion_signal", "")
+                                    if "BUY" in str(_mr_sig).upper():
+                                        st.success(f"Signal: {_mr_sig}")
+                                    elif "SELL" in str(_mr_sig).upper():
+                                        st.error(f"Signal: {_mr_sig}")
+                                    else:
+                                        st.info(f"Signal: {_mr_sig}")
 
-                    # ── MONTE CARLO ──
-                    st.markdown("---")
-                    st.subheader(f"🎲 Monte Carlo Scenarios ({horizon_label_q} ahead)")
-                    mc_p10 = qm.get("mc_p10")
-                    mc_p50 = qm.get("mc_p50")
-                    mc_p90 = qm.get("mc_p90")
-                    mc_mean = qm.get("mc_mean")
-                    last_p = qm.get("last_price", 0)
+                        # ═══════════════════════════════════════
+                        # ROW 4: TAIL RISK + JUMP DIFFUSION
+                        # ═══════════════════════════════════════
+                        st.markdown("---")
+                        tl1, tl2 = st.columns(2)
 
-                    if mc_p10 is not None and last_p:
-                        sc1, sc2, sc3, sc4 = st.columns(4)
-                        sc1.metric("🔴 Bear (P10)", f"${mc_p10:,.2f}", f"{((mc_p10/last_p)-1)*100:+.1f}%")
-                        sc2.metric("⚪ Base (P50)", f"${mc_p50:,.2f}", f"{((mc_p50/last_p)-1)*100:+.1f}%")
-                        sc3.metric("🟢 Bull (P90)", f"${mc_p90:,.2f}", f"{((mc_p90/last_p)-1)*100:+.1f}%")
-                        sc4.metric("📊 Expected", f"${mc_mean:,.2f}", f"{((mc_mean/last_p)-1)*100:+.1f}%")
+                        with tl1:
+                            st.markdown("##### 🛡 Tail Risk & Performance")
+                            if tail_risk:
+                                _tr_data = {
+                                    "Metric": ["Sortino", "Calmar", "Tail Ratio", "Gain/Pain", "Win Rate",
+                                                "Max Drawdown", "Ann. Return", "VaR 95%"],
+                                    "Value": [
+                                        tail_risk.get("sortino_ratio", "N/A"),
+                                        tail_risk.get("calmar_ratio", "N/A"),
+                                        tail_risk.get("tail_ratio", "N/A"),
+                                        tail_risk.get("gain_pain_ratio", "N/A"),
+                                        f"{tail_risk.get('win_rate_pct', 'N/A')}%",
+                                        f"{tail_risk.get('max_drawdown_pct', 'N/A')}%",
+                                        f"{tail_risk.get('annualized_return_pct', 'N/A')}%",
+                                        f"{qm.get('VaR_95_logret', 'N/A')}",
+                                    ]
+                                }
+                                st.dataframe(pd.DataFrame(_tr_data).set_index("Metric"), use_container_width=True)
 
-                    # ── FULL METRICS TABLE ──
-                    st.markdown("---")
-                    with st.expander("📋 Full Quant Metrics Table"):
-                        all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
-                        st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
+                                # Returns distribution histogram
+                                fig_hist = go.Figure()
+                                fig_hist.add_trace(go.Histogram(x=returns * 100, nbinsx=80, marker_color="#00cc66",
+                                                                 name="Daily Returns %", opacity=0.7))
+                                var95v = qm.get("VaR_95_logret")
+                                if var95v:
+                                    fig_hist.add_vline(x=float(var95v) * 100, line_dash="dash", line_color="#ff4444",
+                                                        annotation_text="VaR 95%", annotation_position="top left")
+                                fig_hist.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                        title=dict(text="Returns Distribution", font=dict(size=13)),
+                                                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                        xaxis_title="Daily Return %")
+                                fig_hist.update_yaxes(gridcolor="#1a1a1a")
+                                fig_hist.update_xaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_hist, use_container_width=True)
 
-                    # ── GPT ANALYSIS ──
-                    st.markdown("---")
-                    st.subheader("🧠 AI Quant Analysis (Renaissance-Grade)")
+                        with tl2:
+                            st.markdown("##### ⚡ Jump-Diffusion (Merton)")
+                            _jd_data = {
+                                "Metric": ["Jumps/Year (λ)", "Avg Jump Size", "Jump Volatility", "Jump Risk Score",
+                                            "Diffusion Vol", "Jumps Detected"],
+                                "Value": [
+                                    qm.get("lambda_year", "N/A"),
+                                    f"{qm.get('avg_jump_pct', 'N/A')}%",
+                                    f"{qm.get('jump_vol_pct', 'N/A')}%",
+                                    qm.get("jump_risk_score", "N/A"),
+                                    f"{qm.get('sigma_diffusion_pct', 'N/A')}%",
+                                    qm.get("jumps_count", 0),
+                                ]
+                            }
+                            st.dataframe(pd.DataFrame(_jd_data).set_index("Metric"), use_container_width=True)
 
-                    # Build enhanced brief with all metrics
-                    all_metrics_for_brief = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk}
-                    enhanced_brief_lines = [
-                        f"SYMBOL: {sym}",
-                        f"SOURCE: {source}",
-                        f"TIMEFRAME: {tf_used}",
-                        f"LOOKBACK_DAYS: {lookback_days_q}",
-                        f"HORIZON: {horizon_label_q}",
-                        "",
-                        "CORE METRICS:",
-                    ]
-                    for k, v in all_metrics_for_brief.items():
-                        enhanced_brief_lines.append(f"- {k}: {v}")
-                    enhanced_brief_lines.append("")
-                    enhanced_brief_lines.append("AUTOCORRELATION:")
-                    for k, v in acf.items():
-                        enhanced_brief_lines.append(f"- {k}: {v}")
+                            # Drawdown chart
+                            _cum = (1 + returns).cumprod()
+                            _peak = _cum.cummax()
+                            _dd = (_cum / _peak - 1) * 100
+                            fig_dd = go.Figure()
+                            fig_dd.add_trace(go.Scatter(y=_dd, fill="tozeroy", fillcolor="rgba(255,68,68,0.2)",
+                                                         line=dict(color="#ff4444", width=1), name="Drawdown %"))
+                            fig_dd.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                  title=dict(text="Drawdown Curve", font=dict(size=13)),
+                                                  paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                  yaxis_title="Drawdown %")
+                            fig_dd.update_yaxes(gridcolor="#1a1a1a")
+                            fig_dd.update_xaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_dd, use_container_width=True)
 
-                    enhanced_brief = "\n".join(enhanced_brief_lines)
-                    gpt_text = run_quant_gpt_analysis(enhanced_brief)
-                    st.markdown(gpt_text)
+                        # ═══════════════════════════════════════
+                        # ROW 5: MONTE CARLO
+                        # ═══════════════════════════════════════
+                        st.markdown("---")
+                        st.markdown(f"##### 🎲 Monte Carlo Scenarios — {horizon_label_q} ahead ({mc_sims_q:,} sims)")
 
-            except Exception as e:
-                st.error(f"Quant Lab error: {type(e).__name__}: {e}")
+                        mc_result = monte_carlo_forward_distribution(close_series, horizon_bars=int(horizon_bars), sims=int(mc_sims_q))
+                        mc_p10 = mc_result.get("mc_p10")
+                        mc_p50 = mc_result.get("mc_p50")
+                        mc_p90 = mc_result.get("mc_p90")
+                        mc_mean = mc_result.get("mc_mean")
+
+                        if mc_p10 is not None and last_p:
+                            mc1, mc2, mc3, mc4 = st.columns(4)
+                            mc1.markdown(f"""
+                            <div style="background:#1a0a0a;border:1px solid #ff4444;border-radius:8px;padding:12px;text-align:center">
+                            <div style="color:#888;font-size:12px">🔴 BEAR (P10)</div>
+                            <div style="color:#ff4444;font-size:24px;font-weight:900">${mc_p10:,.2f}</div>
+                            <div style="color:#ff4444;font-size:14px">{((mc_p10/last_p)-1)*100:+.1f}%</div>
+                            </div>""", unsafe_allow_html=True)
+                            mc2.markdown(f"""
+                            <div style="background:#1a1a1a;border:1px solid #888;border-radius:8px;padding:12px;text-align:center">
+                            <div style="color:#888;font-size:12px">⚪ BASE (P50)</div>
+                            <div style="color:#fff;font-size:24px;font-weight:900">${mc_p50:,.2f}</div>
+                            <div style="color:#888;font-size:14px">{((mc_p50/last_p)-1)*100:+.1f}%</div>
+                            </div>""", unsafe_allow_html=True)
+                            mc3.markdown(f"""
+                            <div style="background:#0a1a0a;border:1px solid #00cc44;border-radius:8px;padding:12px;text-align:center">
+                            <div style="color:#888;font-size:12px">🟢 BULL (P90)</div>
+                            <div style="color:#00cc44;font-size:24px;font-weight:900">${mc_p90:,.2f}</div>
+                            <div style="color:#00cc44;font-size:14px">{((mc_p90/last_p)-1)*100:+.1f}%</div>
+                            </div>""", unsafe_allow_html=True)
+                            mc4.markdown(f"""
+                            <div style="background:#0a0a1a;border:1px solid #4488ff;border-radius:8px;padding:12px;text-align:center">
+                            <div style="color:#888;font-size:12px">📊 EXPECTED</div>
+                            <div style="color:#4488ff;font-size:24px;font-weight:900">${mc_mean:,.2f}</div>
+                            <div style="color:#4488ff;font-size:14px">{((mc_mean/last_p)-1)*100:+.1f}%</div>
+                            </div>""", unsafe_allow_html=True)
+
+                            # MC distribution chart
+                            _r_log = np.log(close_series.dropna().astype(float)).diff().dropna()
+                            _mu = float(_r_log.mean())
+                            _sig = float(_r_log.std())
+                            _z_mc = np.random.normal(0, 1, int(mc_sims_q))
+                            _rh = (_mu * horizon_bars) + (_sig * np.sqrt(horizon_bars) * _z_mc)
+                            _final_prices = last_p * np.exp(_rh)
+                            fig_mc = go.Figure()
+                            fig_mc.add_trace(go.Histogram(x=_final_prices, nbinsx=100, marker_color="#4488ff", opacity=0.7, name="Simulated Prices"))
+                            fig_mc.add_vline(x=last_p, line_dash="solid", line_color="#ffffff", annotation_text="Current", line_width=2)
+                            fig_mc.add_vline(x=mc_p10, line_dash="dash", line_color="#ff4444", annotation_text="P10")
+                            fig_mc.add_vline(x=mc_p90, line_dash="dash", line_color="#00cc44", annotation_text="P90")
+                            fig_mc.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                  title=dict(text="Monte Carlo Price Distribution", font=dict(size=13)),
+                                                  paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                  xaxis_title="Price")
+                            fig_mc.update_yaxes(gridcolor="#1a1a1a")
+                            fig_mc.update_xaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_mc, use_container_width=True)
+
+                        # ═══════════════════════════════════════
+                        # ROW 6: FULL METRICS + AI ANALYSIS
+                        # ═══════════════════════════════════════
+                        with st.expander("📋 Full Quant Metrics (raw data)"):
+                            all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
+                            st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Quant Lab error: {type(e).__name__}: {e}")
 
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:

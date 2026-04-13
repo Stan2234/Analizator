@@ -800,3 +800,140 @@ def fetch_binance_24h(symbol: str) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+# ────────────────────────────────────────────────────
+# POLYMARKET
+# ────────────────────────────────────────────────────
+
+POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
+
+# Finance-related tags on Polymarket
+POLYMARKET_TAGS = ["Finance", "Stocks", "Crypto", "Commodities", "Economics", "Business"]
+
+
+def fetch_polymarket_events(
+    tag: Optional[str] = None,
+    limit: int = 50,
+    active: bool = True,
+    closed: bool = False,
+) -> List[Dict[str, Any]]:
+    """Fetch events from Polymarket Gamma API."""
+    params: Dict[str, Any] = {
+        "limit": limit,
+        "active": active,
+        "closed": closed,
+        "order": "volume",
+        "ascending": False,
+    }
+    if tag:
+        params["tag"] = tag
+    r = _get(f"{POLYMARKET_GAMMA}/events", params=params)
+    if not r:
+        return []
+    try:
+        return r.json() or []
+    except Exception:
+        return []
+
+
+def fetch_polymarket_markets(
+    tag: Optional[str] = None,
+    limit: int = 100,
+    active: bool = True,
+    closed: bool = False,
+) -> List[Dict[str, Any]]:
+    """Fetch individual markets from Polymarket Gamma API."""
+    params: Dict[str, Any] = {
+        "limit": limit,
+        "active": active,
+        "closed": closed,
+        "order": "volume",
+        "ascending": False,
+    }
+    if tag:
+        params["tag"] = tag
+    r = _get(f"{POLYMARKET_GAMMA}/markets", params=params)
+    if not r:
+        return []
+    try:
+        return r.json() or []
+    except Exception:
+        return []
+
+
+def parse_polymarket_market(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse a single Polymarket market into a clean dict."""
+    import json as _json
+
+    question = m.get("question") or ""
+    outcomes_raw = m.get("outcomes") or "[]"
+    prices_raw = m.get("outcomePrices") or "[]"
+
+    try:
+        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+    except Exception:
+        outcomes = []
+    try:
+        prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+    except Exception:
+        prices = []
+
+    # Build outcome list with prices
+    outcome_list = []
+    for i, label in enumerate(outcomes):
+        p = float(prices[i]) if i < len(prices) else 0.0
+        outcome_list.append({"label": str(label), "price": p, "pct": round(p * 100, 1)})
+
+    volume = 0
+    try:
+        volume = float(m.get("volume") or m.get("volumeNum") or 0)
+    except Exception:
+        pass
+
+    return {
+        "id": m.get("id") or m.get("condition_id") or "",
+        "question": question,
+        "outcomes": outcome_list,
+        "volume": volume,
+        "end_date": m.get("endDate") or m.get("end_date_iso") or "",
+        "image": m.get("image") or "",
+        "slug": m.get("slug") or "",
+        "active": bool(m.get("active", True)),
+        "closed": bool(m.get("closed", False)),
+        "tags": m.get("tags") or [],
+    }
+
+
+def fetch_polymarket_finance_markets(limit: int = 100) -> List[Dict[str, Any]]:
+    """Fetch and parse all finance-related Polymarket markets."""
+    all_markets: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+
+    for tag in POLYMARKET_TAGS:
+        raw = fetch_polymarket_markets(tag=tag, limit=limit, active=True)
+        for m in raw:
+            mid = m.get("id") or m.get("condition_id") or ""
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                parsed = parse_polymarket_market(m)
+                if parsed["outcomes"]:
+                    all_markets.append(parsed)
+
+    # Also try without tag filter to catch unlabeled finance markets
+    raw_all = fetch_polymarket_markets(tag=None, limit=200, active=True)
+    finance_keywords = ["up or down", "above", "below", "price", "close", "stock", "bitcoin",
+                         "ethereum", "gold", "silver", "s&p", "nasdaq", "oil", "fed", "rate",
+                         "inflation", "gdp", "cpi", "treasury", "yield"]
+    for m in raw_all:
+        mid = m.get("id") or m.get("condition_id") or ""
+        q = (m.get("question") or "").lower()
+        if mid and mid not in seen_ids and any(kw in q for kw in finance_keywords):
+            seen_ids.add(mid)
+            parsed = parse_polymarket_market(m)
+            if parsed["outcomes"]:
+                all_markets.append(parsed)
+
+    # Sort by volume descending
+    all_markets.sort(key=lambda x: x.get("volume", 0), reverse=True)
+    return all_markets

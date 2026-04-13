@@ -3229,8 +3229,8 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab"]
+tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_poly, tab_ai, tab_fomc = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🔮 Predictions", "🤖 AI Analyst", "🏛 FOMC Lab"]
 
 )
 
@@ -4284,6 +4284,147 @@ with tab_quant:
 
                 except Exception as e:
                     st.error(f"Quant Lab error: {type(e).__name__}: {e}")
+
+# -------- POLYMARKET PREDICTIONS TAB --------
+with tab_poly:
+    import sources as _src_poly
+
+    st.markdown("""
+    <div style="padding:12px 0 4px 0">
+    <span style="font-size:28px;font-weight:800;letter-spacing:-1px">PREDICTION MARKETS</span>
+    <span style="font-size:14px;color:#888;margin-left:12px">Live from Polymarket · Real money predictions</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Filters
+    pf1, pf2, pf3 = st.columns([2, 1, 1])
+    with pf1:
+        poly_filter = st.text_input("Search", placeholder="e.g. Bitcoin, S&P 500, Gold, Tesla...", key="poly_search", label_visibility="collapsed")
+    with pf2:
+        poly_cat = st.selectbox("Category", ["All", "Stocks", "Crypto", "Commodities", "Economics", "Finance"], index=0, key="poly_cat", label_visibility="collapsed")
+    with pf3:
+        poly_refresh = st.button("🔄 Refresh", key="poly_refresh", use_container_width=True)
+
+    @st.cache_data(ttl=300, show_spinner="Loading Polymarket...")
+    def _load_polymarket():
+        return _src_poly.fetch_polymarket_finance_markets(limit=100)
+
+    if poly_refresh:
+        _load_polymarket.clear()
+
+    poly_markets = _load_polymarket()
+
+    # Apply filters
+    if poly_filter:
+        kw = poly_filter.lower()
+        poly_markets = [m for m in poly_markets if kw in m["question"].lower()]
+    if poly_cat != "All":
+        cat_kw_map = {
+            "Stocks": ["stock", "up or down", "close above", "close below", "aapl", "nvda", "msft", "tsla", "amzn", "googl", "meta", "nflx", "spy", "qqq", "djia", "s&p", "nasdaq", "dow", "russell"],
+            "Crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp", "doge", "coin"],
+            "Commodities": ["gold", "silver", "oil", "wti", "natural gas", "commodity", "xau", "xag"],
+            "Economics": ["fed", "rate", "inflation", "cpi", "gdp", "unemployment", "treasury", "yield", "recession", "tariff"],
+            "Finance": ["bank", "finance", "market", "index"],
+        }
+        cat_kws = cat_kw_map.get(poly_cat, [])
+        if cat_kws:
+            poly_markets = [m for m in poly_markets if any(k in m["question"].lower() for k in cat_kws)]
+
+    if not poly_markets:
+        st.info("No prediction markets found. Try different filters or refresh.")
+    else:
+        st.caption(f"Showing {len(poly_markets)} markets · sorted by volume")
+
+        # Render as card grid (3 per row)
+        for row_start in range(0, len(poly_markets), 3):
+            cols = st.columns(3)
+            for ci, col in enumerate(cols):
+                idx = row_start + ci
+                if idx >= len(poly_markets):
+                    break
+                m = poly_markets[idx]
+                q = m["question"]
+                outcomes = m["outcomes"]
+                vol = m["volume"]
+                end_date = m.get("end_date", "")
+
+                # Format volume
+                if vol >= 1_000_000:
+                    vol_str = f"${vol / 1_000_000:.1f}M"
+                elif vol >= 1_000:
+                    vol_str = f"${vol / 1_000:.0f}K"
+                else:
+                    vol_str = f"${vol:.0f}"
+
+                # Format end date
+                end_str = ""
+                if end_date:
+                    try:
+                        import datetime as _dt
+                        if "T" in str(end_date):
+                            ed = _dt.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        else:
+                            ed = _dt.datetime.strptime(str(end_date)[:10], "%Y-%m-%d")
+                        end_str = ed.strftime("%b %d")
+                    except Exception:
+                        end_str = str(end_date)[:10]
+
+                # Determine primary outcome (usually "Up" or "Yes")
+                primary = outcomes[0] if outcomes else {"label": "?", "pct": 0}
+                secondary = outcomes[1] if len(outcomes) > 1 else {"label": "?", "pct": 0}
+
+                # Color based on primary prediction strength
+                pp = primary.get("pct", 50)
+                if pp >= 80:
+                    gauge_color = "#00cc44"
+                    gauge_bg = "#0a2a0a"
+                elif pp >= 60:
+                    gauge_color = "#88cc00"
+                    gauge_bg = "#1a2a0a"
+                elif pp >= 40:
+                    gauge_color = "#ccaa00"
+                    gauge_bg = "#1a1a0a"
+                elif pp >= 20:
+                    gauge_color = "#ff8800"
+                    gauge_bg = "#2a1a0a"
+                else:
+                    gauge_color = "#ff4444"
+                    gauge_bg = "#2a0a0a"
+
+                sp = secondary.get("pct", 0)
+                up_color = "#00cc44"
+                down_color = "#ff4444"
+
+                with col:
+                    st.markdown(f"""
+                    <div style="background:#111;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:12px;min-height:200px">
+                        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                            <div style="flex:1;padding-right:10px">
+                                <div style="font-size:14px;font-weight:700;color:#eee;line-height:1.3">{q}</div>
+                            </div>
+                            <div style="text-align:center;min-width:60px">
+                                <div style="width:52px;height:52px;border-radius:50%;border:3px solid {gauge_color};display:flex;align-items:center;justify-content:center;background:{gauge_bg}">
+                                    <span style="font-size:15px;font-weight:900;color:{gauge_color}">{pp:.0f}%</span>
+                                </div>
+                                <div style="font-size:10px;color:{gauge_color};margin-top:2px">{primary.get('label','')}</div>
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:8px;margin-top:14px">
+                            <div style="flex:1;background:rgba(0,204,68,0.15);border:1px solid rgba(0,204,68,0.3);border-radius:6px;padding:8px;text-align:center;cursor:default">
+                                <span style="color:{up_color};font-weight:700;font-size:14px">{primary.get('label','Up')}</span>
+                                <span style="color:{up_color};font-size:12px;margin-left:4px">{pp:.0f}%</span>
+                            </div>
+                            <div style="flex:1;background:rgba(255,68,68,0.15);border:1px solid rgba(255,68,68,0.3);border-radius:6px;padding:8px;text-align:center;cursor:default">
+                                <span style="color:{down_color};font-weight:700;font-size:14px">{secondary.get('label','Down')}</span>
+                                <span style="color:{down_color};font-size:12px;margin-left:4px">{sp:.0f}%</span>
+                            </div>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:11px;color:#666">
+                            <span>{vol_str} Vol.</span>
+                            <span>{end_str}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:

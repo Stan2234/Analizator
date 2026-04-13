@@ -181,6 +181,17 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "get_polymarket_predictions",
+        "description": "Get live prediction market data from Polymarket. Shows real-money bets on whether stocks/crypto/commodities will go up or down, price targets, economic events, etc. Filter by keyword.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional keyword filter (e.g. 'Bitcoin', 'S&P', 'Gold', 'Tesla')"},
+                "limit": {"type": "integer", "description": "Max results (default 20)"}
+            }
+        }
+    },
+    {
         "name": "get_sentiment_indexes",
         "description": "Get all 4 sentiment / fear & greed indexes: crypto (alternative.me), US stocks (CNN), commodities (synthetic from gold/silver/oil momentum), and global macro risk (synthetic from VIX, yield curve, HY spread, DXY). Each returns 0-100 (higher = greedier/risk-on).",
         "input_schema": {"type": "object", "properties": {}}
@@ -310,6 +321,17 @@ def _tool_list_all_symbols(_args: Dict[str, Any]) -> Any:
     return [s["symbol"] for s in dl.all_latest_snapshots()]
 
 
+def _tool_get_polymarket_predictions(args: Dict[str, Any]) -> Any:
+    markets = src.fetch_polymarket_finance_markets(limit=int(args.get("limit") or 50))
+    query = (args.get("query") or "").lower()
+    if query:
+        markets = [m for m in markets if query in m["question"].lower()]
+    return [{"question": m["question"],
+             "outcomes": m["outcomes"],
+             "volume": m["volume"],
+             "end_date": m.get("end_date", "")} for m in markets[:int(args.get("limit") or 20)]]
+
+
 def _tool_get_db_health(_args: Dict[str, Any]) -> Any:
     return dl.db_health()
 
@@ -337,6 +359,7 @@ TOOL_DISPATCH = {
     "get_company_news":             _tool_get_company_news,
     "get_analyst_recommendations":  _tool_get_analyst_recommendations,
     "list_all_symbols":             _tool_list_all_symbols,
+    "get_polymarket_predictions":   _tool_get_polymarket_predictions,
     "get_db_health":                _tool_get_db_health,
     "get_sentiment_indexes":        _tool_get_sentiment_indexes,
 }

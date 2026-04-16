@@ -905,12 +905,13 @@ def parse_polymarket_market(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def fetch_polymarket_finance_markets(limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch and parse all finance-related Polymarket markets."""
+def fetch_polymarket_finance_markets(limit: int = 200) -> List[Dict[str, Any]]:
+    """Fetch and parse stocks + crypto Polymarket markets only."""
     all_markets: List[Dict[str, Any]] = []
     seen_ids: set = set()
 
-    for tag in POLYMARKET_TAGS:
+    # Only stocks and crypto tags
+    for tag in ["Stocks", "Crypto", "Finance"]:
         raw = fetch_polymarket_markets(tag=tag, limit=limit, active=True)
         for m in raw:
             mid = m.get("id") or m.get("condition_id") or ""
@@ -920,20 +921,36 @@ def fetch_polymarket_finance_markets(limit: int = 100) -> List[Dict[str, Any]]:
                 if parsed["outcomes"]:
                     all_markets.append(parsed)
 
-    # Also try without tag filter to catch unlabeled finance markets
-    raw_all = fetch_polymarket_markets(tag=None, limit=200, active=True)
-    finance_keywords = ["up or down", "above", "below", "price", "close", "stock", "bitcoin",
-                         "ethereum", "gold", "silver", "s&p", "nasdaq", "oil", "fed", "rate",
-                         "inflation", "gdp", "cpi", "treasury", "yield"]
+    # Also scan untagged for stock/crypto keywords
+    raw_all = fetch_polymarket_markets(tag=None, limit=300, active=True)
+    stock_crypto_kw = [
+        "up or down", "close above", "close below",
+        # Stocks
+        "s&p", "spx", "spy", "nasdaq", "ndx", "qqq", "dow", "djia", "russell",
+        "nvda", "nvidia", "aapl", "apple", "msft", "microsoft", "tsla", "tesla",
+        "amzn", "amazon", "googl", "alphabet", "meta", "nflx", "netflix",
+        "jpm", "jpmorgan", "gs", "goldman", "blk", "blackrock", "coin", "coinbase",
+        "pltr", "palantir", "hood", "robinhood", "abnb", "airbnb", "amd",
+        # Crypto
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "bnb",
+        "doge", "dogecoin", "crypto",
+    ]
+    # Exclude noise
+    noise_kw = ["model", "president", "election", "war", "pope", "sports", "nba", "nfl",
+                "mlb", "ufc", "oscar", "grammy", "youtube", "tiktok", "subscriber"]
     for m in raw_all:
         mid = m.get("id") or m.get("condition_id") or ""
         q = (m.get("question") or "").lower()
-        if mid and mid not in seen_ids and any(kw in q for kw in finance_keywords):
-            seen_ids.add(mid)
-            parsed = parse_polymarket_market(m)
-            if parsed["outcomes"]:
-                all_markets.append(parsed)
+        if mid and mid not in seen_ids:
+            if any(kw in q for kw in stock_crypto_kw) and not any(nk in q for nk in noise_kw):
+                seen_ids.add(mid)
+                parsed = parse_polymarket_market(m)
+                if parsed["outcomes"]:
+                    all_markets.append(parsed)
 
-    # Sort by volume descending
+    # Filter: must have at least 2 outcomes and volume > 0
+    all_markets = [m for m in all_markets if len(m["outcomes"]) >= 2]
+
+    # Sort: highest volume first
     all_markets.sort(key=lambda x: x.get("volume", 0), reverse=True)
     return all_markets

@@ -4296,18 +4296,20 @@ with tab_poly:
     </div>
     """, unsafe_allow_html=True)
 
-    # Filters
-    pf1, pf2, pf3 = st.columns([2, 1, 1])
+    # Filters: only Stocks + Crypto, with sub-category toggle + min volume
+    pf1, pf2, pf3, pf4 = st.columns([2, 1.2, 1, 1])
     with pf1:
-        poly_filter = st.text_input("Search", placeholder="e.g. Bitcoin, S&P 500, Gold, Tesla...", key="poly_search", label_visibility="collapsed")
+        poly_filter = st.text_input("Search", placeholder="e.g. Bitcoin, NVDA, Tesla, BTC...", key="poly_search", label_visibility="collapsed")
     with pf2:
-        poly_cat = st.selectbox("Category", ["All", "Stocks", "Crypto", "Commodities", "Economics", "Finance"], index=0, key="poly_cat", label_visibility="collapsed")
+        poly_cat = st.selectbox("Category", ["All", "Stocks", "Crypto"], index=0, key="poly_cat", label_visibility="collapsed")
     with pf3:
+        poly_min_vol = st.selectbox("Min $Vol", ["Any", "$1K+", "$10K+", "$50K+"], index=1, key="poly_min_vol", label_visibility="collapsed")
+    with pf4:
         poly_refresh = st.button("🔄 Refresh", key="poly_refresh", use_container_width=True)
 
     @st.cache_data(ttl=300, show_spinner="Loading Polymarket...")
     def _load_polymarket():
-        return _src_poly.fetch_polymarket_finance_markets(limit=100)
+        return _src_poly.fetch_polymarket_finance_markets(limit=200)
 
     if poly_refresh:
         _load_polymarket.clear()
@@ -4318,17 +4320,17 @@ with tab_poly:
     if poly_filter:
         kw = poly_filter.lower()
         poly_markets = [m for m in poly_markets if kw in m["question"].lower()]
-    if poly_cat != "All":
-        cat_kw_map = {
-            "Stocks": ["stock", "up or down", "close above", "close below", "aapl", "nvda", "msft", "tsla", "amzn", "googl", "meta", "nflx", "spy", "qqq", "djia", "s&p", "nasdaq", "dow", "russell"],
-            "Crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp", "doge", "coin"],
-            "Commodities": ["gold", "silver", "oil", "wti", "natural gas", "commodity", "xau", "xag"],
-            "Economics": ["fed", "rate", "inflation", "cpi", "gdp", "unemployment", "treasury", "yield", "recession", "tariff"],
-            "Finance": ["bank", "finance", "market", "index"],
-        }
-        cat_kws = cat_kw_map.get(poly_cat, [])
-        if cat_kws:
-            poly_markets = [m for m in poly_markets if any(k in m["question"].lower() for k in cat_kws)]
+
+    crypto_kws = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol ", " sol", "xrp", "bnb ", "doge", "crypto", "hyperliquid", "altcoin"]
+    if poly_cat == "Stocks":
+        poly_markets = [m for m in poly_markets if not any(k in m["question"].lower() for k in crypto_kws)]
+    elif poly_cat == "Crypto":
+        poly_markets = [m for m in poly_markets if any(k in m["question"].lower() for k in crypto_kws)]
+
+    min_vol_map = {"Any": 0, "$1K+": 1_000, "$10K+": 10_000, "$50K+": 50_000}
+    min_vol_val = min_vol_map.get(poly_min_vol, 0)
+    if min_vol_val > 0:
+        poly_markets = [m for m in poly_markets if m.get("volume", 0) >= min_vol_val]
 
     if not poly_markets:
         st.info("No prediction markets found. Try different filters or refresh.")

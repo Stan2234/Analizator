@@ -24,8 +24,8 @@ import sources as src
 
 log = logging.getLogger("analizator.agent")
 
-OPUS_MODEL  = "claude-opus-4-5-20250929"  # adjust if Anthropic releases newer
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+OPUS_MODEL  = "claude-opus-4-5"   # alias -> latest Opus 4.5 snapshot
+HAIKU_MODEL = "claude-haiku-4-5"  # alias -> latest Haiku 4.5 snapshot
 DEFAULT_MAX_TOKENS = 2048
 
 

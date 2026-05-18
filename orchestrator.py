@@ -42,7 +42,18 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
             "geopolitics, regulation), equities (earnings, M&A, downgrades, "
             "guidance), crypto (regulation, ETF flows, hacks), and commodities. "
             "Cite real headlines with sources and timestamps. Skip clickbait. "
-            "Group findings by impact, not by chronology."
+            "Group findings by impact, not by chronology.\n\n"
+            "CRITICAL RULES:\n"
+            "- DO NOT report asset PRICES or LEVELS in your findings. Prices in "
+            "news headlines are stale by hours-to-days and you have no live "
+            "quote tool. Other agents own the live price data. You report "
+            "EVENTS, CATALYSTS, NARRATIVES — not numbers like 'gold at $X'.\n"
+            "- Every finding must reference a real article you saw via "
+            "search_news/get_company_news, with source name. If you cannot "
+            "point to a specific tool result, do not include the claim.\n"
+            "- If you are tempted to cite a number, only cite numbers that "
+            "appeared verbatim in the news headlines/descriptions you "
+            "retrieved, and qualify them as 'as reported by <source>'."
         ),
         "default_task": (
             "Produce a news briefing covering the last 24-48 hours. Call "
@@ -299,7 +310,21 @@ Rules:
 - Be specific. Cite numbers, tickers, levels, and dates from the agent outputs.
 - Don't be generic ("monitor inflation" is useless; "watch DGS10 above 4.50% as a trigger" is useful).
 - If an agent reported _parse_failed=true or low confidence, weight it accordingly.
-- If two agents directly contradict, surface it rather than averaging.
+
+DATA INTEGRITY RULES (critical):
+- If two agents report DIFFERENT NUMERIC VALUES for the same asset/metric
+  (e.g. gold at $3,200 vs $4,540, or 10Y yield at 4.28% vs 4.47%), you MUST
+  explicitly flag the contradiction in 'Agreements & Contradictions'. Do NOT
+  silently pick one. Do NOT average them.
+- When flagging such a numeric contradiction, identify which source is more
+  likely correct: agents with live-quote tools (crypto, equity, macro using
+  get_market_quote/get_live_quote/get_fred_series) have authoritative price
+  data. The news agent does NOT have price tools — any price it reports came
+  from a possibly-stale article and should be treated as low-confidence.
+- For your TL;DR and Actionable Insights, use prices/levels from the
+  price-authoritative agents, never from news. If only news provides a
+  number, qualify it as "reportedly" or omit it.
+- Never invent or interpolate a number that no agent provided.
 """
 
 

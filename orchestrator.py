@@ -21,11 +21,19 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent import TOOLS, TOOL_DISPATCH, get_anthropic_client, OPUS_MODEL
 
+try:
+    import data_layer as dl
+    _HAS_DL = True
+except Exception:
+    _HAS_DL = False
+
 log = logging.getLogger("analizator.orchestrator")
 
 SUBAGENT_MAX_TOKENS = 2500
 SUBAGENT_MAX_ITER = 6
 SYNTH_MAX_TOKENS = 3500
+
+CACHE_KEY = "last_deep_brief"
 
 
 # ---------------- sub-agent specifications ----------------
@@ -118,6 +126,43 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
             "Pull recent filings for 2-3 of the tracked institutions, surface "
             "top holdings, and get analyst recs on any standout tickers. "
             "Identify the most actionable smart-money signal right now."
+        ),
+    },
+    {
+        "id": "fomc",
+        "title": "🏛️ FOMC & Central Banks",
+        "tools": ["get_fred_series", "get_economic_calendar",
+                  "search_news", "get_polymarket_predictions",
+                  "get_market_quote"],
+        "system": (
+            "You are a Fed-watcher and central-bank analyst. Your job is to "
+            "read the Federal Reserve's reaction function and the path of "
+            "global monetary policy (Fed, ECB, BOJ, BOE).\n\n"
+            "Required inputs to consult:\n"
+            "- FRED: FEDFUNDS (current policy rate), DGS2 and DGS10 (market "
+            "  pricing of policy path), T10Y2Y (curve), CPIAUCSL & CPILFESL "
+            "  (inflation Fed targets), UNRATE & PAYEMS (labor side of dual "
+            "  mandate), ICSA (high-frequency labor signal)\n"
+            "- Economic calendar: upcoming FOMC meetings, CPI, NFP, PCE, "
+            "  retail sales, FOMC minutes, Fed speakers — 14 days ahead\n"
+            "- News: search for 'Fed', 'FOMC', 'Powell', 'ECB', 'Lagarde', "
+            "  'rate cut', 'rate hike' in the last 24-72 hours\n"
+            "- Polymarket: rate-cut/hike probability markets — query 'Fed', "
+            "  'rate', 'recession'\n\n"
+            "Frame your findings around: (1) Where is policy now? (2) What is "
+            "the market pricing for the next 1-3 meetings? (3) What does the "
+            "data justify? (4) Where is the asymmetry — what would shift the "
+            "Fed's reaction function? (5) Which upcoming data point or speech "
+            "is the next regime-shifting catalyst?\n\n"
+            "Be precise: cite exact basis points, exact probabilities from "
+            "Polymarket, exact dates of upcoming events. The whole point of "
+            "this brief is actionable Fed-path positioning."
+        ),
+        "default_task": (
+            "Produce a Fed-path briefing: current policy stance, what's priced "
+            "vs. what the data justifies, next 1-3 meetings, and the single "
+            "most asymmetric catalyst on the calendar. Pull FRED + calendar + "
+            "Fed news + Polymarket rate-cut probabilities."
         ),
     },
     {
@@ -419,15 +464,58 @@ def run_deep_brief(
 
     synthesis = _synthesize(results, user_query)
 
-    return {
+    brief = {
         "subagents": results,
         "synthesis": synthesis,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "user_query": user_query,
     }
+    cache_brief(brief)
+    return brief
 
 
 def list_subagents() -> List[Dict[str, str]]:
     """Return a UI-friendly list of available sub-agents."""
     return [{"id": s["id"], "title": s["title"], "tools": ", ".join(s["tools"])}
             for s in SUBAGENT_SPECS]
+
+
+# ---------------- cache (SQLite kv_store) ----------------
+
+def cache_brief(brief: Dict[str, Any]) -> None:
+    """Persist the most recent brief to SQLite kv_store."""
+    if not _HAS_DL:
+        return
+    try:
+        dl.kv_set(CACHE_KEY, brief)
+    except Exception:
+        log.exception("cache_brief failed")
+
+
+def load_cached_brief() -> Optional[Dict[str, Any]]:
+    """Return the last cached brief, or None if none exists."""
+    if not _HAS_DL:
+        return None
+    try:
+        return dl.kv_get(CACHE_KEY, None)
+    except Exception:
+        log.exception("load_cached_brief failed")
+        return None
+
+
+def cached_brief_age_minutes() -> Optional[float]:
+    """Return age in minutes of the cached brief, or None if no cache."""
+    b = load_cached_brief()
+    if not b:
+        return None
+    ts = b.get("generated_at")
+    if not ts:
+        return None
+    try:
+        gen = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if gen.tzinfo is None:
+            gen = gen.replace(tzinfo=dt.timezone.utc)
+        delta = dt.datetime.now(dt.timezone.utc) - gen
+        return delta.total_seconds() / 60.0
+    except Exception:
+        return None

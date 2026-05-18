@@ -4550,6 +4550,20 @@ with tab_brief:
     elif not _HAS_AGENT:
         st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
     else:
+        # Hydrate session_state from SQLite cache (survives page reloads)
+        if "last_deep_brief" not in st.session_state:
+            cached = orch.load_cached_brief()
+            if cached:
+                st.session_state["last_deep_brief"] = cached
+
+        cache_age_min = orch.cached_brief_age_minutes()
+        if cache_age_min is not None:
+            age_label = (f"{cache_age_min:.0f} min ago" if cache_age_min < 60
+                         else f"{cache_age_min/60:.1f} h ago")
+            freshness_emoji = "🟢" if cache_age_min < 30 else "🟡" if cache_age_min < 180 else "🔴"
+            st.caption(f"{freshness_emoji} Last cached brief: **{age_label}** "
+                       f"(persisted in SQLite, survives reloads)")
+
         all_specs = orch.list_subagents()
 
         with st.expander("⚙️ Configure brief", expanded=False):
@@ -4571,8 +4585,19 @@ with tab_brief:
             key="brief_focus",
         )
 
-        run_col, _ = st.columns([1, 4])
-        run_clicked = run_col.button("🚀 Run Deep Brief", type="primary", key="brief_run")
+        run_col, load_col, _ = st.columns([1, 1, 3])
+        run_clicked = run_col.button("🚀 Run Fresh Brief", type="primary", key="brief_run")
+        load_clicked = load_col.button("📂 Load Cached", key="brief_load",
+                                       disabled=(cache_age_min is None))
+
+        if load_clicked:
+            cached = orch.load_cached_brief()
+            if cached:
+                st.session_state["last_deep_brief"] = cached
+                st.success(f"Loaded cached brief from {cache_age_min:.0f} min ago. "
+                           f"Saved one Opus run.")
+            else:
+                st.warning("No cached brief found.")
 
         if run_clicked:
             if not selected_ids:

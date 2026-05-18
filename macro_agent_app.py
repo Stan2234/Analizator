@@ -4538,11 +4538,11 @@ with tab_fomc:
 with tab_brief:
     st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
     st.caption(
-        "Five specialist sub-agents (News, Macro, Crypto, Smart Money, Sentiment) "
-        "run in parallel on Opus, each with a curated tool subset. A Chief "
-        "Strategist agent then synthesizes their structured briefings into a "
-        "single executive brief with TL;DR, cross-asset themes, contradictions, "
-        "actionable insights, and risks."
+        "Six specialist sub-agents (News, Macro, Crypto, Smart Money, FOMC, "
+        "Sentiment) run in parallel on Opus, each with a curated tool subset. "
+        "A Chief Strategist agent then synthesizes their structured briefings "
+        "into a single executive brief with TL;DR, cross-asset themes, "
+        "contradictions, actionable insights, and risks."
     )
 
     if not _HAS_ORCH:
@@ -4578,7 +4578,7 @@ with tab_brief:
             colB.markdown(f"**Cron:** `{cron_setting}`")
 
             if brief_job:
-                next_run = brief_job.get("next_run_time")
+                next_run = brief_job.get("next_run") or brief_job.get("next_run_time")
                 st.markdown(f"**Next scheduled run:** `{next_run}` (UTC)")
             else:
                 st.info("No scheduled brief job is currently registered. "

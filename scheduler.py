@@ -190,6 +190,56 @@ def job_prune() -> None:
         log.exception("job_prune failed: %s", e)
 
 
+def job_generate_deep_brief() -> None:
+    """Run the multi-agent deep brief and persist it to kv_store cache.
+
+    Opt-in: only registered when ENABLE_SCHEDULED_BRIEF=true. Default
+    schedule is configurable via DEEP_BRIEF_CRON (cron-style 'h m' or full
+    cron expression). The brief is cached so the user sees a ready-made
+    briefing when they open the app in the morning.
+    """
+    try:
+        import orchestrator as orch
+        log.info("scheduled deep brief: starting")
+        t0 = dt.datetime.utcnow()
+        brief = orch.run_deep_brief(user_query="")
+        elapsed = (dt.datetime.utcnow() - t0).total_seconds()
+        n_agents = len(brief.get("subagents", {}))
+        log.info("scheduled deep brief: done in %.0fs, %d agents", elapsed, n_agents)
+    except Exception as e:
+        log.exception("job_generate_deep_brief failed: %s", e)
+
+
+def _parse_brief_cron() -> Optional[CronTrigger]:
+    """Read DEEP_BRIEF_CRON from env. Returns None on parse failure.
+
+    Accepts either a 5-field cron expression ("0 7 * * 1-5") or a simple
+    "HH:MM" form (defaults to weekdays).
+    """
+    raw = _get_secret("DEEP_BRIEF_CRON", "0 7 * * 1-5")
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Simple "HH:MM" form -> weekdays at that time UTC
+    if ":" in raw and len(raw.split()) == 1:
+        try:
+            hh, mm = raw.split(":")
+            return CronTrigger(hour=int(hh), minute=int(mm), day_of_week="mon-fri")
+        except Exception:
+            log.warning("DEEP_BRIEF_CRON invalid HH:MM '%s'", raw)
+            return None
+    # 5-field cron
+    try:
+        parts = raw.split()
+        if len(parts) != 5:
+            raise ValueError("expected 5 cron fields")
+        return CronTrigger(minute=parts[0], hour=parts[1], day=parts[2],
+                           month=parts[3], day_of_week=parts[4])
+    except Exception:
+        log.warning("DEEP_BRIEF_CRON invalid cron '%s'", raw)
+        return None
+
+
 # ---------------- entrypoint ----------------
 
 def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
@@ -207,6 +257,16 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_fred, IntervalTrigger(hours=6), id="fred", replace_existing=True)
         sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True)
         sched.add_job(job_prune, CronTrigger(hour=3, minute=0), id="prune", replace_existing=True)
+
+        # Optional: scheduled deep brief generation (opt-in via env var)
+        if _get_secret("ENABLE_SCHEDULED_BRIEF", "").lower() in ("1", "true", "yes", "on"):
+            trig = _parse_brief_cron()
+            if trig is not None:
+                sched.add_job(job_generate_deep_brief, trig,
+                              id="deep_brief", replace_existing=True)
+                log.info("scheduled deep brief enabled with trigger=%s", trig)
+            else:
+                log.warning("ENABLE_SCHEDULED_BRIEF=true but cron parse failed; not scheduled")
 
         sched.start()
         _SCHED = sched

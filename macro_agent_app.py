@@ -4564,6 +4564,39 @@ with tab_brief:
             st.caption(f"{freshness_emoji} Last cached brief: **{age_label}** "
                        f"(persisted in SQLite, survives reloads)")
 
+        # Scheduled brief status
+        with st.expander("⏰ Scheduled brief", expanded=False):
+            sched_status = bg_scheduler.scheduler_status()
+            jobs = sched_status.get("jobs", [])
+            brief_job = next((j for j in jobs if j.get("id") == "deep_brief"), None)
+            scheduling_enabled = (os.environ.get("ENABLE_SCHEDULED_BRIEF", "").lower()
+                                  in ("1", "true", "yes", "on"))
+            cron_setting = os.environ.get("DEEP_BRIEF_CRON", "0 7 * * 1-5 (default)")
+
+            colA, colB = st.columns(2)
+            colA.markdown(f"**Enabled:** {'✅ yes' if scheduling_enabled else '❌ no'}")
+            colB.markdown(f"**Cron:** `{cron_setting}`")
+
+            if brief_job:
+                next_run = brief_job.get("next_run_time")
+                st.markdown(f"**Next scheduled run:** `{next_run}` (UTC)")
+            else:
+                st.info("No scheduled brief job is currently registered. "
+                        "To enable: set `ENABLE_SCHEDULED_BRIEF=true` (and "
+                        "optionally `DEEP_BRIEF_CRON=0 7 * * 1-5` or `07:00`) "
+                        "in Render env vars, then redeploy. Default schedule "
+                        "is 07:00 UTC weekdays.")
+
+            if st.button("▶️ Run scheduled brief now (manual trigger)",
+                         key="brief_sched_runnow"):
+                with st.spinner("Running scheduled brief in background — refresh in ~60-90s…"):
+                    import threading
+                    threading.Thread(target=bg_scheduler.job_generate_deep_brief,
+                                     daemon=True).start()
+                    st.success("Triggered. The brief is generating in the "
+                               "background and will appear in the cache when "
+                               "complete. Refresh the page to see it.")
+
         all_specs = orch.list_subagents()
 
         with st.expander("⚙️ Configure brief", expanded=False):

@@ -28,6 +28,13 @@ except Exception as _e:
     _HAS_AGENT = False
     _AGENT_IMPORT_ERROR = str(_e)
 
+try:
+    import orchestrator as orch
+    _HAS_ORCH = True
+except Exception as _oe:
+    _HAS_ORCH = False
+    _ORCH_IMPORT_ERROR = str(_oe)
+
 st.set_page_config(page_title="AI Macro Agent", layout="wide")
 
 # Start background scheduler exactly once per process
@@ -3229,8 +3236,8 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_poly, tab_ai, tab_fomc = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🔮 Predictions", "🤖 AI Analyst", "🏛 FOMC Lab"]
+tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_poly, tab_ai, tab_fomc, tab_brief = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🔮 Predictions", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief"]
 
 )
 
@@ -4526,6 +4533,139 @@ with tab_ai:
 # -------- FOMC TAB --------
 with tab_fomc:
     show_fomc_lab()
+
+# -------- DEEP BRIEF TAB (multi-agent orchestrator) --------
+with tab_brief:
+    st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
+    st.caption(
+        "Five specialist sub-agents (News, Macro, Crypto, Smart Money, Sentiment) "
+        "run in parallel on Opus, each with a curated tool subset. A Chief "
+        "Strategist agent then synthesizes their structured briefings into a "
+        "single executive brief with TL;DR, cross-asset themes, contradictions, "
+        "actionable insights, and risks."
+    )
+
+    if not _HAS_ORCH:
+        st.error(f"Orchestrator failed to load: {_ORCH_IMPORT_ERROR}")
+    elif not _HAS_AGENT:
+        st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
+    else:
+        all_specs = orch.list_subagents()
+
+        with st.expander("⚙️ Configure brief", expanded=False):
+            st.markdown("**Active sub-agents** (uncheck to exclude — saves cost/time):")
+            cols = st.columns(len(all_specs))
+            selected_ids: list[str] = []
+            for col, spec in zip(cols, all_specs):
+                with col:
+                    if st.checkbox(spec["title"], value=True, key=f"brief_inc_{spec['id']}"):
+                        selected_ids.append(spec["id"])
+                    st.caption(f"tools: {spec['tools']}")
+
+        user_focus = st.text_area(
+            "Optional focus / question (leave blank for a general briefing):",
+            value="",
+            height=80,
+            placeholder="e.g. 'Focus on Fed rate path and BTC structure this week' "
+                        "or 'What should I watch ahead of next week's CPI?'",
+            key="brief_focus",
+        )
+
+        run_col, _ = st.columns([1, 4])
+        run_clicked = run_col.button("🚀 Run Deep Brief", type="primary", key="brief_run")
+
+        if run_clicked:
+            if not selected_ids:
+                st.warning("Pick at least one sub-agent.")
+            else:
+                placeholders: dict = {}
+                status_holder = st.empty()
+                progress_bar = st.progress(0.0, text="Spawning specialist agents…")
+
+                # pre-create placeholders so we can fill them as agents complete
+                specs_lookup = {s["id"]: s for s in all_specs}
+                cols_grid = st.columns(min(len(selected_ids), 3))
+                for i, sid in enumerate(selected_ids):
+                    with cols_grid[i % len(cols_grid)]:
+                        placeholders[sid] = st.empty()
+                        placeholders[sid].info(f"⏳ {specs_lookup[sid]['title']} — running…")
+
+                completed = {"n": 0}
+                total = len(selected_ids)
+
+                def _on_progress(agent_id: str, result: dict) -> None:
+                    completed["n"] += 1
+                    progress_bar.progress(
+                        completed["n"] / total,
+                        text=f"{completed['n']}/{total} agents done — synthesizing…"
+                              if completed["n"] == total else
+                              f"{completed['n']}/{total} agents done…",
+                    )
+                    r = result.get("result") or {}
+                    headline = r.get("headline") or "(no headline)"
+                    confidence = r.get("confidence", "?")
+                    ph = placeholders.get(agent_id)
+                    if ph is not None:
+                        ph.success(
+                            f"✅ **{result.get('title','')}** — conf: `{confidence}`\n\n"
+                            f"{headline}"
+                        )
+
+                status_holder.info("🧠 Running 5 specialists in parallel on Opus…")
+                try:
+                    brief = orch.run_deep_brief(
+                        user_query=user_focus,
+                        subagent_ids=selected_ids,
+                        progress_callback=_on_progress,
+                    )
+                    st.session_state["last_deep_brief"] = brief
+                    status_holder.success(
+                        f"Done — generated at {brief['generated_at']} UTC"
+                    )
+                    progress_bar.progress(1.0, text="✅ Complete")
+                except Exception as e:
+                    status_holder.error(f"Deep brief failed: {e}")
+
+        brief = st.session_state.get("last_deep_brief")
+        if brief:
+            st.markdown("---")
+            st.markdown("### 📋 Executive Brief")
+            st.markdown(brief.get("synthesis", "(no synthesis)"))
+
+            st.markdown("---")
+            st.markdown("### 🔬 Specialist Briefings")
+            for sid, r in brief.get("subagents", {}).items():
+                res = r.get("result") or {}
+                title = r.get("title", sid)
+                conf = res.get("confidence", "?")
+                headline = res.get("headline", "")
+                with st.expander(f"{title} — conf: `{conf}` — {headline}", expanded=False):
+                    if res.get("_parse_failed"):
+                        st.warning("This agent's response could not be parsed as JSON. Raw output below.")
+                        st.code(r.get("raw", ""), language="text")
+                    else:
+                        if res.get("key_findings"):
+                            st.markdown("**Key findings:**")
+                            for kf in res["key_findings"]:
+                                st.markdown(f"- {kf}")
+                        if res.get("data_points"):
+                            st.markdown("**Data points:**")
+                            st.json(res["data_points"])
+                        if res.get("outlook"):
+                            st.markdown(f"**Outlook:** {res['outlook']}")
+                        if res.get("risks"):
+                            st.markdown("**Risks:**")
+                            for rk in res["risks"]:
+                                st.markdown(f"- {rk}")
+                    tlog = r.get("tool_log") or []
+                    if tlog:
+                        with st.expander(f"🔧 Tool calls ({len(tlog)})", expanded=False):
+                            for t in tlog:
+                                st.markdown(f"- `{t['name']}` args=`{t.get('args')}`")
+                                st.caption(t.get("result_preview", ""))
+
+            with st.expander("📦 Raw brief JSON"):
+                st.json(brief)
 
 # ================= END OF APP LAYOUT =================
 

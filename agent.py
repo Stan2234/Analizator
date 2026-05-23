@@ -197,6 +197,35 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "search_universe",
+        "description": "Search the S&P 500 + indices universe by ticker or company name. Returns matching symbols with their GICS sector, industry, and (if cached) latest price/change. Use this to find tickers when the user names a company, or to list constituents of a sector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Ticker prefix or company name substring (case-insensitive)"},
+                "sector": {"type": "string", "description": "Optional GICS sector filter: Information Technology, Health Care, Financials, Consumer Discretionary, Communication Services, Industrials, Consumer Staples, Energy, Utilities, Real Estate, Materials"},
+                "limit": {"type": "integer", "description": "Max results (default 30)"}
+            }
+        }
+    },
+    {
+        "name": "get_top_movers",
+        "description": "Top N gainers or losers across the S&P 500 universe today, based on the latest cached snapshots. Use this when asked 'what's moving today', 'biggest gainers', 'top losers', or sector-specific movers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["up", "down"], "description": "'up' for gainers, 'down' for losers"},
+                "n": {"type": "integer", "description": "How many (default 10, max 50)"}
+            },
+            "required": ["direction"]
+        }
+    },
+    {
+        "name": "get_sector_performance",
+        "description": "Average % change per GICS sector across S&P 500 constituents (plus how many are up vs down in each sector). Use this when asked 'how are sectors doing', 'which sectors are leading/lagging', or to triangulate macro themes against equity flows.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "get_db_health",
         "description": "Diagnostics: how many news/market/signal/SEC rows are stored, and the timestamp of the latest news.",
         "input_schema": {"type": "object", "properties": {}}
@@ -336,6 +365,65 @@ def _tool_get_db_health(_args: Dict[str, Any]) -> Any:
     return dl.db_health()
 
 
+def _tool_search_universe(args: Dict[str, Any]) -> Any:
+    try:
+        dl.seed_universe()
+    except Exception:
+        pass
+    q = args.get("query") or ""
+    sector = args.get("sector")
+    limit = min(int(args.get("limit") or 30), 100)
+    rows = dl.universe_with_quotes(
+        asset_types=["equity", "index", "commodity", "fx_index",
+                     "vol_index", "rate_index", "etf"],
+        sector=sector,
+        query=q if q else None,
+        limit=limit,
+    )
+    return [{
+        "symbol": r["symbol"],
+        "name": r["company_name"],
+        "sector": r["sector"],
+        "industry": r["industry"],
+        "price": r.get("price"),
+        "change_pct": r.get("change_pct"),
+        "snapshot_at": r.get("snapshot_at"),
+    } for r in rows]
+
+
+def _tool_get_top_movers(args: Dict[str, Any]) -> Any:
+    try:
+        dl.seed_universe()
+    except Exception:
+        pass
+    direction = (args.get("direction") or "up").lower()
+    n = min(int(args.get("n") or 10), 50)
+    rows = dl.top_movers(n=n, direction=direction, asset_types=["equity"])
+    return [{
+        "symbol": r["symbol"],
+        "name": r["company_name"],
+        "sector": r["sector"],
+        "price": r.get("price"),
+        "change_pct": r.get("change_pct"),
+    } for r in rows]
+
+
+def _tool_get_sector_performance(_args: Dict[str, Any]) -> Any:
+    try:
+        dl.seed_universe()
+    except Exception:
+        pass
+    rows = dl.sector_performance()
+    return [{
+        "sector": r["sector"],
+        "avg_change_pct": r.get("avg_change"),
+        "n_companies": r.get("n_total"),
+        "n_with_data": r.get("n_with_data"),
+        "n_up": r.get("n_up"),
+        "n_down": r.get("n_down"),
+    } for r in rows]
+
+
 def _tool_get_sentiment_indexes(_args: Dict[str, Any]) -> Any:
     fred_key = _get_secret("FRED_API_KEY")
     return {
@@ -362,6 +450,9 @@ TOOL_DISPATCH = {
     "get_polymarket_predictions":   _tool_get_polymarket_predictions,
     "get_db_health":                _tool_get_db_health,
     "get_sentiment_indexes":        _tool_get_sentiment_indexes,
+    "search_universe":              _tool_search_universe,
+    "get_top_movers":               _tool_get_top_movers,
+    "get_sector_performance":       _tool_get_sector_performance,
 }
 
 
@@ -369,14 +460,18 @@ TOOL_DISPATCH = {
 
 SYSTEM_PROMPT = """You are Analizator, an autonomous markets and macro analyst with live tool access to a database of news, market quotes, technical signals, economic calendar events, FRED macro series, SEC filings (13F/Form 4/8-K) for major institutions (JPMorgan, Goldman Sachs, BlackRock, Berkshire, Bridgewater, Renaissance, Citadel, Two Sigma, Point72, Tiger Global), Finnhub analyst data, and a global crypto market overview (CoinGecko + Fear & Greed).
 
+You ALSO have access to the full S&P 500 symbol universe (~489 companies tagged with GICS sector and industry) plus 11 major indices (^GSPC, ^NDX, ^DJI, ^RUT, ^VIX, ^TNX, DX-Y.NYB, CL=F, ^FTSE, ^GDAXI, ^N225). Use search_universe to look up tickers by company name, get_top_movers for today's biggest gainers/losers, and get_sector_performance for sector rotation analysis.
+
 Your job is to answer the user's questions freely, like an intelligent analyst. There are no scripted answers. Use your tools whenever they would help — usually they will. Chain multiple tools when useful (e.g. pull a quote + signal + news for the same symbol before answering).
 
 Rules:
 - Be direct and specific. Cite real numbers and dates pulled from tools.
 - If a tool returns no data, say so honestly. Don't invent numbers.
 - 13F filings are 45+ days delayed by SEC rule — never describe them as current positions.
-- When asked "what's happening today", call search_news with since_hours=24 across multiple categories.
+- When asked "what's happening today", call search_news with since_hours=24 across multiple categories; consider chaining get_top_movers and get_sector_performance for the equity-side read.
+- When the user names a company without a ticker, use search_universe to resolve it before pulling quote/news/signal.
 - When asked about a specific company, get the quote, signal, news, and analyst recs in parallel if possible.
+- When asked about sector rotation, leadership, or laggards, call get_sector_performance.
 - Format prices to a sensible number of decimals. Use thousand separators for big numbers.
 - If the user asks something outside markets/macro, answer briefly and offer to bring it back to markets.
 - Never refuse a question just because data is incomplete — give your best read with caveats.

@@ -42,7 +42,7 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
     {
         "id": "news",
         "title": "📰 News & Catalysts",
-        "tools": ["search_news", "get_company_news"],
+        "tools": ["search_news", "get_company_news", "search_universe"],
         "system": (
             "You are a market news analyst. Your job is to surface the most "
             "important news events of the last 24-48 hours that are moving or "
@@ -111,7 +111,8 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
         "title": "🏛️ Smart Money & Equity",
         "tools": ["get_institution_filings", "get_institution_top_holdings",
                   "get_analyst_recommendations", "get_market_quote",
-                  "get_company_news"],
+                  "get_company_news", "get_top_movers",
+                  "get_sector_performance", "search_universe"],
         "system": (
             "You are a smart-money tracker. Surface what large institutions "
             "(JPMorgan, Goldman, BlackRock, Berkshire, Bridgewater, Renaissance, "

@@ -686,6 +686,90 @@ def universe_search(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def universe_with_quotes(asset_types: Optional[List[str]] = None,
+                          sector: Optional[str] = None,
+                          query: Optional[str] = None,
+                          limit: int = 1000) -> List[Dict[str, Any]]:
+    """Join universe metadata with latest market snapshots.
+
+    Returns rows with: symbol, company_name, sector, industry, asset_type,
+    is_core, price, change_pct, volume, snapshot_at. price/change may be
+    NULL if no snapshot is cached yet.
+    """
+    conn = get_conn()
+    sql = (
+        "SELECT u.symbol, u.company_name, u.sector, u.industry, u.asset_type, "
+        "u.is_core, m.price, m.change_pct, m.volume, m.snapshot_at "
+        "FROM symbols_universe u "
+        "LEFT JOIN market_snapshots m ON u.symbol = m.symbol "
+        "WHERE 1=1"
+    )
+    params: List[Any] = []
+    if asset_types:
+        sql += f" AND u.asset_type IN ({','.join('?' for _ in asset_types)})"
+        params.extend(asset_types)
+    if sector:
+        sql += " AND u.sector = ?"
+        params.append(sector)
+    if query:
+        q = f"%{query.lower()}%"
+        sql += " AND (UPPER(u.symbol) LIKE ? OR LOWER(u.company_name) LIKE ?)"
+        params.extend([f"{query.upper()}%", q])
+    sql += " ORDER BY u.sector, u.symbol LIMIT ?"
+    params.append(int(limit))
+    with _DB_LOCK:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def top_movers(n: int = 10, direction: str = "up",
+                asset_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Top N gainers (direction='up') or losers (direction='down') across
+    the universe. Joins universe metadata. Excludes symbols with NULL
+    change_pct or |change| > 50% (likely bad data / splits)."""
+    conn = get_conn()
+    order = "DESC" if direction.lower() == "up" else "ASC"
+    sql = (
+        "SELECT u.symbol, u.company_name, u.sector, u.asset_type, "
+        "m.price, m.change_pct, m.snapshot_at "
+        "FROM symbols_universe u "
+        "JOIN market_snapshots m ON u.symbol = m.symbol "
+        "WHERE m.change_pct IS NOT NULL "
+        "AND ABS(m.change_pct) < 50"
+    )
+    params: List[Any] = []
+    if asset_types:
+        sql += f" AND u.asset_type IN ({','.join('?' for _ in asset_types)})"
+        params.extend(asset_types)
+    sql += f" ORDER BY m.change_pct {order} LIMIT ?"
+    params.append(int(n))
+    with _DB_LOCK:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def sector_performance() -> List[Dict[str, Any]]:
+    """Average % change per GICS sector, plus the corresponding sector
+    ETF's change for comparison. Returns rows sorted by avg_change DESC."""
+    conn = get_conn()
+    sql = """
+    SELECT u.sector,
+           AVG(m.change_pct) AS avg_change,
+           COUNT(m.change_pct) AS n_with_data,
+           COUNT(u.symbol) AS n_total,
+           SUM(CASE WHEN m.change_pct > 0 THEN 1 ELSE 0 END) AS n_up,
+           SUM(CASE WHEN m.change_pct < 0 THEN 1 ELSE 0 END) AS n_down
+    FROM symbols_universe u
+    LEFT JOIN market_snapshots m ON u.symbol = m.symbol
+    WHERE u.asset_type = 'equity'
+    GROUP BY u.sector
+    ORDER BY avg_change DESC NULLS LAST
+    """
+    with _DB_LOCK:
+        rows = conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
 def universe_sector_counts() -> Dict[str, int]:
     conn = get_conn()
     with _DB_LOCK:

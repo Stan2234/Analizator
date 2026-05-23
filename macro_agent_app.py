@@ -3241,36 +3241,259 @@ tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_poly, tab_ai, tab_fomc,
 
 )
 
-# -------- GLOBAL TAB --------
+# -------- GLOBAL TAB (Bloomberg-style dashboard) --------
 with tab_global:
-    st.subheader("Global Signals — Yahoo Finance (1D, ~1y history)")
+    # ensure universe is loaded before any query
+    try:
+        dl.seed_universe()
+    except Exception as _seed_e:
+        st.warning(f"Universe seed failed: {_seed_e}")
 
-    all_classes = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
-    selected_classes = st.multiselect(
-        "Asset classes to show:",
-        options=all_classes,
-        default=all_classes,
-    )
+    # ============== Indices ticker tape (animated marquee) ==============
+    try:
+        import symbol_universe as _su
+        indices_meta = _su.MAJOR_INDICES
+        ticker_cells = []
+        for idx in indices_meta:
+            snap = dl.latest_market_snapshot(idx["symbol"]) or {}
+            price = snap.get("price")
+            chg = snap.get("change_pct")
+            if price is None:
+                price_str = "—"
+                chg_str = ""
+                color = "#888"
+            else:
+                price_str = f"{float(price):,.2f}"
+                if chg is None:
+                    chg_str = ""
+                    color = "#ddd"
+                else:
+                    chg_str = f"{float(chg):+.2f}%"
+                    color = "#00d97e" if chg >= 0 else "#ff4d6d"
+            ticker_cells.append(
+                f'<span class="ticker-cell">'
+                f'<span class="t-name">{idx["name"]}</span> '
+                f'<span class="t-price">{price_str}</span> '
+                f'<span class="t-chg" style="color:{color};">{chg_str}</span>'
+                f'</span>'
+            )
+        # Duplicate cells to make the loop seamless
+        ticker_html = "".join(ticker_cells) + "".join(ticker_cells)
+        st.markdown(
+            f"""
+            <style>
+            .ticker-wrap {{
+                overflow: hidden; width: 100%;
+                background: #0d0d0d; border: 1px solid #1f1f1f;
+                border-radius: 6px; padding: 8px 0; margin-bottom: 14px;
+            }}
+            .ticker-track {{
+                display: inline-block; white-space: nowrap;
+                animation: ticker-scroll 90s linear infinite;
+            }}
+            .ticker-cell {{
+                display: inline-block; padding: 0 28px; color: #ddd;
+                font-family: 'Courier New', monospace; font-size: 14px;
+            }}
+            .ticker-cell .t-name {{ color: #9aa0a6; }}
+            .ticker-cell .t-price {{ color: #fff; font-weight: 600; }}
+            @keyframes ticker-scroll {{
+                0% {{ transform: translateX(0); }}
+                100% {{ transform: translateX(-50%); }}
+            }}
+            </style>
+            <div class="ticker-wrap"><div class="ticker-track">{ticker_html}</div></div>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception as _e:
+        st.warning(f"Ticker tape failed to render: {_e}")
 
-    st.write("Data source: Yahoo Finance chart API.")
-    st.write("Logic: Multi-indicator scoring (SMA + RSI + MACD + Bollinger + Stochastic + ADX).")
+    # ============== Two-column: Sector heatmap | Top movers ==============
+    col_heat, col_movers = st.columns([3, 2])
 
-    refresh = st.button("🔄 Refresh global signals")
+    with col_heat:
+        st.markdown("### 🔥 Sector Heatmap (S&P 500 avg)")
+        try:
+            perf = dl.sector_performance()
+            perf_with_data = [r for r in perf if r.get("avg_change") is not None]
+            if not perf_with_data:
+                st.info(
+                    "No sector data yet — the universe is being populated "
+                    "by the background scheduler. Refresh in 2-3 minutes."
+                )
+            else:
+                # Render 4-per-row grid of colored cards
+                cols_per_row = 4
+                for i in range(0, len(perf_with_data), cols_per_row):
+                    row = perf_with_data[i:i + cols_per_row]
+                    rcols = st.columns(cols_per_row)
+                    for c, item in zip(rcols, row):
+                        avg = float(item["avg_change"]) if item["avg_change"] is not None else 0.0
+                        # Color: clamp to [-3, +3]% for color intensity
+                        intensity = min(abs(avg) / 3.0, 1.0)
+                        if avg >= 0:
+                            bg = f"rgba(0, 217, 126, {0.15 + intensity * 0.5:.2f})"
+                            border = "#00d97e"
+                        else:
+                            bg = f"rgba(255, 77, 109, {0.15 + intensity * 0.5:.2f})"
+                            border = "#ff4d6d"
+                        n_up = item.get("n_up", 0) or 0
+                        n_down = item.get("n_down", 0) or 0
+                        with c:
+                            st.markdown(
+                                f'''<div style="background:{bg};
+                                    border-left:4px solid {border};
+                                    padding:10px 12px; border-radius:6px;
+                                    margin-bottom:8px;">
+                                <div style="color:#9aa0a6; font-size:11px;
+                                    text-transform:uppercase;
+                                    letter-spacing:0.5px;">{item["sector"]}</div>
+                                <div style="color:#fff; font-size:20px;
+                                    font-weight:700; margin:4px 0;">{avg:+.2f}%</div>
+                                <div style="color:#9aa0a6; font-size:11px;">
+                                    🟢 {n_up} &nbsp; 🔴 {n_down}</div>
+                                </div>''',
+                                unsafe_allow_html=True,
+                            )
+        except Exception as _e:
+            st.error(f"Heatmap failed: {_e}")
 
-    if "df_signals_global" not in st.session_state or refresh:
-        df_global = run_analysis_global(selected_classes)
-        st.session_state["df_signals_global"] = df_global
-    else:
-        df_global = st.session_state["df_signals_global"]
+    with col_movers:
+        st.markdown("### 🚀 Top Movers")
+        try:
+            gainers = dl.top_movers(8, "up",  asset_types=["equity"])
+            losers  = dl.top_movers(8, "down", asset_types=["equity"])
 
-    if df_global.empty:
-        st.error("No global results. Possibly no data or connection issue.")
-    else:
-        def color_terminal(row):
-            return ["color: #00ff00; background-color: #000000;" for _ in row]
+            mv_tab1, mv_tab2 = st.tabs(["📈 Gainers", "📉 Losers"])
+            for tab_holder, rows in [(mv_tab1, gainers), (mv_tab2, losers)]:
+                with tab_holder:
+                    if not rows:
+                        st.caption("No data yet — refresh in a few minutes.")
+                    else:
+                        for r in rows:
+                            chg = float(r.get("change_pct") or 0)
+                            color = "#00d97e" if chg >= 0 else "#ff4d6d"
+                            price = r.get("price")
+                            price_s = f"${float(price):,.2f}" if price else "—"
+                            st.markdown(
+                                f'''<div style="display:flex;
+                                    justify-content:space-between;
+                                    padding:6px 8px; border-bottom:1px solid #1f1f1f;">
+                                <div>
+                                    <span style="color:#fff; font-weight:600;
+                                        font-family:monospace;">{r["symbol"]}</span>
+                                    <span style="color:#9aa0a6; font-size:11px;
+                                        margin-left:8px;">{r["company_name"][:20]}</span>
+                                </div>
+                                <div>
+                                    <span style="color:#ddd; font-family:monospace;">{price_s}</span>
+                                    <span style="color:{color}; font-weight:600;
+                                        margin-left:10px;">{chg:+.2f}%</span>
+                                </div>
+                                </div>''',
+                                unsafe_allow_html=True,
+                            )
+        except Exception as _e:
+            st.error(f"Top movers failed: {_e}")
 
-        styled_df = df_global.style.apply(color_terminal, axis=1)
-        st.dataframe(styled_df, use_container_width=True)
+    st.markdown("---")
+
+    # ============== Searchable Universe Browser ==============
+    st.markdown("### 🔍 S&P 500 Universe Browser")
+    try:
+        stats = dl.universe_sector_counts()
+        total_equities = sum(v for s, v in stats.items()
+                              if s not in ("Index/Commodity", "ETF/Other"))
+        st.caption(
+            f"**{total_equities}** S&P 500 companies + **{stats.get('Index/Commodity', 0)}** "
+            f"indices/commodities + **{stats.get('ETF/Other', 0)}** ETFs available. "
+            f"Search by ticker or company name, or filter by sector."
+        )
+
+        bcol1, bcol2 = st.columns([2, 3])
+        sector_options = ["All sectors"] + sorted(
+            [s for s in stats.keys() if s not in ("Index/Commodity", "ETF/Other")]
+        )
+        sel_sector = bcol1.selectbox("GICS sector", sector_options, key="universe_sector")
+        search_q = bcol2.text_input("Search ticker or company name",
+                                     key="universe_search",
+                                     placeholder="e.g. NVDA, Tesla, oil…")
+
+        sector_filter = None if sel_sector == "All sectors" else sel_sector
+        rows = dl.universe_with_quotes(
+            asset_types=["equity"],
+            sector=sector_filter,
+            query=search_q if search_q else None,
+            limit=200,
+        )
+
+        if not rows:
+            st.info("No matches.")
+        else:
+            # Render as a table
+            import pandas as pd
+            df_view = pd.DataFrame([{
+                "Symbol":   r["symbol"],
+                "Company":  r["company_name"],
+                "Sector":   r["sector"],
+                "Industry": r["industry"],
+                "Price":    f"${float(r['price']):,.2f}" if r.get("price") else "—",
+                "Change %": (f"{float(r['change_pct']):+.2f}%"
+                              if r.get("change_pct") is not None else "—"),
+            } for r in rows])
+
+            def _row_color(row):
+                ch = row.get("Change %", "")
+                if isinstance(ch, str) and ch != "—":
+                    try:
+                        v = float(ch.replace("%", "").replace("+", ""))
+                        if v > 0:
+                            return ["color: #00d97e"] * len(row)
+                        if v < 0:
+                            return ["color: #ff4d6d"] * len(row)
+                    except Exception:
+                        pass
+                return [""] * len(row)
+
+            st.dataframe(
+                df_view.style.apply(_row_color, axis=1),
+                use_container_width=True,
+                hide_index=True,
+                height=min(600, 40 + 35 * len(df_view)),
+            )
+            st.caption(f"Showing {len(df_view)} of up to 200 matches.")
+    except Exception as _e:
+        st.error(f"Universe browser failed: {_e}")
+
+    # ============== Legacy multi-indicator analysis (collapsed) ==============
+    with st.expander("📊 Legacy multi-indicator signal table (original Global Signals)",
+                      expanded=False):
+        st.caption(
+            "The original SMA+RSI+MACD+Bollinger+Stochastic+ADX scoring "
+            "table. Slower (re-pulls history). Kept for power-user use."
+        )
+        all_classes_legacy = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
+        selected_classes = st.multiselect(
+            "Asset classes to show:",
+            options=all_classes_legacy,
+            default=all_classes_legacy,
+            key="legacy_global_classes",
+        )
+        refresh = st.button("🔄 Refresh legacy signals", key="legacy_global_refresh")
+        if "df_signals_global" not in st.session_state or refresh:
+            df_global = run_analysis_global(selected_classes)
+            st.session_state["df_signals_global"] = df_global
+        else:
+            df_global = st.session_state["df_signals_global"]
+
+        if df_global.empty:
+            st.warning("No legacy results yet.")
+        else:
+            def color_terminal(row):
+                return ["color: #00ff00; background-color: #000000;" for _ in row]
+            styled_df = df_global.style.apply(color_terminal, axis=1)
+            st.dataframe(styled_df, use_container_width=True)
 
 # -------- FX / CURRENCIES TAB --------
 with tab_fx:
@@ -3841,9 +4064,34 @@ with tab_quant:
     """, unsafe_allow_html=True)
 
     # ── ASSET SELECTOR (horizontal, compact) ──
+    # Build the asset pool from:
+    #   1. The full S&P 500 universe + indices (filterable by sector)
+    #   2. The dynamic Global/Binance tab signals (legacy)
+    try:
+        dl.seed_universe()
+    except Exception:
+        pass
+
+    sector_options_q = ["All"] + sorted(
+        [s for s in (dl.universe_sector_counts() or {}).keys()]
+    )
+    sec_filter = st.selectbox("Sector filter", options=sector_options_q,
+                                index=0, key="quant_sec_filter",
+                                label_visibility="collapsed")
+
+    asset_options_q: List[str] = []
+    try:
+        universe_rows = dl.universe_all()
+        if sec_filter and sec_filter != "All":
+            universe_rows = [r for r in universe_rows if r.get("sector") == sec_filter]
+        asset_options_q.extend(
+            f"{r['company_name']} ({r['symbol']})" for r in universe_rows
+        )
+    except Exception:
+        pass
+
     df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
     df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
-    asset_options_q: List[str] = []
     if not df_global_for_q.empty:
         asset_options_q.extend(
             df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
@@ -3856,7 +4104,11 @@ with tab_quant:
 
     qc1, qc2, qc3, qc4, qc5 = st.columns([2.5, 1, 1.5, 1.5, 1])
     with qc1:
-        focus_asset_q = st.selectbox("Asset", options=asset_options_q, index=0, key="quant_asset", label_visibility="collapsed")
+        focus_asset_q = st.selectbox(
+            f"Asset ({len(asset_options_q)-1} available)",
+            options=asset_options_q, index=0,
+            key="quant_asset", label_visibility="collapsed",
+        )
     with qc2:
         source_pref_q = st.selectbox("Src", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source", label_visibility="collapsed")
     with qc3:

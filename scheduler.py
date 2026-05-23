@@ -162,24 +162,82 @@ def job_refresh_sec() -> None:
 
 
 def job_refresh_quotes() -> None:
-    """Live quotes for the assets shown in the live ticker."""
+    """Live quotes for the header tickers + core watchlist.
+
+    Runs frequently (every 5 min). Includes the original header symbols
+    (gold, silver, FX, indices, BTC, ETH) plus the universe CORE_WATCHLIST
+    (sector ETFs, mega caps, broad ETFs).
+    """
     try:
-        yahoo_syms = ["GC=F", "SI=F", "EURUSD=X", "GBPUSD=X", "JPY=X",
-                      "^GSPC", "^NDX", "BTC-USD", "ETH-USD"]
-        for s in yahoo_syms:
-            q = src.fetch_yahoo_quote(s)
-            if q and q.get("price") is not None:
-                prev = q.get("prev_close") or 0
-                chg = ((q["price"] - prev) / prev * 100.0) if prev else None
-                dl.upsert_market_snapshot(s, "yahoo", float(q["price"]), chg)
+        # Original header symbols (kept for backward compat)
+        header_syms = ["GC=F", "SI=F", "EURUSD=X", "GBPUSD=X", "JPY=X",
+                       "^GSPC", "^NDX", "BTC-USD", "ETH-USD"]
+        # Core watchlist from the universe (ETFs, indices, mega caps)
+        core_syms: list = []
+        try:
+            dl.seed_universe()  # idempotent
+            core_syms = [r["symbol"] for r in dl.universe_core()]
+        except Exception:
+            log.exception("could not read core watchlist")
+
+        all_yahoo = sorted(set(header_syms) | set(core_syms))
+        results = src.fetch_yahoo_batch(all_yahoo, max_workers=8)
+        ok = 0
+        for sym, q in results.items():
+            if "error" in q:
+                continue
+            price = q.get("price")
+            if price is None:
+                continue
+            dl.upsert_market_snapshot(sym, "yahoo", float(price),
+                                       q.get("change_pct"), q.get("volume"))
+            ok += 1
+
         binance_syms = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT", "XRPUSDT"]
         for s in binance_syms:
             q = src.fetch_binance_24h(s)
             if q:
                 dl.upsert_market_snapshot(s, "binance", q["price"], q.get("change_pct"), q.get("volume"))
-        log.info("quotes job: refreshed %d symbols", len(yahoo_syms) + len(binance_syms))
+        log.info("quotes job: refreshed %d/%d yahoo + %d binance",
+                 ok, len(all_yahoo), len(binance_syms))
     except Exception as e:
         log.exception("job_refresh_quotes failed: %s", e)
+
+
+def job_refresh_universe_full() -> None:
+    """Refresh prices for the FULL S&P 500 universe (500+ symbols).
+
+    Runs less frequently (every 30 min) to avoid Yahoo rate-limiting.
+    Uses batch fetcher with parallelism. Skips the core symbols since
+    they're already refreshed by job_refresh_quotes every 5 min.
+    """
+    try:
+        dl.seed_universe()  # idempotent
+        all_rows = dl.universe_all()
+        core_set = {r["symbol"] for r in dl.universe_core()}
+        non_core = [r["symbol"] for r in all_rows
+                    if r["symbol"] not in core_set and r["asset_type"] == "equity"]
+        if not non_core:
+            log.info("universe refresh: no non-core equities to refresh")
+            return
+        log.info("universe refresh: starting %d symbols", len(non_core))
+        t0 = dt.datetime.utcnow()
+        results = src.fetch_yahoo_batch(non_core, max_workers=10)
+        ok = 0
+        for sym, q in results.items():
+            if "error" in q:
+                continue
+            price = q.get("price")
+            if price is None:
+                continue
+            dl.upsert_market_snapshot(sym, "yahoo", float(price),
+                                       q.get("change_pct"), q.get("volume"))
+            ok += 1
+        elapsed = (dt.datetime.utcnow() - t0).total_seconds()
+        log.info("universe refresh: done %d/%d ok in %.0fs",
+                 ok, len(non_core), elapsed)
+    except Exception as e:
+        log.exception("job_refresh_universe_full failed: %s", e)
 
 
 def job_prune() -> None:
@@ -250,6 +308,8 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched = BackgroundScheduler(timezone="UTC", job_defaults={"coalesce": True, "max_instances": 1})
 
         sched.add_job(job_refresh_quotes, IntervalTrigger(minutes=5), id="quotes", replace_existing=True)
+        sched.add_job(job_refresh_universe_full, IntervalTrigger(minutes=30),
+                      id="universe_full", replace_existing=True)
         sched.add_job(job_refresh_rss, IntervalTrigger(minutes=20), id="rss", replace_existing=True)
         sched.add_job(job_refresh_news, IntervalTrigger(minutes=30), id="newsapi", replace_existing=True)
         sched.add_job(job_refresh_crypto_market, IntervalTrigger(minutes=15), id="crypto_market", replace_existing=True)

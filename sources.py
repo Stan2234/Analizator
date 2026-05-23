@@ -786,6 +786,55 @@ def fetch_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def fetch_yahoo_batch(symbols: List[str], max_workers: int = 8,
+                       per_symbol_timeout: float = 8.0) -> Dict[str, Dict[str, Any]]:
+    """Fetch quotes for many symbols in parallel.
+
+    Yahoo's old v7/finance/quote multi-symbol endpoint now requires
+    authenticated crumbs, so we just parallelize the per-symbol chart
+    endpoint. With max_workers=8 we can refresh ~500 symbols in ~60-90s
+    without hitting Yahoo's rate limits.
+
+    Returns a dict {symbol: quote_dict_or_error_dict}. Symbols that fail
+    are present with {"error": "..."} rather than missing — so callers
+    can distinguish "tried and failed" from "not requested".
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    out: Dict[str, Dict[str, Any]] = {}
+    if not symbols:
+        return out
+
+    def _one(sym: str) -> tuple:
+        try:
+            q = fetch_yahoo_quote(sym)
+            if q and q.get("price") is not None:
+                # Compute change_pct from prev_close when available
+                if q.get("change_pct") is None and q.get("prev_close"):
+                    try:
+                        pc = float(q["prev_close"])
+                        if pc:
+                            q["change_pct"] = (float(q["price"]) - pc) / pc * 100.0
+                    except Exception:
+                        pass
+                return sym, q
+            return sym, {"error": "no data"}
+        except Exception as e:
+            return sym, {"error": str(e)[:200]}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_one, s) for s in symbols]
+        for fut in as_completed(futures):
+            try:
+                sym, q = fut.result(timeout=per_symbol_timeout)
+                out[sym] = q
+            except Exception as e:
+                # Don't let one slow symbol kill the batch
+                pass
+
+    return out
+
+
 def fetch_binance_24h(symbol: str) -> Optional[Dict[str, Any]]:
     r = _get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": symbol})
     if not r:

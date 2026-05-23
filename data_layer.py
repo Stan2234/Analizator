@@ -171,6 +171,18 @@ CREATE TABLE IF NOT EXISTS chat_history (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS symbols_universe (
+    symbol        TEXT PRIMARY KEY,
+    company_name  TEXT NOT NULL,
+    sector        TEXT,
+    industry      TEXT,
+    asset_type    TEXT,    -- 'equity' | 'index' | 'commodity' | 'fx_index' | 'vol_index' | 'rate_index'
+    is_core       INTEGER DEFAULT 0,   -- 1 = always refresh
+    updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_universe_sector ON symbols_universe(sector);
+CREATE INDEX IF NOT EXISTS idx_universe_core ON symbols_universe(is_core);
 """
 
 
@@ -557,6 +569,130 @@ def clear_chat(session_id: str) -> int:
         cur = conn.execute("DELETE FROM chat_history WHERE session_id=?", (session_id,))
         conn.commit()
         return cur.rowcount
+
+
+# ---------------- SYMBOLS UNIVERSE ----------------
+
+def seed_universe(force: bool = False) -> int:
+    """Populate symbols_universe table from symbol_universe.py.
+
+    Idempotent — uses INSERT OR REPLACE so re-running refreshes metadata
+    without duplicating rows. If `force=False` and the table is already
+    non-empty, this is a no-op (skips the work). Returns rows inserted.
+    """
+    try:
+        import symbol_universe as su
+    except Exception:
+        return 0
+    conn = get_conn()
+    with _DB_LOCK:
+        if not force:
+            existing = conn.execute("SELECT COUNT(*) c FROM symbols_universe").fetchone()["c"]
+            if existing >= len(su.SP500_COMPANIES) + len(su.MAJOR_INDICES) - 5:
+                return 0  # already seeded
+        now = now_utc_iso()
+        core_set = set(su.CORE_WATCHLIST)
+        rows = []
+        for r in su.SP500_COMPANIES:
+            rows.append((r["symbol"], r["name"], r["sector"], r["industry"],
+                         "equity", 1 if r["symbol"] in core_set else 0, now))
+        for r in su.MAJOR_INDICES:
+            rows.append((r["symbol"], r["name"], "Index/Commodity", r["type"],
+                         r["type"], 1, now))  # all indices are core
+        # ETFs in core watchlist that aren't S&P members - register them too
+        sp500_set = {x["symbol"] for x in su.SP500_COMPANIES}
+        idx_set = {x["symbol"] for x in su.MAJOR_INDICES}
+        for sym in su.CORE_WATCHLIST:
+            if sym in sp500_set or sym in idx_set:
+                continue
+            rows.append((sym, sym, "ETF/Other", "ETF", "etf", 1, now))
+        conn.executemany(
+            """INSERT OR REPLACE INTO symbols_universe
+               (symbol, company_name, sector, industry, asset_type, is_core, updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+
+
+def universe_all(asset_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    sql = "SELECT * FROM symbols_universe"
+    params: List[Any] = []
+    if asset_types:
+        placeholders = ",".join("?" for _ in asset_types)
+        sql += f" WHERE asset_type IN ({placeholders})"
+        params.extend(asset_types)
+    sql += " ORDER BY sector, symbol"
+    with _DB_LOCK:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def universe_by_sector(sector: str) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT * FROM symbols_universe WHERE sector=? ORDER BY symbol",
+            (sector,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def universe_core() -> List[Dict[str, Any]]:
+    conn = get_conn()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT * FROM symbols_universe WHERE is_core=1 ORDER BY asset_type, symbol"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def universe_meta(symbol: str) -> Optional[Dict[str, Any]]:
+    if not symbol:
+        return None
+    conn = get_conn()
+    with _DB_LOCK:
+        row = conn.execute(
+            "SELECT * FROM symbols_universe WHERE symbol=?", (symbol.upper(),)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def universe_search(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Search by symbol prefix or company name substring."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    conn = get_conn()
+    like = f"%{q.lower()}%"
+    sym_like = f"{q.upper()}%"
+    with _DB_LOCK:
+        rows = conn.execute(
+            """SELECT *,
+                  CASE
+                    WHEN UPPER(symbol) = ? THEN 0
+                    WHEN UPPER(symbol) LIKE ? THEN 1
+                    WHEN LOWER(company_name) LIKE ? THEN 2
+                    ELSE 3
+                  END AS rank
+               FROM symbols_universe
+               WHERE UPPER(symbol) LIKE ? OR LOWER(company_name) LIKE ?
+               ORDER BY rank, symbol
+               LIMIT ?""",
+            (q.upper(), sym_like, like, sym_like, like, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def universe_sector_counts() -> Dict[str, int]:
+    conn = get_conn()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT sector, COUNT(*) c FROM symbols_universe GROUP BY sector"
+        ).fetchall()
+    return {r["sector"]: r["c"] for r in rows}
 
 
 # ---------------- HEALTH ----------------

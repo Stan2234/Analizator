@@ -2972,7 +2972,7 @@ live_ticker_css = """
 .ticker-header { display: inline; }
 .ticker-symbol {
     color: #9aa0a6;
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -2981,11 +2981,11 @@ live_ticker_css = """
 .ticker-price-row { display: inline-flex; align-items: baseline; gap: 12px; }
 .ticker-price {
     color: #ffffff;
-    font-size: 19px;
+    font-size: 21px;
     font-weight: 700;
 }
 .ticker-change {
-    font-size: 16px;
+    font-size: 17px;
     font-weight: 600;
     color: #cccccc;
 }
@@ -3191,7 +3191,26 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 </script>
 """)
 
-components.html(live_ticker_html, height=72, scrolling=False)
+# Make the ticker span the full viewport width (edge-to-edge).
+# We target the iframe by its unique height=78 (the value we pass below)
+# so this rule does not affect any other Streamlit iframe component.
+st.markdown(
+    """
+    <style>
+    iframe[height="78"] {
+        position: relative !important;
+        width: 100vw !important;
+        left: 50% !important;
+        right: 50% !important;
+        margin-left: -50vw !important;
+        margin-right: -50vw !important;
+        max-width: 100vw !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+components.html(live_ticker_html, height=78, scrolling=False)
 
 # ===== FEAR & GREED INDEXES =====
 def _fg_color(v):

@@ -2930,21 +2930,22 @@ live_ticker_css = """
 <style>
 .live-ticker-container {
     position: relative;
-    margin-top: 0.25rem;
+    margin-top: 0.5rem;
     margin-bottom: 1.5rem;
-    padding: 0.25rem 0;
+    padding: 16px 0;
     overflow: hidden;
-    background-color: #000000;
+    background-color: #0a0a0a;
+    border-top: 1px solid #1f1f1f;
+    border-bottom: 1px solid #1f1f1f;
     color: #ffffff;
 }
-/* Auto-scrolling marquee: row is twice the natural width (we render
-   the cells twice in HTML) and slides from 0 to -50% in a loop. */
+/* Auto-scrolling marquee: cells rendered twice, row slides 0 -> -50%. */
 .live-ticker-row {
     display: inline-flex;
-    gap: 0.75rem;
-    align-items: stretch;
+    gap: 0;
+    align-items: center;
     width: max-content;
-    animation: ticker-marquee 120s linear infinite;
+    animation: ticker-marquee 140s linear infinite;
 }
 .live-ticker-container:hover .live-ticker-row {
     animation-play-state: paused;
@@ -2954,40 +2955,42 @@ live_ticker_css = """
     100% { transform: translateX(-50%); }
 }
 
+/* Flat text-only ticker cells (no borders, no cards). */
 .ticker-item {
-    min-width: 170px;
-    padding: 0.35rem 0.75rem;
-    border-radius: 6px;
-    border: 1px solid #00ff00;
-    background-color: #000000;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    font-size: 0.85rem;
-    color: #ffffff;
-}
-
-.ticker-header {
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 0.15rem;
-}
-.ticker-symbol { font-weight: 700; }
-.ticker-source { opacity: 0.7; font-size: 0.7rem; }
-
-.ticker-price-row {
-    display: flex;
-    justify-content: space-between;
+    display: inline-flex;
     align-items: baseline;
-}
-.ticker-price {
-    font-family: monospace;
-    font-size: 0.95rem;
+    gap: 14px;
+    padding: 0 38px;
+    font-family: 'Courier New', monospace;
+    white-space: nowrap;
+    min-width: 0;
 }
 
-.ticker-change { font-size: 0.8rem; }
-.ticker-change.up { color: #00ff00; }
-.ticker-change.down { color: #ff4d4d; }
+/* Source badge (Yahoo / Binance) hidden — cleaner look. */
+.ticker-source { display: none; }
+
+.ticker-header { display: inline; }
+.ticker-symbol {
+    color: #9aa0a6;
+    font-size: 15px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.ticker-price-row { display: inline-flex; align-items: baseline; gap: 12px; }
+.ticker-price {
+    color: #ffffff;
+    font-size: 19px;
+    font-weight: 700;
+}
+.ticker-change {
+    font-size: 16px;
+    font-weight: 600;
+    color: #cccccc;
+}
+.ticker-change.up   { color: #00d97e; }
+.ticker-change.down { color: #ff4d6d; }
 
 /* Scroll arrows hidden — replaced by auto-scrolling marquee. */
 .ticker-arrow { display: none; }
@@ -3188,7 +3191,7 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 </script>
 """)
 
-components.html(live_ticker_html, height=120, scrolling=False)
+components.html(live_ticker_html, height=72, scrolling=False)
 
 # ===== FEAR & GREED INDEXES =====
 def _fg_color(v):

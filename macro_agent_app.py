@@ -234,18 +234,33 @@ BINANCE_TIMEFRAMES = {
 
 # Live ticker – кои символи да показваме хоризонтално (Binance crypto)
 LIVE_TICKER_SYMBOLS = [
+    # Commodities + FX (existing)
     ("GC=F", "GOLD"),
     ("SI=F", "SILVER"),
     ("EURUSD=X", "EUR/USD"),
     ("GBPUSD=X", "GBP/USD"),
     ("JPY=X", "USD/JPY"),
 
+    # Crypto via Binance (existing)
     ("BTCUSDT", "BTC"),
     ("ETHUSDT", "ETH"),
     ("BNBUSDT", "BNB"),
     ("SOLUSDT", "SOL"),
     ("ADAUSDT", "ADA"),
     ("XRPUSDT", "XRP"),
+
+    # Major global indices, rates, DXY, WTI (added 2026-05)
+    ("^GSPC",     "S&P 500"),
+    ("^NDX",      "NASDAQ 100"),
+    ("^DJI",      "DOW"),
+    ("^RUT",      "RUSSELL 2000"),
+    ("^VIX",      "VIX"),
+    ("^TNX",      "US 10Y"),
+    ("DX-Y.NYB",  "DXY"),
+    ("CL=F",      "WTI CRUDE"),
+    ("^FTSE",     "FTSE 100"),
+    ("^GDAXI",    "DAX"),
+    ("^N225",     "NIKKEI"),
 ]
 
 
@@ -3231,70 +3246,8 @@ with st.expander("Yahoo Live Debug"):
 
 
 # ===== REST OF HEADER =====
-
-# ── Indices ticker tape (scrolling, matches header style) ─────────────
-try:
-    dl.seed_universe()  # idempotent
-    import symbol_universe as _su_hdr
-    _ticker_cells = []
-    for _idx in _su_hdr.MAJOR_INDICES:
-        _snap = dl.latest_market_snapshot(_idx["symbol"]) or {}
-        _price = _snap.get("price")
-        _chg = _snap.get("change_pct")
-        if _price is None:
-            _price_str = "—"
-            _chg_str = ""
-            _color = "#888"
-        else:
-            _price_str = f"{float(_price):,.2f}"
-            if _chg is None:
-                _chg_str = ""
-                _color = "#ddd"
-            else:
-                _chg_str = f"{float(_chg):+.2f}%"
-                _color = "#00d97e" if _chg >= 0 else "#ff4d6d"
-        _ticker_cells.append(
-            f'<span class="hdr-ticker-cell">'
-            f'<span class="hdr-t-name">{_idx["name"]}</span> '
-            f'<span class="hdr-t-price">{_price_str}</span> '
-            f'<span class="hdr-t-chg" style="color:{_color};">{_chg_str}</span>'
-            f'</span>'
-        )
-    _ticker_html = "".join(_ticker_cells) + "".join(_ticker_cells)
-    st.markdown(
-        f"""
-        <style>
-        .hdr-ticker-wrap {{
-            overflow: hidden; width: 100%;
-            background: #0d0d0d;
-            border: 1px solid #1f1f1f;
-            border-radius: 6px; padding: 10px 0; margin: 8px 0 4px 0;
-        }}
-        .hdr-ticker-track {{
-            display: inline-block; white-space: nowrap;
-            animation: hdr-ticker-scroll 90s linear infinite;
-        }}
-        .hdr-ticker-cell {{
-            display: inline-block; padding: 0 32px; color: #ddd;
-            font-family: 'Courier New', monospace; font-size: 14px;
-        }}
-        .hdr-ticker-cell .hdr-t-name {{
-            color: #9aa0a6; text-transform: uppercase;
-            letter-spacing: 0.5px; font-size: 12px;
-        }}
-        .hdr-ticker-cell .hdr-t-price {{ color: #fff; font-weight: 600; }}
-        .hdr-ticker-cell .hdr-t-chg {{ font-weight: 600; }}
-        @keyframes hdr-ticker-scroll {{
-            0% {{ transform: translateX(0); }}
-            100% {{ transform: translateX(-50%); }}
-        }}
-        </style>
-        <div class="hdr-ticker-wrap"><div class="hdr-ticker-track">{_ticker_html}</div></div>
-        """,
-        unsafe_allow_html=True,
-    )
-except Exception as _hdr_e:
-    pass  # silently skip; main dashboard will still render
+# (The 11 major indices are now part of the LIVE_TICKER_SYMBOLS row above —
+# same bordered-card style, same scroll-arrow navigation as gold/silver/FX.)
 
 now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")

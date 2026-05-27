@@ -3952,6 +3952,18 @@ with tab_news:
                 + ")"
             )
 
+        # Add the full S&P 500 universe + indices so the user can pick any
+        # of the ~500 companies for news-based focus, not just whatever
+        # happens to be in the global signal cache.
+        try:
+            dl.seed_universe()
+            for _r in dl.universe_all():
+                if _r.get("asset_type") in ("equity", "index", "commodity",
+                                              "fx_index", "vol_index", "rate_index"):
+                    asset_options.append(f"{_r['company_name']} ({_r['symbol']})")
+        except Exception:
+            pass
+
         asset_options = sorted(set(asset_options))
         current_focus = st.session_state.get("news_focus_asset", "Global macro view")
 
@@ -4125,6 +4137,55 @@ with tab_quant:
     with qc5:
         run_quant_btn = st.button("▶ Run", type="primary", key="run_quant_btn", use_container_width=True)
 
+    # ── Free-text override: type any ticker or company name ──
+    # Lets the user analyse companies outside the S&P 500 (small caps,
+    # foreign tickers, etc.) by going straight to Yahoo.
+    custom_query = st.text_input(
+        "Or type any ticker / company name directly (overrides the dropdown above)",
+        value="",
+        key="quant_custom_query",
+        placeholder="e.g. PLTR  ·  Palantir  ·  ASML.AS  ·  RHM.DE",
+    )
+
+    # Resolve the custom query → symbol.
+    #   Step 1: search our universe (covers ~489 S&P 500 + indices + ETFs)
+    #   Step 2: try the literal input as a Yahoo ticker (broader coverage)
+    #   Step 3: give up with a clear "no data" message
+    custom_symbol_resolved: Optional[str] = None
+    if custom_query.strip():
+        q = custom_query.strip()
+        # 1) universe search by ticker/name
+        try:
+            hits = dl.universe_search(q, limit=1)
+        except Exception:
+            hits = []
+        if hits:
+            custom_symbol_resolved = hits[0]["symbol"]
+            st.success(
+                f"✅ Resolved **{q}** → `{custom_symbol_resolved}` "
+                f"({hits[0]['company_name']} · {hits[0].get('sector','—')})"
+            )
+        else:
+            # 2) try literal as Yahoo ticker
+            try:
+                import sources as _src_probe
+                _probe = _src_probe.fetch_yahoo_quote(q.upper())
+            except Exception:
+                _probe = None
+            if _probe and _probe.get("price") is not None:
+                custom_symbol_resolved = q.upper()
+                st.info(
+                    f"ℹ️ **{q.upper()}** is not in our S&P 500 universe but "
+                    f"Yahoo returned a live quote (${float(_probe['price']):,.2f}). "
+                    f"Will analyse it directly."
+                )
+            else:
+                st.error(
+                    f"❌ No data found for **{q}**. We tried our S&P 500 "
+                    f"universe and a direct Yahoo lookup. Check the spelling "
+                    f"or use the exact Yahoo ticker (e.g. `BRK-B`, `ASML.AS`)."
+                )
+
     with st.expander("⚙ Advanced", expanded=False):
         ac1, ac2, ac3 = st.columns(3)
         jump_z_q = ac1.slider("Jump threshold (z)", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
@@ -4132,9 +4193,16 @@ with tab_quant:
         mc_sims_q = ac3.number_input("Monte Carlo sims", min_value=1000, max_value=50000, value=10000, step=1000, key="quant_sims")
 
     if run_quant_btn:
-        sym = parse_selected_asset_to_symbol(focus_asset_q)
+        # Manual text input wins over the dropdown when it successfully resolves.
+        if custom_symbol_resolved:
+            sym = custom_symbol_resolved
+        else:
+            sym = parse_selected_asset_to_symbol(focus_asset_q)
         if not sym:
-            st.warning("Select an asset first.")
+            st.warning(
+                "Select an asset from the dropdown above, OR type a ticker / "
+                "company name in the free-text field."
+            )
         else:
             source = detect_source_for_symbol(sym, preferred=source_pref_q)
             mpd = bars_per_day_for_tf(source, tf_binance_q)

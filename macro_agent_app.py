@@ -2937,16 +2937,22 @@ live_ticker_css = """
     background-color: #000000;
     color: #ffffff;
 }
+/* Auto-scrolling marquee: row is twice the natural width (we render
+   the cells twice in HTML) and slides from 0 to -50% in a loop. */
 .live-ticker-row {
-    display: flex;
+    display: inline-flex;
     gap: 0.75rem;
     align-items: stretch;
-    overflow-x: auto;
-    scroll-behavior: smooth;
-    scrollbar-width: none;
-    padding: 0 42px; /* място за стрелките */
+    width: max-content;
+    animation: ticker-marquee 120s linear infinite;
 }
-.live-ticker-row::-webkit-scrollbar { display: none; }
+.live-ticker-container:hover .live-ticker-row {
+    animation-play-state: paused;
+}
+@keyframes ticker-marquee {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+}
 
 .ticker-item {
     min-width: 170px;
@@ -2983,26 +2989,8 @@ live_ticker_css = """
 .ticker-change.up { color: #00ff00; }
 .ticker-change.down { color: #ff4d4d; }
 
-.ticker-arrow {
-    position: absolute;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 34px;
-    height: 62px;
-    border-radius: 6px;
-    border: 1px solid #555555;
-    background-color: #111111;
-    color: #cccccc;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    z-index: 10;
-    user-select: none;
-}
-.ticker-arrow.left { left: 6px; }
-.ticker-arrow.right { right: 6px; }
-.ticker-arrow:hover { background-color: #222222; }
+/* Scroll arrows hidden — replaced by auto-scrolling marquee. */
+.ticker-arrow { display: none; }
 </style>
 """
 
@@ -3075,13 +3063,15 @@ for sym, short in LIVE_TICKER_SYMBOLS:
 
 symbols_js = [sym for sym, _ in LIVE_TICKER_SYMBOLS]
 
+# Duplicate the cells so the CSS marquee animation (0% → -50%) loops
+# seamlessly without a visible jump at the end.
+_ticker_items_doubled = ''.join(ticker_items_html) * 2
+
 live_ticker_html = live_ticker_css + textwrap.dedent(f"""
 <div class="live-ticker-container">
-  <button type="button" class="ticker-arrow left" onclick="scrollTicker(-1)">&#9664;</button>
   <div class="live-ticker-row" id="live-ticker-row">
-    {''.join(ticker_items_html)}
+    {_ticker_items_doubled}
   </div>
-  <button type="button" class="ticker-arrow right" onclick="scrollTicker(1)">&#9654;</button>
 </div>
 
 <script>
@@ -3149,17 +3139,20 @@ live_ticker_html = live_ticker_css + textwrap.dedent(f"""
       const last = Number(data.lastPrice);
       const pct = Number(data.priceChangePercent);
 
-      const lastEl = document.querySelector(`[data-symbol="${sym}"][data-field="last"]`);
-      const pctEl  = document.querySelector(`[data-symbol="${sym}"][data-field="changePct"]`);
-      const chgEl  = document.querySelector(`[data-symbol="${sym}"][data-field="chgClass"]`);
+      // The marquee duplicates each cell — update BOTH copies so the
+      // visible price stays consistent as the row scrolls.
+      const lastEls = document.querySelectorAll(`[data-symbol="${sym}"][data-field="last"]`);
+      const pctEls  = document.querySelectorAll(`[data-symbol="${sym}"][data-field="changePct"]`);
+      const chgEls  = document.querySelectorAll(`[data-symbol="${sym}"][data-field="chgClass"]`);
 
-      if (lastEl) lastEl.textContent = fmtPrice(last);
-      if (pctEl) pctEl.textContent = (isFinite(pct) ? pct.toFixed(2) : "...") + "%";
-
-      if (chgEl) {{
-        chgEl.classList.remove("up", "down");
-        if (isFinite(pct)) chgEl.classList.add(pct >= 0 ? "up" : "down");
-      }}
+      lastEls.forEach(el => {{ el.textContent = fmtPrice(last); }});
+      pctEls.forEach(el => {{
+        el.textContent = (isFinite(pct) ? pct.toFixed(2) : "...") + "%";
+      }});
+      chgEls.forEach(el => {{
+        el.classList.remove("up", "down");
+        if (isFinite(pct)) el.classList.add(pct >= 0 ? "up" : "down");
+      }});
     }}
   }}
 

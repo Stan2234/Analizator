@@ -3232,6 +3232,70 @@ with st.expander("Yahoo Live Debug"):
 
 # ===== REST OF HEADER =====
 
+# ── Indices ticker tape (scrolling, matches header style) ─────────────
+try:
+    dl.seed_universe()  # idempotent
+    import symbol_universe as _su_hdr
+    _ticker_cells = []
+    for _idx in _su_hdr.MAJOR_INDICES:
+        _snap = dl.latest_market_snapshot(_idx["symbol"]) or {}
+        _price = _snap.get("price")
+        _chg = _snap.get("change_pct")
+        if _price is None:
+            _price_str = "—"
+            _chg_str = ""
+            _color = "#888"
+        else:
+            _price_str = f"{float(_price):,.2f}"
+            if _chg is None:
+                _chg_str = ""
+                _color = "#ddd"
+            else:
+                _chg_str = f"{float(_chg):+.2f}%"
+                _color = "#00d97e" if _chg >= 0 else "#ff4d6d"
+        _ticker_cells.append(
+            f'<span class="hdr-ticker-cell">'
+            f'<span class="hdr-t-name">{_idx["name"]}</span> '
+            f'<span class="hdr-t-price">{_price_str}</span> '
+            f'<span class="hdr-t-chg" style="color:{_color};">{_chg_str}</span>'
+            f'</span>'
+        )
+    _ticker_html = "".join(_ticker_cells) + "".join(_ticker_cells)
+    st.markdown(
+        f"""
+        <style>
+        .hdr-ticker-wrap {{
+            overflow: hidden; width: 100%;
+            background: #0d0d0d;
+            border: 1px solid #1f1f1f;
+            border-radius: 6px; padding: 10px 0; margin: 8px 0 4px 0;
+        }}
+        .hdr-ticker-track {{
+            display: inline-block; white-space: nowrap;
+            animation: hdr-ticker-scroll 90s linear infinite;
+        }}
+        .hdr-ticker-cell {{
+            display: inline-block; padding: 0 32px; color: #ddd;
+            font-family: 'Courier New', monospace; font-size: 14px;
+        }}
+        .hdr-ticker-cell .hdr-t-name {{
+            color: #9aa0a6; text-transform: uppercase;
+            letter-spacing: 0.5px; font-size: 12px;
+        }}
+        .hdr-ticker-cell .hdr-t-price {{ color: #fff; font-weight: 600; }}
+        .hdr-ticker-cell .hdr-t-chg {{ font-weight: 600; }}
+        @keyframes hdr-ticker-scroll {{
+            0% {{ transform: translateX(0); }}
+            100% {{ transform: translateX(-50%); }}
+        }}
+        </style>
+        <div class="hdr-ticker-wrap"><div class="hdr-ticker-track">{_ticker_html}</div></div>
+        """,
+        unsafe_allow_html=True,
+    )
+except Exception as _hdr_e:
+    pass  # silently skip; main dashboard will still render
+
 now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
@@ -3249,65 +3313,8 @@ with tab_global:
     except Exception as _seed_e:
         st.warning(f"Universe seed failed: {_seed_e}")
 
-    # ============== Indices ticker tape (animated marquee) ==============
-    try:
-        import symbol_universe as _su
-        indices_meta = _su.MAJOR_INDICES
-        ticker_cells = []
-        for idx in indices_meta:
-            snap = dl.latest_market_snapshot(idx["symbol"]) or {}
-            price = snap.get("price")
-            chg = snap.get("change_pct")
-            if price is None:
-                price_str = "—"
-                chg_str = ""
-                color = "#888"
-            else:
-                price_str = f"{float(price):,.2f}"
-                if chg is None:
-                    chg_str = ""
-                    color = "#ddd"
-                else:
-                    chg_str = f"{float(chg):+.2f}%"
-                    color = "#00d97e" if chg >= 0 else "#ff4d6d"
-            ticker_cells.append(
-                f'<span class="ticker-cell">'
-                f'<span class="t-name">{idx["name"]}</span> '
-                f'<span class="t-price">{price_str}</span> '
-                f'<span class="t-chg" style="color:{color};">{chg_str}</span>'
-                f'</span>'
-            )
-        # Duplicate cells to make the loop seamless
-        ticker_html = "".join(ticker_cells) + "".join(ticker_cells)
-        st.markdown(
-            f"""
-            <style>
-            .ticker-wrap {{
-                overflow: hidden; width: 100%;
-                background: #0d0d0d; border: 1px solid #1f1f1f;
-                border-radius: 6px; padding: 8px 0; margin-bottom: 14px;
-            }}
-            .ticker-track {{
-                display: inline-block; white-space: nowrap;
-                animation: ticker-scroll 90s linear infinite;
-            }}
-            .ticker-cell {{
-                display: inline-block; padding: 0 28px; color: #ddd;
-                font-family: 'Courier New', monospace; font-size: 14px;
-            }}
-            .ticker-cell .t-name {{ color: #9aa0a6; }}
-            .ticker-cell .t-price {{ color: #fff; font-weight: 600; }}
-            @keyframes ticker-scroll {{
-                0% {{ transform: translateX(0); }}
-                100% {{ transform: translateX(-50%); }}
-            }}
-            </style>
-            <div class="ticker-wrap"><div class="ticker-track">{ticker_html}</div></div>
-            """,
-            unsafe_allow_html=True,
-        )
-    except Exception as _e:
-        st.warning(f"Ticker tape failed to render: {_e}")
+    # (Indices ticker tape is now rendered globally in the page header,
+    # right under the GOLD/SILVER/FX/crypto cards.)
 
     # ============== Two-column: Sector heatmap | Top movers ==============
     col_heat, col_movers = st.columns([3, 2])

@@ -686,22 +686,38 @@ def universe_search(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# CTE that picks only the LATEST snapshot per symbol from market_snapshots.
+# This prevents the LEFT JOIN duplication that would otherwise multiply
+# universe rows by the number of historical snapshots per symbol.
+_LATEST_SNAPSHOT_CTE = """
+WITH latest_snap AS (
+    SELECT m.symbol, m.source, m.price, m.change_pct, m.volume, m.snapshot_at
+    FROM market_snapshots m
+    INNER JOIN (
+        SELECT symbol, MAX(snapshot_at) AS max_t
+        FROM market_snapshots
+        GROUP BY symbol
+    ) ms ON ms.symbol = m.symbol AND ms.max_t = m.snapshot_at
+)
+"""
+
+
 def universe_with_quotes(asset_types: Optional[List[str]] = None,
                           sector: Optional[str] = None,
                           query: Optional[str] = None,
                           limit: int = 1000) -> List[Dict[str, Any]]:
-    """Join universe metadata with latest market snapshots.
+    """Join universe metadata with the LATEST market snapshot per symbol.
 
     Returns rows with: symbol, company_name, sector, industry, asset_type,
     is_core, price, change_pct, volume, snapshot_at. price/change may be
     NULL if no snapshot is cached yet.
     """
     conn = get_conn()
-    sql = (
+    sql = _LATEST_SNAPSHOT_CTE + (
         "SELECT u.symbol, u.company_name, u.sector, u.industry, u.asset_type, "
         "u.is_core, m.price, m.change_pct, m.volume, m.snapshot_at "
         "FROM symbols_universe u "
-        "LEFT JOIN market_snapshots m ON u.symbol = m.symbol "
+        "LEFT JOIN latest_snap m ON u.symbol = m.symbol "
         "WHERE 1=1"
     )
     params: List[Any] = []
@@ -725,15 +741,15 @@ def universe_with_quotes(asset_types: Optional[List[str]] = None,
 def top_movers(n: int = 10, direction: str = "up",
                 asset_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Top N gainers (direction='up') or losers (direction='down') across
-    the universe. Joins universe metadata. Excludes symbols with NULL
-    change_pct or |change| > 50% (likely bad data / splits)."""
+    the universe. Uses the latest snapshot per symbol. Excludes symbols
+    with NULL change_pct or |change| > 50% (likely bad data / splits)."""
     conn = get_conn()
     order = "DESC" if direction.lower() == "up" else "ASC"
-    sql = (
+    sql = _LATEST_SNAPSHOT_CTE + (
         "SELECT u.symbol, u.company_name, u.sector, u.asset_type, "
         "m.price, m.change_pct, m.snapshot_at "
         "FROM symbols_universe u "
-        "JOIN market_snapshots m ON u.symbol = m.symbol "
+        "JOIN latest_snap m ON u.symbol = m.symbol "
         "WHERE m.change_pct IS NOT NULL "
         "AND ABS(m.change_pct) < 50"
     )
@@ -749,10 +765,10 @@ def top_movers(n: int = 10, direction: str = "up",
 
 
 def sector_performance() -> List[Dict[str, Any]]:
-    """Average % change per GICS sector, plus the corresponding sector
-    ETF's change for comparison. Returns rows sorted by avg_change DESC."""
+    """Average % change per GICS sector based on the latest snapshot per
+    symbol. Returns rows sorted by avg_change DESC."""
     conn = get_conn()
-    sql = """
+    sql = _LATEST_SNAPSHOT_CTE + """
     SELECT u.sector,
            AVG(m.change_pct) AS avg_change,
            COUNT(m.change_pct) AS n_with_data,
@@ -760,7 +776,7 @@ def sector_performance() -> List[Dict[str, Any]]:
            SUM(CASE WHEN m.change_pct > 0 THEN 1 ELSE 0 END) AS n_up,
            SUM(CASE WHEN m.change_pct < 0 THEN 1 ELSE 0 END) AS n_down
     FROM symbols_universe u
-    LEFT JOIN market_snapshots m ON u.symbol = m.symbol
+    LEFT JOIN latest_snap m ON u.symbol = m.symbol
     WHERE u.asset_type = 'equity'
     GROUP BY u.sector
     ORDER BY avg_change DESC NULLS LAST

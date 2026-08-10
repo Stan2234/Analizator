@@ -554,20 +554,28 @@ def basic_signal_from_series(
 
     score = round(float(score), 2)
 
+    # Each branch used to carry a hardcoded "confidence" (0.92 for STRONG BUY,
+    # 0.75 for BUY, and so on). Those numbers were invented — nothing measured
+    # them. Walk-forward testing over 25k signals on 12 assets put the real
+    # 5-day hit rate at 56.2% for STRONG BUY (promised 92%) and 44.1% for
+    # STRONG SELL (promised 92%), against a 58.5% base rate from market drift
+    # alone — so the bearish half was worse than a coin flip and the bullish
+    # half did not beat simply holding. The field is gone rather than restated,
+    # because any number in a column called "confidence" reads as an edge.
     if score >= 7:
-        signal, confidence = "STRONG BUY",  0.92
+        signal = "STRONG BUY"
     elif score >= 4:
-        signal, confidence = "BUY",          0.75
+        signal = "BUY"
     elif score >= 1.5:
-        signal, confidence = "WEAK BUY",     0.60
+        signal = "WEAK BUY"
     elif score >= -1.5:
-        signal, confidence = "HOLD",         0.50
+        signal = "HOLD"
     elif score >= -4:
-        signal, confidence = "WEAK SELL",    0.60
+        signal = "WEAK SELL"
     elif score >= -7:
-        signal, confidence = "SELL",         0.75
+        signal = "SELL"
     else:
-        signal, confidence = "STRONG SELL",  0.92
+        signal = "STRONG SELL"
 
     if close_v > sma200 and sma50 > sma200:
         trend = "up"
@@ -595,7 +603,6 @@ def basic_signal_from_series(
         "trend":      trend,
         "momentum":   momentum,
         "signal":     signal,
-        "confidence": round(confidence, 2),
     }
     if stoch_k is not None:
         out["stoch_k"] = round(stoch_k, 2)
@@ -629,12 +636,17 @@ def detect_source_for_symbol(symbol: str, preferred: str = "Auto") -> str:
     return "Yahoo"
 
 def bars_per_year_for_timeframe(source: str, timeframe: str) -> int:
-    # rough trading bars/year for annualization
+    """Bars per year, used to annualize vol / return / risk ratios.
+
+    Yahoo (equities, FX, futures) trades ~252 sessions a year. Binance trades
+    365 days a year, 24h a day — the 252-session base understated every
+    annualized crypto figure, badly so on intraday timeframes.
+    """
     if source == "Yahoo":
         return 252
-    # Binance
-    bars_map = {"1d": 252, "4h": 252 * 6, "1h": 252 * 24, "15m": 252 * 24 * 4}
-    return int(bars_map.get(timeframe, 252))
+    # Binance — 24/7
+    bars_map = {"1d": 365, "4h": 365 * 6, "1h": 365 * 24, "15m": 365 * 24 * 4}
+    return int(bars_map.get(timeframe, 365))
 
 def bars_per_day_for_tf(source: str, timeframe: str) -> int:
     if source == "Yahoo":
@@ -691,7 +703,19 @@ def monte_carlo_forward_distribution(
     close: pd.Series,
     horizon_bars: int,
     sims: int = 5000,
+    seed: Optional[int] = None,
+    return_samples: bool = False,
 ) -> Dict[str, Any]:
+    """Forward price distribution, GBM with iid normal shocks.
+
+    Draw once and reuse the result — the percentiles and any histogram built
+    from them must come from the same sample, otherwise the numbers on screen
+    disagree with the chart underneath them.
+
+    Set return_samples=True to get the simulated terminal prices back under
+    'mc_samples'. That key is deliberately kept out of the flat metrics dict
+    (see compute_quant_metrics) since it is an array, not a scalar.
+    """
     s = close.dropna().astype(float)
     if len(s) < 60 or horizon_bars < 1:
         return {}
@@ -700,24 +724,34 @@ def monte_carlo_forward_distribution(
     sigma = float(r.std())
     s0 = float(s.iloc[-1])
 
+    rng = np.random.default_rng(seed)
     # 1-step aggregated horizon using normal approximation (OK for quant dashboard)
-    z = np.random.normal(loc=0.0, scale=1.0, size=sims)
+    z = rng.standard_normal(int(sims))
     rh = (mu * horizon_bars) + (sigma * np.sqrt(horizon_bars) * z)
-    st = s0 * np.exp(rh)
+    prices = s0 * np.exp(rh)
 
-    p10 = float(np.percentile(st, 10))
-    p50 = float(np.percentile(st, 50))
-    p90 = float(np.percentile(st, 90))
-    expv = float(np.mean(st))
-
-    return {"mc_p10": p10, "mc_p50": p50, "mc_p90": p90, "mc_mean": expv}
+    out: Dict[str, Any] = {
+        "mc_p10": float(np.percentile(prices, 10)),
+        "mc_p50": float(np.percentile(prices, 50)),
+        "mc_p90": float(np.percentile(prices, 90)),
+        "mc_mean": float(np.mean(prices)),
+    }
+    if return_samples:
+        out["mc_samples"] = prices
+    return out
 
 def compute_quant_metrics(
     close: pd.Series,
     bars_per_year: int,
     jump_z: float,
     horizon_bars: int,
+    mc: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Flat dict of quant metrics for one price series.
+
+    Pass `mc` when the caller has already run the Monte Carlo, so the whole
+    page reports one simulation instead of several independent draws.
+    """
     s = close.dropna().astype(float)
     if len(s) < 80:
         return {"error": "Not enough data for quant metrics."}
@@ -754,8 +788,11 @@ def compute_quant_metrics(
     # jump-diffusion pack (uses your existing function)
     jm = compute_jump_diffusion_metrics(s, bars_per_year=bars_per_year, jump_z=jump_z)
 
-    # Monte Carlo horizon distribution
-    mc = monte_carlo_forward_distribution(s, horizon_bars=horizon_bars, sims=5000)
+    # Monte Carlo horizon distribution — reuse the caller's draw if given.
+    if mc is None:
+        mc = monte_carlo_forward_distribution(s, horizon_bars=horizon_bars, sims=5000)
+    # 'mc_samples' is an array; keep the metrics dict flat and scalar-only.
+    mc = {k: v for k, v in mc.items() if k != "mc_samples"}
 
     out = {
         "last_price": float(s.iloc[-1]),
@@ -783,10 +820,14 @@ def compute_autocorrelation(returns: pd.Series, max_lag: int = 10) -> Dict[str, 
     return acf
 
 
-def compute_regime_hmm_simple(returns: pd.Series, window: int = 63) -> Dict[str, Any]:
+def compute_regime_hmm_simple(returns: pd.Series, window: int = 63,
+                              bars_per_year: int = 252) -> Dict[str, Any]:
     """
-    Simple volatility regime detection using rolling vol percentile.
-    Approximates Hidden Markov Model regime states without external libraries.
+    Volatility regime detection using the rolling-vol percentile.
+
+    Not an HMM — a percentile bucketing of rolling realized vol. Pass the
+    timeframe's real bars_per_year; annualizing intraday bars with 252
+    understates vol by an order of magnitude.
     """
     roll_vol = returns.rolling(window).std()
     if roll_vol.dropna().empty:
@@ -820,7 +861,7 @@ def compute_regime_hmm_simple(returns: pd.Series, window: int = 63) -> Dict[str,
         "current_regime": regime,
         "regime_percentile": round(pct, 1),
         "regime_duration_bars": duration,
-        "current_vol_annualized": round(float(current_vol * np.sqrt(252)), 4),
+        "current_vol_annualized": round(float(current_vol * np.sqrt(float(bars_per_year))), 4),
     }
 
 
@@ -833,7 +874,8 @@ def compute_mean_reversion_signals(close: pd.Series) -> Dict[str, Any]:
     """
     s = close.dropna().astype(float)
     if len(s) < 100:
-        return {"z_score_20": None, "z_score_50": None, "ou_half_life": None}
+        return {"z_score_20": None, "z_score_50": None, "ou_half_life": None,
+                "bb_pct": None, "rsi_14": None}
 
     # Z-scores
     m20 = s.rolling(20).mean()
@@ -857,10 +899,19 @@ def compute_mean_reversion_signals(close: pd.Series) -> Dict[str, Any]:
         if beta < -0.001:
             ou_half_life = round(-np.log(2) / beta, 1)
 
+    # Bollinger %B and RSI — the Quant Lab table has always asked for these two
+    # keys; they were simply never produced, so both rows read "N/A" forever.
+    bb = compute_bollinger_bands(s)
+    bb_up, bb_lo = float(bb["upper"].iloc[-1]), float(bb["lower"].iloc[-1])
+    bb_pct = (float(s.iloc[-1]) - bb_lo) / ((bb_up - bb_lo) or 1e-12)
+    rsi_last = compute_rsi(s).iloc[-1]
+
     return {
         "z_score_20": round(float(z20), 3),
         "z_score_50": round(float(z50), 3),
         "ou_half_life": ou_half_life,
+        "bb_pct": round(float(bb_pct), 3),
+        "rsi_14": round(float(rsi_last), 1) if pd.notna(rsi_last) else None,
     }
 
 
@@ -894,18 +945,23 @@ def compute_momentum_features(close: pd.Series) -> Dict[str, Any]:
     }
 
 
-def compute_tail_risk_metrics(returns: pd.Series) -> Dict[str, Any]:
+def compute_tail_risk_metrics(returns: pd.Series, bars_per_year: int = 252) -> Dict[str, Any]:
     """
     Advanced tail risk analysis beyond simple VaR/CVaR.
+
+    bars_per_year must match the timeframe of `returns` — annualizing 15m
+    crypto bars with 252 understated Sortino / Calmar / annual return by ~20x.
     """
     r = returns.dropna()
     if len(r) < 60:
         return {}
 
+    bpy = float(bars_per_year)
+
     # Sortino ratio (downside deviation)
     downside = r[r < 0]
     downside_std = float(downside.std()) if len(downside) > 5 else None
-    sortino = float(r.mean() / (downside_std + 1e-12) * np.sqrt(252)) if downside_std else None
+    sortino = float(r.mean() / (downside_std + 1e-12) * np.sqrt(bpy)) if downside_std else None
 
     # Gain/pain ratio
     total_gain = float(r[r > 0].sum())
@@ -913,7 +969,7 @@ def compute_tail_risk_metrics(returns: pd.Series) -> Dict[str, Any]:
     gain_pain_ratio = round(total_gain / (total_pain + 1e-12), 3)
 
     # Calmar ratio (annualized return / max drawdown)
-    ann_ret = float(r.mean() * 252)
+    ann_ret = float(r.mean() * bpy)
     cum = (1 + r).cumprod()
     peak = cum.cummax()
     dd = (cum / peak - 1.0)
@@ -1136,7 +1192,7 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     base_cols = [
         "name", "ticker", "asset_class",
-        "signal", "confidence", "score",
+        "signal", "score",
         "trend", "momentum",
         "rsi14", "macd_hist", "bb_pct",
         "close", "sma20", "sma50", "sma200",
@@ -1222,14 +1278,12 @@ def run_analysis_binance(timeframe: str) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    bars_map = {"1d": 252, "4h": 252 * 6, "1h": 252 * 24, "15m": 252 * 24 * 4}
+    bpy = bars_per_year_for_timeframe("Binance", timeframe)
 
     for symbol, meta in BINANCE_SYMBOLS.items():
         try:
             df = fetch_binance_klines(symbol, interval=timeframe, limit=500)
             sig = basic_signal_from_series(df["close"], df["high"], df["low"])
-
-            bpy = bars_map.get(timeframe, 252)
 
             jm = compute_jump_diffusion_metrics(
                 df["close"],
@@ -1616,12 +1670,16 @@ def df_to_brief(df: pd.DataFrame, label: str) -> str:
     if df is None or df.empty:
         return f"No {label} signals available."
     df_local = df.copy()
-    df_local = df_local.sort_values("confidence", ascending=False).head(10)
+    # Was sorted by the (fabricated) confidence column. Conviction now comes
+    # from the size of the score itself, which is at least a real quantity.
+    df_local = df_local.reindex(
+        df_local["score"].abs().sort_values(ascending=False).index
+    ).head(10) if "score" in df_local.columns else df_local.head(10)
     cols = [
         c for c in df_local.columns
         if c in [
             "name", "ticker", "symbol", "asset_class", "timeframe",
-            "signal", "confidence", "score",
+            "signal", "score",
             "trend", "momentum",
             "rsi14", "macd_hist", "bb_pct", "stoch_k", "adx",
             "close", "sma20", "sma50", "sma200",
@@ -1871,10 +1929,10 @@ def run_deep_analysis_for_asset(asset_name: str, asset_type: str, close_series: 
     bpy = 252
 
     qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=3.0, horizon_bars=7)
-    regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns) // 3)))
+    regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns) // 3)), bars_per_year=bpy)
     mean_rev = compute_mean_reversion_signals(close_series)
     mom = compute_momentum_features(close_series)
-    tail = compute_tail_risk_metrics(returns)
+    tail = compute_tail_risk_metrics(returns, bars_per_year=bpy)
 
     return run_asset_deep_analysis(
         asset_name=asset_name,
@@ -3268,8 +3326,8 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_poly, tab_ai, tab_fomc, tab_brief = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🔮 Predictions", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief"]
+tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc, tab_brief = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief"]
 
 )
 
@@ -3490,7 +3548,7 @@ with tab_fx:
             if not df_fx.empty:
                 base_cols = [
                     "name", "ticker", "asset_class",
-                    "signal", "confidence", "score",
+                    "signal", "score",
                     "trend", "momentum",
                     "rsi14", "macd_hist", "bb_pct",
                     "close", "sma20", "sma50", "sma200",
@@ -3559,10 +3617,10 @@ with tab_fx:
 
                         # Compute all metrics
                         qm = compute_quant_metrics(close_s, bars_per_year=252, jump_z=3.0, horizon_bars=7)
-                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)))
+                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)), bars_per_year=252)
                         mean_rev = compute_mean_reversion_signals(close_s)
                         mom = compute_momentum_features(close_s)
-                        tail = compute_tail_risk_metrics(returns)
+                        tail = compute_tail_risk_metrics(returns, bars_per_year=252)
 
                         # Display signal header
                         sig_val = sig.get("signal", "HOLD")
@@ -3742,16 +3800,14 @@ with tab_crypto:
                         sig = basic_signal_from_series(close_s, high_s, low_s)
                         returns = np.log(close_s).diff().dropna()
 
-                        bars_map = {"1d": 252, "4h": 252*6, "1h": 252*24, "15m": 252*24*4}
-                        bpy = bars_map.get(crypto_analysis_tf, 252)
-                        mpd_map = {"1d": 1, "4h": 6, "1h": 24, "15m": 96}
-                        horizon_bars = 7 * mpd_map.get(crypto_analysis_tf, 1)
+                        bpy = bars_per_year_for_timeframe("Binance", crypto_analysis_tf)
+                        horizon_bars = 7 * bars_per_day_for_tf("Binance", crypto_analysis_tf)
 
                         qm = compute_quant_metrics(close_s, bars_per_year=bpy, jump_z=3.0, horizon_bars=horizon_bars)
-                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)))
+                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)), bars_per_year=bpy)
                         mean_rev = compute_mean_reversion_signals(close_s)
                         mom = compute_momentum_features(close_s)
-                        tail = compute_tail_risk_metrics(returns)
+                        tail = compute_tail_risk_metrics(returns, bars_per_year=bpy)
 
                         # Signal header
                         sig_val = sig.get("signal", "HOLD")
@@ -4183,52 +4239,67 @@ with tab_quant:
                 try:
                     close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
                     returns = np.log(close_series).diff().dropna()
-                    qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q), horizon_bars=int(horizon_bars))
+                    # One Monte Carlo draw for the whole page — the cards and the
+                    # histogram below both read from this sample.
+                    mc_result = monte_carlo_forward_distribution(
+                        close_series, horizon_bars=int(horizon_bars),
+                        sims=int(mc_sims_q), return_samples=True,
+                    )
+                    qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q),
+                                               horizon_bars=int(horizon_bars), mc=mc_result)
                     if "error" in qm:
                         st.error(qm["error"])
                     else:
-                        regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3))
+                        regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3), bars_per_year=bpy)
                         mean_rev = compute_mean_reversion_signals(close_series)
                         mom_feat = compute_momentum_features(close_series)
-                        tail_risk = compute_tail_risk_metrics(returns)
+                        tail_risk = compute_tail_risk_metrics(returns, bars_per_year=bpy)
                         acf = compute_autocorrelation(returns, max_lag=5)
 
                         last_p = qm.get("last_price", float(close_series.iloc[-1]))
                         hurst = qm.get("hurst")
 
                         # ═══════════════════════════════════════
-                        # ROW 1: VERDICT CARD + KEY METRICS
+                        # ROW 1: STRUCTURE CARD + KEY METRICS
                         # ═══════════════════════════════════════
-                        # Build a composite quant verdict
-                        _qv_scores = []
-                        if hurst is not None:
-                            _qv_scores.append(("Hurst", (hurst - 0.5) * 10))  # >0.5 trending = bullish lean
-                        mom_score = mom_feat.get("momentum_composite_score")
-                        if mom_score is not None:
-                            _qv_scores.append(("Momentum", mom_score / 2))
-                        z20 = mean_rev.get("z_score_20")
-                        if z20 is not None:
-                            _qv_scores.append(("Mean-Rev Z", -float(z20) / 2))  # high z = overbought = slight negative
-                        _ann_ret = tail_risk.get("annualized_return_pct")
-                        if _ann_ret is not None:
-                            _qv_scores.append(("Returns", float(_ann_ret) / 10))
-                        _qv_total = sum(s for _, s in _qv_scores) / max(len(_qv_scores), 1) if _qv_scores else 0
-                        if _qv_total > 3: _qv_label, _qv_color = "STRONG BULLISH", "#00ff44"
-                        elif _qv_total > 1: _qv_label, _qv_color = "BULLISH", "#88cc00"
-                        elif _qv_total > -1: _qv_label, _qv_color = "NEUTRAL", "#cccc00"
-                        elif _qv_total > -3: _qv_label, _qv_color = "BEARISH", "#ff8800"
-                        else: _qv_label, _qv_color = "STRONG BEARISH", "#ff2222"
+                        # A "QUANT VERDICT" card used to sit here, averaging Hurst,
+                        # momentum, the 20d z-score and the annualized return into a
+                        # BULLISH/BEARISH call. It was walk-forward tested on 457 S&P
+                        # names, 2012-2026, 78k non-overlapping observations against
+                        # forward 21d returns. It was not merely uninformative — it was
+                        # inverted: the STRONG BEARISH bucket averaged +5.10% forward
+                        # vs +1.53% for STRONG BULLISH (t=9.87), because a crashed name
+                        # scores bearish right before it bounces. A rebuilt version
+                        # (Hurst as a regime switch, self-normalized terms, annualized
+                        # return dropped) tested flat: STRONG BULLISH minus STRONG
+                        # BEARISH = -0.16% full period, -0.84% out-of-sample, not
+                        # monotonic, every |t| < 2. Neither earns a place on screen,
+                        # so this panel now states what IS, not what to do.
+                        _regime_now = str(regime.get("current_regime", "?")).replace("_", " ")
+                        _regime_pct = regime.get("regime_percentile")
+                        if hurst is None:
+                            _struct_txt, _struct_col, _hurst_txt = "Unknown", "#888", "insufficient data"
+                        elif hurst > 0.55:
+                            _struct_txt, _struct_col, _hurst_txt = "Trending", "#4488ff", f"Hurst {hurst:.3f}"
+                        elif hurst < 0.45:
+                            _struct_txt, _struct_col, _hurst_txt = "Mean-reverting", "#aa88ff", f"Hurst {hurst:.3f}"
+                        else:
+                            _struct_txt, _struct_col, _hurst_txt = "Random walk", "#888", f"Hurst {hurst:.3f}"
 
                         v1, v2 = st.columns([1, 3])
                         with v1:
                             st.markdown(f"""
-                            <div style="background:#111;border:2px solid {_qv_color};border-radius:12px;padding:20px;text-align:center">
-                            <div style="font-size:12px;color:#888">QUANT VERDICT</div>
-                            <div style="font-size:32px;font-weight:900;color:{_qv_color}">{_qv_label}</div>
-                            <div style="font-size:42px;font-weight:900;color:#fff">{_qv_total:+.1f}</div>
-                            <div style="font-size:13px;color:#888">{sym} · {tf_used} · {lookback_days_q}d</div>
+                            <div style="background:#111;border:1px solid #333;border-radius:12px;padding:18px;text-align:center">
+                            <div style="font-size:12px;color:#888">PRICE STRUCTURE</div>
+                            <div style="font-size:26px;font-weight:800;color:{_struct_col}">{_struct_txt}</div>
+                            <div style="font-size:12px;color:#666">{_hurst_txt}</div>
+                            <div style="font-size:16px;font-weight:700;color:#ccc;margin-top:12px">{_regime_now}</div>
+                            <div style="font-size:12px;color:#666">vol regime · {_regime_pct if _regime_pct is not None else '?'}th pct</div>
+                            <div style="font-size:12px;color:#666;margin-top:12px">{sym} · {tf_used} · {qm.get('n_bars', 0)} bars</div>
                             </div>
                             """, unsafe_allow_html=True)
+                            st.caption("Descriptive. This panel measures the series; "
+                                       "it does not forecast it.")
 
                         with v2:
                             m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -4374,19 +4445,25 @@ with tab_quant:
 
                                 mom_score_v = mom_feat.get("momentum_composite_score")
                                 if mom_score_v is not None:
-                                    if mom_score_v > 5: mom_label = "🟢 STRONG BULLISH"
-                                    elif mom_score_v > 1: mom_label = "🟢 Bullish"
-                                    elif mom_score_v > -1: mom_label = "⚪ Neutral"
-                                    elif mom_score_v > -5: mom_label = "🔴 Bearish"
-                                    else: mom_label = "🔴 STRONG BEARISH"
-                                    _mc = "#00ff44" if mom_score_v > 1 else "#ff4444" if mom_score_v < -1 else "#cccc00"
+                                    # Describes the trailing move only. Tested on 457
+                                    # S&P names 2012-2026, this score's rank IC against
+                                    # forward 21d returns is -0.004 (t=-0.24) — so it
+                                    # gets past-tense wording, not BULLISH/BEARISH.
+                                    if mom_score_v > 5: mom_label = "strong uptrend"
+                                    elif mom_score_v > 1: mom_label = "uptrend"
+                                    elif mom_score_v > -1: mom_label = "flat"
+                                    elif mom_score_v > -5: mom_label = "downtrend"
+                                    else: mom_label = "strong downtrend"
+                                    _mc = "#00cc66" if mom_score_v > 1 else "#ff4444" if mom_score_v < -1 else "#cccc00"
                                     st.markdown(f"""
                                     <div style="text-align:center;padding:10px;background:#111;border-radius:8px;border:1px solid {_mc}">
-                                    <span style="font-size:14px;color:#888">Composite Momentum Score</span><br>
+                                    <span style="font-size:14px;color:#888">Composite Momentum Score — trailing</span><br>
                                     <span style="font-size:36px;font-weight:900;color:{_mc}">{mom_score_v:+.2f}</span>
                                     <span style="font-size:16px;color:{_mc};margin-left:10px">{mom_label}</span>
                                     </div>
                                     """, unsafe_allow_html=True)
+                                    st.caption("Weighted 5/21/63/126/252-bar return. "
+                                               "Describes what the price did, not what it will do.")
                             else:
                                 st.info("Not enough data for momentum (need 252+ bars).")
 
@@ -4423,28 +4500,26 @@ with tab_quant:
                                     st.plotly_chart(fig_z, use_container_width=True)
 
                                 with zc2:
-                                    st.markdown("##### Mean Reversion Signals")
+                                    st.markdown("##### Mean Reversion Measures")
                                     _mr_data = {
-                                        "Metric": ["Z-Score (20d)", "Z-Score (50d)", "O-U Half-Life", "BB %B", "RSI(14)",
-                                                    "Signal"],
+                                        "Metric": ["Z-Score (20d)", "Z-Score (50d)", "O-U Half-Life",
+                                                    "BB %B", "RSI(14)"],
                                         "Value": [
                                             f"{z20v}" if z20v is not None else "N/A",
                                             f"{z50v}" if z50v is not None else "N/A",
                                             f"{hlv:.0f} bars" if hlv else "N/A (trending)",
-                                            f"{mean_rev.get('bb_pct', 'N/A')}",
-                                            f"{mean_rev.get('rsi_14', 'N/A')}",
-                                            mean_rev.get("mean_reversion_signal", "N/A"),
+                                            f"{mean_rev.get('bb_pct')}" if mean_rev.get('bb_pct') is not None else "N/A",
+                                            f"{mean_rev.get('rsi_14')}" if mean_rev.get('rsi_14') is not None else "N/A",
                                         ]
                                     }
                                     st.dataframe(pd.DataFrame(_mr_data).set_index("Metric"), use_container_width=True)
-
-                                    _mr_sig = mean_rev.get("mean_reversion_signal", "")
-                                    if "BUY" in str(_mr_sig).upper():
-                                        st.success(f"Signal: {_mr_sig}")
-                                    elif "SELL" in str(_mr_sig).upper():
-                                        st.error(f"Signal: {_mr_sig}")
-                                    else:
-                                        st.info(f"Signal: {_mr_sig}")
+                                    st.caption(
+                                        "A 'Signal' row used to sit here reading BUY/SELL. "
+                                        "It was wired to a key the calculation never "
+                                        "returned, so it was always blank — and a plain "
+                                        "z-score rule tests at IC 0.017 (t=1.51), which "
+                                        "is not significant. Removed rather than faked."
+                                    )
 
                         # ═══════════════════════════════════════
                         # ROW 4: TAIL RISK + JUMP DIFFUSION
@@ -4524,7 +4599,7 @@ with tab_quant:
                         st.markdown("---")
                         st.markdown(f"##### 🎲 Monte Carlo Scenarios — {horizon_label_q} ahead ({mc_sims_q:,} sims)")
 
-                        mc_result = monte_carlo_forward_distribution(close_series, horizon_bars=int(horizon_bars), sims=int(mc_sims_q))
+                        # mc_result was drawn once above, before compute_quant_metrics.
                         mc_p10 = mc_result.get("mc_p10")
                         mc_p50 = mc_result.get("mc_p50")
                         mc_p90 = mc_result.get("mc_p90")
@@ -4557,13 +4632,8 @@ with tab_quant:
                             <div style="color:#4488ff;font-size:14px">{((mc_mean/last_p)-1)*100:+.1f}%</div>
                             </div>""", unsafe_allow_html=True)
 
-                            # MC distribution chart
-                            _r_log = np.log(close_series.dropna().astype(float)).diff().dropna()
-                            _mu = float(_r_log.mean())
-                            _sig = float(_r_log.std())
-                            _z_mc = np.random.normal(0, 1, int(mc_sims_q))
-                            _rh = (_mu * horizon_bars) + (_sig * np.sqrt(horizon_bars) * _z_mc)
-                            _final_prices = last_p * np.exp(_rh)
+                            # MC distribution chart — same sample the cards above report.
+                            _final_prices = mc_result.get("mc_samples")
                             fig_mc = go.Figure()
                             fig_mc.add_trace(go.Histogram(x=_final_prices, nbinsx=100, marker_color="#4488ff", opacity=0.7, name="Simulated Prices"))
                             fig_mc.add_vline(x=last_p, line_dash="solid", line_color="#ffffff", annotation_text="Current", line_width=2)
@@ -4586,149 +4656,6 @@ with tab_quant:
 
                 except Exception as e:
                     st.error(f"Quant Lab error: {type(e).__name__}: {e}")
-
-# -------- POLYMARKET PREDICTIONS TAB --------
-with tab_poly:
-    import sources as _src_poly
-
-    st.markdown("""
-    <div style="padding:12px 0 4px 0">
-    <span style="font-size:28px;font-weight:800;letter-spacing:-1px">PREDICTION MARKETS</span>
-    <span style="font-size:14px;color:#888;margin-left:12px">Live from Polymarket · Real money predictions</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Filters: only Stocks + Crypto, with sub-category toggle + min volume
-    pf1, pf2, pf3, pf4 = st.columns([2, 1.2, 1, 1])
-    with pf1:
-        poly_filter = st.text_input("Search", placeholder="e.g. Bitcoin, NVDA, Tesla, BTC...", key="poly_search", label_visibility="collapsed")
-    with pf2:
-        poly_cat = st.selectbox("Category", ["All", "Stocks", "Crypto"], index=0, key="poly_cat", label_visibility="collapsed")
-    with pf3:
-        poly_min_vol = st.selectbox("Min $Vol", ["Any", "$1K+", "$10K+", "$50K+"], index=1, key="poly_min_vol", label_visibility="collapsed")
-    with pf4:
-        poly_refresh = st.button("🔄 Refresh", key="poly_refresh", use_container_width=True)
-
-    @st.cache_data(ttl=300, show_spinner="Loading Polymarket...")
-    def _load_polymarket():
-        return _src_poly.fetch_polymarket_finance_markets(limit=200)
-
-    if poly_refresh:
-        _load_polymarket.clear()
-
-    poly_markets = _load_polymarket()
-
-    # Apply filters
-    if poly_filter:
-        kw = poly_filter.lower()
-        poly_markets = [m for m in poly_markets if kw in m["question"].lower()]
-
-    crypto_kws = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol ", " sol", "xrp", "bnb ", "doge", "crypto", "hyperliquid", "altcoin"]
-    if poly_cat == "Stocks":
-        poly_markets = [m for m in poly_markets if not any(k in m["question"].lower() for k in crypto_kws)]
-    elif poly_cat == "Crypto":
-        poly_markets = [m for m in poly_markets if any(k in m["question"].lower() for k in crypto_kws)]
-
-    min_vol_map = {"Any": 0, "$1K+": 1_000, "$10K+": 10_000, "$50K+": 50_000}
-    min_vol_val = min_vol_map.get(poly_min_vol, 0)
-    if min_vol_val > 0:
-        poly_markets = [m for m in poly_markets if m.get("volume", 0) >= min_vol_val]
-
-    if not poly_markets:
-        st.info("No prediction markets found. Try different filters or refresh.")
-    else:
-        st.caption(f"Showing {len(poly_markets)} markets · sorted by volume")
-
-        # Render as card grid (3 per row)
-        for row_start in range(0, len(poly_markets), 3):
-            cols = st.columns(3)
-            for ci, col in enumerate(cols):
-                idx = row_start + ci
-                if idx >= len(poly_markets):
-                    break
-                m = poly_markets[idx]
-                q = m["question"]
-                outcomes = m["outcomes"]
-                vol = m["volume"]
-                end_date = m.get("end_date", "")
-
-                # Format volume
-                if vol >= 1_000_000:
-                    vol_str = f"${vol / 1_000_000:.1f}M"
-                elif vol >= 1_000:
-                    vol_str = f"${vol / 1_000:.0f}K"
-                else:
-                    vol_str = f"${vol:.0f}"
-
-                # Format end date
-                end_str = ""
-                if end_date:
-                    try:
-                        import datetime as _dt
-                        if "T" in str(end_date):
-                            ed = _dt.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        else:
-                            ed = _dt.datetime.strptime(str(end_date)[:10], "%Y-%m-%d")
-                        end_str = ed.strftime("%b %d")
-                    except Exception:
-                        end_str = str(end_date)[:10]
-
-                # Determine primary outcome (usually "Up" or "Yes")
-                primary = outcomes[0] if outcomes else {"label": "?", "pct": 0}
-                secondary = outcomes[1] if len(outcomes) > 1 else {"label": "?", "pct": 0}
-
-                # Color based on primary prediction strength
-                pp = primary.get("pct", 50)
-                if pp >= 80:
-                    gauge_color = "#00cc44"
-                    gauge_bg = "#0a2a0a"
-                elif pp >= 60:
-                    gauge_color = "#88cc00"
-                    gauge_bg = "#1a2a0a"
-                elif pp >= 40:
-                    gauge_color = "#ccaa00"
-                    gauge_bg = "#1a1a0a"
-                elif pp >= 20:
-                    gauge_color = "#ff8800"
-                    gauge_bg = "#2a1a0a"
-                else:
-                    gauge_color = "#ff4444"
-                    gauge_bg = "#2a0a0a"
-
-                sp = secondary.get("pct", 0)
-                up_color = "#00cc44"
-                down_color = "#ff4444"
-
-                with col:
-                    st.markdown(f"""
-                    <div style="background:#111;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:12px;min-height:200px">
-                        <div style="display:flex;justify-content:space-between;align-items:flex-start">
-                            <div style="flex:1;padding-right:10px">
-                                <div style="font-size:14px;font-weight:700;color:#eee;line-height:1.3">{q}</div>
-                            </div>
-                            <div style="text-align:center;min-width:60px">
-                                <div style="width:52px;height:52px;border-radius:50%;border:3px solid {gauge_color};display:flex;align-items:center;justify-content:center;background:{gauge_bg}">
-                                    <span style="font-size:15px;font-weight:900;color:{gauge_color}">{pp:.0f}%</span>
-                                </div>
-                                <div style="font-size:10px;color:{gauge_color};margin-top:2px">{primary.get('label','')}</div>
-                            </div>
-                        </div>
-                        <div style="display:flex;gap:8px;margin-top:14px">
-                            <div style="flex:1;background:rgba(0,204,68,0.15);border:1px solid rgba(0,204,68,0.3);border-radius:6px;padding:8px;text-align:center;cursor:default">
-                                <span style="color:{up_color};font-weight:700;font-size:14px">{primary.get('label','Up')}</span>
-                                <span style="color:{up_color};font-size:12px;margin-left:4px">{pp:.0f}%</span>
-                            </div>
-                            <div style="flex:1;background:rgba(255,68,68,0.15);border:1px solid rgba(255,68,68,0.3);border-radius:6px;padding:8px;text-align:center;cursor:default">
-                                <span style="color:{down_color};font-weight:700;font-size:14px">{secondary.get('label','Down')}</span>
-                                <span style="color:{down_color};font-size:12px;margin-left:4px">{sp:.0f}%</span>
-                            </div>
-                        </div>
-                        <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:11px;color:#666">
-                            <span>{vol_str} Vol.</span>
-                            <span>{end_str}</span>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
 
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:

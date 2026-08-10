@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS signals (
     timeframe    TEXT,
     signal       TEXT,
     score        REAL,
-    confidence   REAL,
+    confidence   REAL,                  -- retired: held a fabricated 0.50-0.92
+                                        -- constant, never measured. Kept so
+                                        -- existing DBs still open; written NULL.
     payload_json TEXT,                  -- full signal dict
     computed_at  TEXT NOT NULL,
     UNIQUE(symbol, source, timeframe, computed_at)
@@ -322,6 +324,8 @@ def all_latest_snapshots() -> List[Dict[str, Any]]:
 def upsert_signal(symbol: str, source: str, timeframe: str, payload: Dict[str, Any]) -> None:
     conn = get_conn()
     with _DB_LOCK:
+        # 'confidence' is a retired column — the signal no longer produces one,
+        # so payload.get() returns None and the column is written NULL.
         conn.execute(
             """INSERT OR REPLACE INTO signals
                (symbol, source, timeframe, signal, score, confidence, payload_json, computed_at)

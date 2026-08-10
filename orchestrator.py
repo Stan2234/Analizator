@@ -92,18 +92,17 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
         "id": "crypto",
         "title": "🪙 Crypto",
         "tools": ["get_crypto_overview", "get_market_quote", "get_live_quote",
-                  "get_polymarket_predictions", "get_signal"],
+                  "get_signal"],
         "system": (
             "You are a digital asset analyst. Read the current state of crypto: "
             "BTC and ETH price/signal, total market cap, BTC dominance, ETH "
-            "dominance, fear & greed, what's trending, and what Polymarket is "
-            "pricing for crypto-related events. Focus on what matters to a "
-            "serious investor — flow, structure, positioning — not retail noise."
+            "dominance, fear & greed, and what's trending. Focus on what "
+            "matters to a serious investor — flow, structure, positioning — "
+            "not retail noise."
         ),
         "default_task": (
-            "Pull crypto overview, BTC and ETH quotes plus signals, and "
-            "Polymarket predictions filtered to crypto. Produce a structural "
-            "read on the current crypto regime."
+            "Pull crypto overview, BTC and ETH quotes plus signals. Produce a "
+            "structural read on the current crypto regime."
         ),
     },
     {
@@ -133,8 +132,7 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
         "id": "fomc",
         "title": "🏛️ FOMC & Central Banks",
         "tools": ["get_fred_series", "get_economic_calendar",
-                  "search_news", "get_polymarket_predictions",
-                  "get_market_quote"],
+                  "search_news", "get_market_quote"],
         "system": (
             "You are a Fed-watcher and central-bank analyst. Your job is to "
             "read the Federal Reserve's reaction function and the path of "
@@ -147,43 +145,37 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
             "- Economic calendar: upcoming FOMC meetings, CPI, NFP, PCE, "
             "  retail sales, FOMC minutes, Fed speakers — 14 days ahead\n"
             "- News: search for 'Fed', 'FOMC', 'Powell', 'ECB', 'Lagarde', "
-            "  'rate cut', 'rate hike' in the last 24-72 hours\n"
-            "- Polymarket: rate-cut/hike probability markets — query 'Fed', "
-            "  'rate', 'recession'\n\n"
+            "  'rate cut', 'rate hike' in the last 24-72 hours\n\n"
             "Frame your findings around: (1) Where is policy now? (2) What is "
             "the market pricing for the next 1-3 meetings? (3) What does the "
             "data justify? (4) Where is the asymmetry — what would shift the "
             "Fed's reaction function? (5) Which upcoming data point or speech "
             "is the next regime-shifting catalyst?\n\n"
-            "Be precise: cite exact basis points, exact probabilities from "
-            "Polymarket, exact dates of upcoming events. The whole point of "
-            "this brief is actionable Fed-path positioning."
+            "Be precise: cite exact basis points, exact levels, and exact "
+            "dates of upcoming events. The whole point of this brief is "
+            "actionable Fed-path positioning."
         ),
         "default_task": (
             "Produce a Fed-path briefing: current policy stance, what's priced "
             "vs. what the data justifies, next 1-3 meetings, and the single "
             "most asymmetric catalyst on the calendar. Pull FRED + calendar + "
-            "Fed news + Polymarket rate-cut probabilities."
+            "Fed news."
         ),
     },
     {
         "id": "sentiment",
         "title": "💭 Sentiment & Positioning",
-        "tools": ["get_sentiment_indexes", "get_polymarket_predictions",
-                  "get_crypto_overview"],
+        "tools": ["get_sentiment_indexes", "get_crypto_overview"],
         "system": (
             "You are a positioning and sentiment analyst. Read the crowd across "
-            "all four fear & greed indexes (crypto, stocks, commodities, macro) "
-            "and across Polymarket prediction prices (rate cuts, recession, "
-            "election outcomes, geopolitical events, asset price targets). "
+            "all four fear & greed indexes (crypto, stocks, commodities, macro). "
             "When sentiment is extreme on either tail, contrarian reads matter. "
             "Flag where sentiment indexes disagree across asset classes — those "
             "divergences are often the most informative."
         ),
         "default_task": (
-            "Pull all sentiment indexes and the most relevant Polymarket "
-            "markets. Identify extremes, divergences, and what they imply for "
-            "positioning."
+            "Pull all sentiment indexes. Identify extremes, divergences, and "
+            "what they imply for positioning."
         ),
     },
 ]

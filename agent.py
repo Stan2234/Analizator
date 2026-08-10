@@ -6,7 +6,7 @@ It uses Anthropic's tool-use protocol so the model decides which tools to
 call based on the user's question. No fixed answer templates.
 
 Model routing:
-  - 'claude-opus-4-6'  for complex / analytical questions
+  - 'claude-opus-5'    for complex / analytical questions
   - 'claude-haiku-4-5' for short factual questions
 
 Set ANTHROPIC_API_KEY in env or Streamlit secrets.
@@ -24,9 +24,13 @@ import sources as src
 
 log = logging.getLogger("analizator.agent")
 
-OPUS_MODEL  = "claude-opus-4-5"   # alias -> latest Opus 4.5 snapshot
-HAIKU_MODEL = "claude-haiku-4-5"  # alias -> latest Haiku 4.5 snapshot
-DEFAULT_MAX_TOKENS = 2048
+OPUS_MODEL  = "claude-opus-5"     # current Opus
+HAIKU_MODEL = "claude-haiku-4-5"  # current Haiku — still the cheap/fast tier
+
+# Opus 5 thinks by default, and max_tokens caps thinking AND response text
+# together. The old 2048 was sized for Opus 4.5, which did not think unless
+# asked — leaving it would truncate answers mid-sentence.
+DEFAULT_MAX_TOKENS = 8000
 
 
 # ---------------- secrets ----------------
@@ -507,6 +511,19 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
         except Exception as e:
             log.exception("anthropic call failed")
             return {"text": f"⚠️ Agent error: {e}", "messages": convo, "tool_calls": tool_calls_log}
+
+        # Opus 5 runs safety classifiers that can decline a request: HTTP 200,
+        # stop_reason "refusal", empty content. Without this branch the loop
+        # would append an empty assistant turn and return "(no response)".
+        if getattr(resp, "stop_reason", None) == "refusal":
+            reason = getattr(getattr(resp, "stop_details", None), "category", None)
+            log.warning("model declined the request (category=%s)", reason)
+            return {
+                "text": "⚠️ The model declined to answer this request"
+                        + (f" ({reason})." if reason else "."),
+                "messages": convo,
+                "tool_calls": tool_calls_log,
+            }
 
         # Build assistant message from response content blocks
         assistant_blocks = []

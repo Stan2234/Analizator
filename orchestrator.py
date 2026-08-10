@@ -29,9 +29,21 @@ except Exception:
 
 log = logging.getLogger("analizator.orchestrator")
 
-SUBAGENT_MAX_TOKENS = 2500
+# Opus 5 thinks by default and max_tokens caps thinking AND response text
+# together, so the old 2500/3500 (sized for a non-thinking Opus 4.5) would
+# truncate. The sub-agents must emit parseable JSON, so a cut-off response
+# is a hard failure here, not just a short answer.
+SUBAGENT_MAX_TOKENS = 8000
 SUBAGENT_MAX_ITER = 6
-SYNTH_MAX_TOKENS = 3500
+SYNTH_MAX_TOKENS = 12000
+
+# Effort is the cost lever for this path: a Deep Brief is five specialists in
+# parallel plus a synthesis pass. Opus 5 performs well below its default of
+# "high" — "medium" is a reasonable starting point here; raise to "high" or
+# "xhigh" if briefs come back shallow. Only Opus accepts this, which is why it
+# is applied here and not in agent.py's Haiku-routed path.
+SUBAGENT_EFFORT = "medium"
+SYNTH_EFFORT = "high"
 
 CACHE_KEY = "last_deep_brief"
 
@@ -265,6 +277,7 @@ def _run_subagent(spec: Dict[str, Any], user_query: str) -> Dict[str, Any]:
             resp = client.messages.create(
                 model=OPUS_MODEL,
                 max_tokens=SUBAGENT_MAX_TOKENS,
+                output_config={"effort": SUBAGENT_EFFORT},
                 system=system,
                 tools=tools,
                 messages=convo,
@@ -388,6 +401,7 @@ def _synthesize(subagent_results: Dict[str, Any], user_query: str) -> str:
         resp = client.messages.create(
             model=OPUS_MODEL,
             max_tokens=SYNTH_MAX_TOKENS,
+            output_config={"effort": SYNTH_EFFORT},
             system=SYNTH_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
         )

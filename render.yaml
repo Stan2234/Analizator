@@ -20,8 +20,6 @@ services:
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
       - key: NEWSAPI_KEY
         sync: false
       - key: BINANCE_API_KEY
@@ -32,5 +30,3 @@ services:
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
-      - key: OPENAI_MODEL
-        value: gpt-4.1-mini

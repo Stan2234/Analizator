@@ -11,7 +11,6 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from binance.client import Client
-from openai import OpenAI
 from bs4 import BeautifulSoup
 import streamlit.components.v1 as components
 import pdfplumber
@@ -82,8 +81,6 @@ def inject_secrets_to_env():
         "NEWSAPI_KEY",
         "BINANCE_API_KEY",
         "BINANCE_API_SECRET",
-        "OPENAI_API_KEY",
-        "OPENAI_MODEL",
         "ANTHROPIC_API_KEY",
         "FRED_API_KEY",
         "FINNHUB_API_KEY",
@@ -118,8 +115,6 @@ def get_secret(name: str, default: str = "") -> str:
 NEWSAPI_KEY = get_secret("NEWSAPI_KEY")
 BINANCE_API_KEY = get_secret("BINANCE_API_KEY")
 BINANCE_API_SECRET = get_secret("BINANCE_API_SECRET")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4.1-mini")
 
 # ------------------------------------
 # CONFIG
@@ -1049,9 +1044,9 @@ def quant_metrics_to_brief(symbol: str, source: str, timeframe: str, lookback_da
 
 @st.cache_data(ttl=60, show_spinner=False)
 def run_quant_gpt_analysis(brief: str) -> str:
-    client = get_openai_client()
-    if client is None:
-        return "Quant GPT analysis error: OpenAI client not configured."
+    _err = ai_unavailable()
+    if _err:
+        return f"Quant analysis unavailable: {_err}."
 
     system_prompt = """
 You are a quantitative portfolio manager at a systematic hedge fund.
@@ -1090,16 +1085,7 @@ For each: Entry trigger | Exit condition | Risk management rule
 What conditions would break each playbook? What data would change this analysis?
 """
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": brief},
-        ],
-        max_completion_tokens=2000,
-        temperature=0.25,
-    )
-    return completion.choices[0].message.content.strip()
+    return ai_agent.complete(system_prompt, brief, max_tokens=6000, effort="medium")
 
 # ------------------------------------
 # YAHOO PRICE DATA
@@ -1651,15 +1637,21 @@ def get_relevant_news_for_asset(focus_asset: str, max_items: int = 40) -> List[D
     return df_rel.to_dict("records")
 
 # ------------------------------------
-# OPENAI CLIENT + AI ANALYST
+# AI ANALYST
 # ------------------------------------
 
 
-@st.cache_resource(show_spinner=False)
-def get_openai_client() -> Optional[OpenAI]:
-    if not OPENAI_API_KEY:
-        return None
-    return OpenAI(api_key=OPENAI_API_KEY)
+def ai_unavailable() -> Optional[str]:
+    """None when the analysis panels can call the model, else why not.
+
+    These panels used to run on a second provider with its own key. They are
+    on Claude now, so there is one dependency and one key to check.
+    """
+    if not _HAS_AGENT:
+        return f"AI module failed to load ({_AGENT_IMPORT_ERROR})"
+    if not get_secret("ANTHROPIC_API_KEY"):
+        return "ANTHROPIC_API_KEY is not configured"
+    return None
 
 
 def df_to_brief(df: pd.DataFrame, label: str) -> str:
@@ -1723,9 +1715,9 @@ LATEST NEWS (top headlines):
 
 def run_ai_analyst(df_global, df_crypto, news_items, target_asset, horizon, user_question):
     try:
-        client = get_openai_client()
-        if client is None:
-            return "AI analysis error: OpenAI client is not configured (missing OPENAI_API_KEY)."
+        _err = ai_unavailable()
+        if _err:
+            return f"AI analysis unavailable: {_err}."
 
         base_ctx = build_ai_context(
             df_global if df_global is not None else pd.DataFrame(),
@@ -1791,17 +1783,7 @@ Rules:
 
         context = base_ctx + "\n\n" + focus_block
 
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": context},
-            ],
-            max_completion_tokens=5500,
-            temperature=0.4,
-        )
-
-        return completion.choices[0].message.content.strip()
+        return ai_agent.complete(system_prompt, context, max_tokens=14000, effort="high")
 
     except Exception as e:
         return f"AI analysis error: {e}"
@@ -1818,9 +1800,9 @@ def run_asset_deep_analysis(
     tail_data: Dict[str, Any],
     mean_rev_data: Dict[str, Any],
 ) -> str:
-    client = get_openai_client()
-    if client is None:
-        return "AI analysis error: OpenAI client not configured."
+    _err = ai_unavailable()
+    if _err:
+        return f"AI analysis unavailable: {_err}."
 
     brief_lines = [f"ASSET: {asset_name}", f"TYPE: {asset_type}", "", "SIGNAL DATA:"]
     for k, v in signal_data.items():
@@ -1911,16 +1893,7 @@ One-line: BULLISH / BEARISH / NEUTRAL with conviction (High/Medium/Low) and 1-se
 What specific conditions would change this view?
 """
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": brief},
-        ],
-        max_completion_tokens=2500,
-        temperature=0.3,
-    )
-    return completion.choices[0].message.content.strip()
+    return ai_agent.complete(system_prompt, brief, max_tokens=8000, effort="high")
 
 
 def run_deep_analysis_for_asset(asset_name: str, asset_type: str, close_series: pd.Series, signal_data: Dict[str, Any]) -> str:
@@ -1950,9 +1923,9 @@ def run_news_forecast(
     df_global, df_crypto, latest_news_items: List[Dict[str, Any]], focus_asset: str
 ):
     try:
-        client = get_openai_client()
-        if client is None:
-            return "AI news-forecast error: OpenAI client is not configured (missing OPENAI_API_KEY)."
+        _err = ai_unavailable()
+        if _err:
+            return f"AI news-forecast unavailable: {_err}."
 
         history_items = get_relevant_news_for_asset(focus_asset)
         effective_news = history_items or latest_news_items or []
@@ -2008,17 +1981,7 @@ Write like a Bloomberg Intelligence or Morgan Stanley research note — direct, 
 
         context = base_ctx + "\n\n" + user_block
 
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": context},
-            ],
-            max_completion_tokens=2200,
-            temperature=0.4,
-        )
-
-        return completion.choices[0].message.content.strip()
+        return ai_agent.complete(system_prompt, context, max_tokens=7000, effort="medium")
 
     except Exception as e:
         return f"AI news-forecast error: {e}"
@@ -2243,9 +2206,9 @@ def analyze_fomc_with_gpt(
     previous_text: str = "",
     pressconf_text: str = "",
 ) -> Dict[str, Any]:
-    client = get_openai_client()
-    if client is None:
-        return {"error": "OpenAI client is not configured (missing OPENAI_API_KEY)."}
+    _err = ai_unavailable()
+    if _err:
+        return {"error": f"AI unavailable: {_err}."}
 
     system_msg = """
 You are a senior macro strategist at a top-tier investment bank with 20+ years of Fed-watching experience.
@@ -2364,49 +2327,7 @@ Instructions:
 - wall_street_take: 1-2 punchy sentences. The "so what" headline a trader sends to their book right now.
 """
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.15,
-        max_completion_tokens=4500,
-    )
-
-    msg = completion.choices[0].message
-    raw = msg.content
-    refusal = getattr(msg, "refusal", None)
-    finish = completion.choices[0].finish_reason
-
-    if refusal:
-        return {"error": "Model refusal / blocked output", "refusal": refusal}
-
-    if raw is None or not str(raw).strip():
-        # Possibly hit token limit or content filter
-        try:
-            debug = msg.model_dump()
-        except Exception:
-            debug = str(msg)
-        hint = ""
-        if finish == "length":
-            hint = " (output was cut off — token limit reached)"
-        return {"error": f"Empty response from OpenAI model{hint}", "finish_reason": finish, "debug_message": debug}
-
-    raw = str(raw)
-
-    if isinstance(raw, dict):
-        return raw
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # If truncated due to length, try to note that
-        hint = " (possibly truncated — increase max_completion_tokens)" if finish == "length" else ""
-        data = {"error": f"JSON parsing failed{hint}", "raw_response": raw[:2000]}
-
-    return data
+    return ai_agent.complete_json(system_msg, user_msg, max_tokens=12000, effort="high")
 
 
 # ------------------------------------
@@ -2419,9 +2340,10 @@ def extract_fomc_pressconf_topics(press_text: str) -> Dict[str, Any]:
     Extracts WHAT was discussed in the FOMC press conference + interpretive market read.
     (Позволяваме мнение и вероятностни реакции, без да халюцинира факти.)
     """
-    client = get_openai_client()
-    if client is None or not press_text.strip():
-        return {"error": "No press conference text available or OpenAI not configured."}
+    _err = ai_unavailable()
+    if _err or not press_text.strip():
+        return {"error": f"AI unavailable: {_err}." if _err
+                         else "No press conference text available."}
 
     system_prompt = """
 You are a Federal Reserve press conference macro analyst.
@@ -2462,39 +2384,7 @@ Output MUST strictly follow this JSON structure:
 }
 """
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": press_text},
-        ],
-        temperature=0.2,
-        max_completion_tokens=2000,
-    )
-
-    msg = completion.choices[0].message
-    raw = msg.content
-    refusal = getattr(msg, "refusal", None)
-
-    if refusal:
-        return {"error": "Model refusal / blocked output", "refusal": refusal}
-
-    if raw is None or not str(raw).strip():
-        try:
-            debug = msg.model_dump()
-        except Exception:
-            debug = str(msg)
-        return {"error": "Empty response from OpenAI model", "debug_message": debug}
-
-    raw = str(raw)
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {"error": "JSON parsing failed", "raw_response": raw[:2000]}
-
-    return data
+    return ai_agent.complete_json(system_prompt, press_text, max_tokens=7000, effort="low")
 
 
 

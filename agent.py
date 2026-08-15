@@ -59,6 +59,76 @@ def get_anthropic_client():
     return Anthropic(api_key=key)
 
 
+class ModelDeclined(RuntimeError):
+    """Raised when safety classifiers decline the request."""
+
+
+def complete(system: str, user: str, *, max_tokens: int = 4000,
+             effort: str = "high", model: Optional[str] = None) -> str:
+    """One-shot completion — no tools, no conversation state.
+
+    The analysis panels in the app all want the same thing: a system prompt,
+    one user message, and the text back. This is that, in one place, so the
+    model and its settings are configured once rather than at six call sites.
+
+    Raises ModelDeclined if the safety classifiers refuse, RuntimeError if the
+    model returns nothing. Both beat silently rendering an empty panel.
+    """
+    client = get_anthropic_client()
+    resp = client.messages.create(
+        model=model or OPUS_MODEL,
+        max_tokens=max_tokens,
+        output_config={"effort": effort},
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+
+    if getattr(resp, "stop_reason", None) == "refusal":
+        cat = getattr(getattr(resp, "stop_details", None), "category", None)
+        raise ModelDeclined(f"the model declined this request{f' ({cat})' if cat else ''}")
+
+    text = "\n".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError(f"empty response (stop_reason={getattr(resp, 'stop_reason', '?')})")
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        log.warning("response hit max_tokens (%s) — output may be cut off", max_tokens)
+    return text
+
+
+def complete_json(system: str, user: str, *, max_tokens: int = 4000,
+                  effort: str = "high") -> Dict[str, Any]:
+    """complete() for prompts that specify a JSON shape, parsed.
+
+    Returns {"error": ...} rather than raising, matching what the callers
+    already render. Strips a ```json fence if the model adds one.
+    """
+    try:
+        raw = complete(system, user, max_tokens=max_tokens, effort=effort)
+    except ModelDeclined as e:
+        return {"error": str(e)}
+    except Exception as e:
+        log.exception("completion failed")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    body = raw.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[-1]
+        if body.rstrip().endswith("```"):
+            body = body.rstrip()[:-3]
+    # Be forgiving about a stray sentence before or after the object.
+    start, end = body.find("{"), body.rfind("}")
+    if start != -1 and end > start:
+        body = body[start:end + 1]
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"error": "JSON parsing failed (response may be truncated — "
+                         "raise max_tokens)", "raw_response": raw[:2000]}
+
+
 # ---------------- tool definitions ----------------
 
 TOOLS: List[Dict[str, Any]] = [

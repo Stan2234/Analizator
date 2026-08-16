@@ -3480,6 +3480,34 @@ def fx_pct(v, digits: int = 2) -> str:
     return "—" if v is None or pd.isna(v) else f"{v:+.{digits}f}%"
 
 
+# Styler.background_gradient pulls in matplotlib for its colormaps, which is a
+# large dependency to add for three table gradients. These interpolate the same
+# red -> dark -> green palette the heatmaps use, in pure pandas.
+_HEAT_LOW, _HEAT_MID, _HEAT_HIGH = (170, 17, 17), (17, 17, 17), (17, 170, 68)
+
+
+def _fx_blend(c1, c2, t: float) -> str:
+    return "rgb({},{},{})".format(*(int(a + (b - a) * t) for a, b in zip(c1, c2)))
+
+
+def fx_heat_col(s: pd.Series, invert: bool = False) -> List[str]:
+    """Per-column heat shading; scales to that column's own range."""
+    vals = pd.to_numeric(s, errors="coerce")
+    lo, hi = vals.min(), vals.max()
+    out = []
+    for v in vals:
+        if pd.isna(v) or pd.isna(lo) or pd.isna(hi) or hi <= lo:
+            out.append("")
+            continue
+        t = (float(v) - float(lo)) / (float(hi) - float(lo))
+        if invert:
+            t = 1.0 - t
+        colour = (_fx_blend(_HEAT_LOW, _HEAT_MID, t / 0.5) if t < 0.5
+                  else _fx_blend(_HEAT_MID, _HEAT_HIGH, (t - 0.5) / 0.5))
+        out.append(f"background-color: {colour}; color: #eee")
+    return out
+
+
 with tab_fx:
     if not _HAS_FXA:
         st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
@@ -3613,7 +3641,7 @@ with tab_fx:
                                            if c in show.columns]
                     st.dataframe(
                         show[cols].style
-                        .background_gradient(cmap="RdYlGn", subset=[c for c in cols if c != "Currency"])
+                        .apply(fx_heat_col, subset=[c for c in cols if c != "Currency"])
                         .format({c: "{:+.2f}%" for c in cols if c != "Currency"}, na_rep="—"),
                         use_container_width=True, hide_index=True,
                     )
@@ -3655,7 +3683,7 @@ with tab_fx:
                     })
                     st.dataframe(
                         view.style
-                        .background_gradient(cmap="RdYlGn", subset=["Total (1y)"])
+                        .apply(fx_heat_col, subset=["Total (1y)"])
                         .format({"Policy rate": "{:.2f}%", "Carry vs USD": "{:+.2f}%",
                                  "Vol (3m)": "{:.1f}%", "Carry / vol": "{:.2f}",
                                  "Spot (1y ann.)": "{:+.1f}%", "Total (1y)": "{:+.1f}%"},
@@ -3739,7 +3767,7 @@ with tab_fx:
                     st.markdown("##### Realised volatility")
                     st.dataframe(
                         vdf.style
-                        .background_gradient(cmap="OrRd", subset=["Vol 1m", "Percentile"])
+                        .apply(fx_heat_col, invert=True, subset=["Vol 1m", "Percentile"])
                         .format({"Vol 1m": "{:.1f}%", "Vol 3m": "{:.1f}%", "Vol 1y": "{:.1f}%",
                                  "Percentile": "{:.0f}", "1m − 3m": "{:+.1f}"}, na_rep="—"),
                         use_container_width=True, hide_index=True,

@@ -559,28 +559,37 @@ def basic_signal_from_series(
 
     score = round(float(score), 2)
 
-    # Each branch used to carry a hardcoded "confidence" (0.92 for STRONG BUY,
-    # 0.75 for BUY, and so on). Those numbers were invented — nothing measured
-    # them. Walk-forward testing over 25k signals on 12 assets put the real
-    # 5-day hit rate at 56.2% for STRONG BUY (promised 92%) and 44.1% for
-    # STRONG SELL (promised 92%), against a 58.5% base rate from market drift
-    # alone — so the bearish half was worse than a coin flip and the bullish
-    # half did not beat simply holding. The field is gone rather than restated,
-    # because any number in a column called "confidence" reads as an edge.
+    # These branches read STRONG BUY / BUY / HOLD / SELL / STRONG SELL, and
+    # each carried a hardcoded confidence (0.92 for STRONG BUY, and so on).
+    # Nothing measured those numbers. Walk-forward testing over 25k signals on
+    # 12 assets put the real 5-day hit rate at 56.2% for STRONG BUY (promised
+    # 92%) and 44.1% for STRONG SELL, against a 58.5% base rate from market
+    # drift alone: the bearish half was worse than a coin flip and the bullish
+    # half did not beat simply holding. Rank correlation with forward returns
+    # was -0.003 at 1d and +0.019 at 20d, where usable starts around 0.03, and
+    # the deciles were non-monotonic, so the score does not order future
+    # returns either.
+    #
+    # The confidence field is gone. The labels are now descriptive too: this
+    # composite measures how far RSI, MACD, the moving averages, Bollinger and
+    # Stochastic currently agree with one another, which is a real and useful
+    # summary of present indicator state. It is not a recommendation, and a
+    # word like BUY makes a claim about the future that the evidence does not
+    # support.
     if score >= 7:
-        signal = "STRONG BUY"
+        signal = "Strong bullish alignment"
     elif score >= 4:
-        signal = "BUY"
+        signal = "Bullish alignment"
     elif score >= 1.5:
-        signal = "WEAK BUY"
+        signal = "Mild bullish"
     elif score >= -1.5:
-        signal = "HOLD"
+        signal = "Mixed"
     elif score >= -4:
-        signal = "WEAK SELL"
+        signal = "Mild bearish"
     elif score >= -7:
-        signal = "SELL"
+        signal = "Bearish alignment"
     else:
-        signal = "STRONG SELL"
+        signal = "Strong bearish alignment"
 
     if close_v > sma200 and sma50 > sma200:
         trend = "up"
@@ -1664,6 +1673,21 @@ def ai_unavailable() -> Optional[str]:
     return None
 
 
+# The composite in basic_signal_from_series summarises indicator agreement. It
+# was walk-forward tested and does not predict, so every surface that shows it
+# says so — a label that looks like a call needs its track record beside it,
+# not buried in a methodology page.
+ALIGNMENT_NOTE = (
+    "**Alignment**, not a recommendation. This scores how far RSI, MACD, the "
+    "moving averages, Bollinger and Stochastic currently agree — a summary of "
+    "present state. Walk-forward tested over 25,128 signals on 12 assets "
+    "(2018-2026) it does **not** predict returns: rank correlation with the "
+    "next 20 days is +0.019 where usable starts near 0.03, deciles are "
+    "non-monotonic, and the bearish end was followed by *gains* on average. "
+    "Read it as context alongside the Quant Lab, never as an entry signal."
+)
+
+
 def df_to_brief(df: pd.DataFrame, label: str) -> str:
     """
     Тук вече подаваме и реалните close / SMA50 / SMA200,
@@ -1692,35 +1716,191 @@ def df_to_brief(df: pd.DataFrame, label: str) -> str:
     return df_local[cols].to_string(index=False)
 
 
+# The macro series that decide what regime the market is in. Anyone reading a
+# cross-asset note expects the analyst to have looked at these before writing a
+# word about growth, inflation or policy.
+AI_CONTEXT_FRED = [
+    ("DFF",          "Fed funds effective", "%"),
+    ("DGS2",         "2y Treasury", "%"),
+    ("DGS10",        "10y Treasury", "%"),
+    ("T10Y2Y",       "10y-2y curve", "pp"),
+    ("CPIAUCSL",     "CPI, headline (index)", ""),
+    ("CPILFESL",     "CPI, core (index)", ""),
+    ("UNRATE",       "Unemployment rate", "%"),
+    ("PAYEMS",       "Nonfarm payrolls (000s)", ""),
+    ("ICSA",         "Initial jobless claims", ""),
+    ("BAMLH0A0HYM2", "High-yield OAS", "pp"),
+    ("VIXCLS",       "VIX", ""),
+    ("DCOILWTICO",   "WTI crude", "$"),
+]
+
+
+def _ctx_section(title: str, body: str) -> str:
+    return f"\n### {title}\n{body.strip() if body and body.strip() else '(unavailable)'}\n"
+
+
 def build_ai_context(
     df_global: pd.DataFrame,
     df_crypto: pd.DataFrame,
     news_items: List[Dict[str, Any]],
 ) -> str:
-    global_text = df_to_brief(df_global, "global")
-    crypto_text = df_to_brief(df_crypto, "crypto")
+    """Assemble everything the app knows into one brief for the model.
 
+    This used to be three things: a technical-signal table, a crypto table and
+    ten headlines. A cross-asset note cannot be written from that — there is
+    nothing in it about rates, the curve, inflation, credit or positioning, so
+    the output had no choice but to be generic.
+
+    Every section is guarded: a source that is missing or unconfigured drops
+    out with a note rather than taking the brief down, and the model is told
+    what it is missing so it can say so rather than fill the gap.
+    """
+    parts: List[str] = []
+
+    # ---- rates, inflation, labour, credit -------------------------------
+    if _HAS_AGENT:
+        macro_lines = []
+        for series_id, label, unit in AI_CONTEXT_FRED:
+            try:
+                obs = dl.latest_fred(series_id, n=2)
+            except Exception:
+                continue
+            if not obs:
+                continue
+            cur = obs[0]
+            line = f"- {label} ({series_id}): {cur.get('value')}{unit} as of {cur.get('obs_date') or cur.get('date')}"
+            if len(obs) > 1:
+                try:
+                    delta = float(cur.get("value")) - float(obs[1].get("value"))
+                    line += f"  [prior {obs[1].get('value')}{unit}, change {delta:+.2f}]"
+                except Exception:
+                    pass
+            macro_lines.append(line)
+        parts.append(_ctx_section(
+            "MACRO — rates, inflation, labour, credit (FRED)",
+            "\n".join(macro_lines) or
+            "No FRED data cached. FRED_API_KEY may be unset — say so rather than "
+            "guessing at the macro regime."))
+
+    # ---- market internals ------------------------------------------------
+    if _HAS_AGENT:
+        try:
+            sectors = dl.sector_performance() or []
+            sec_txt = "\n".join(
+                f"- {s.get('sector')}: {float(s.get('avg_change') or 0):+.2f}% "
+                f"({s.get('n_up', 0)} up / {s.get('n_down', 0)} down)"
+                for s in sectors[:12] if s.get('sector') and s.get('avg_change') is not None)
+        except Exception:
+            sec_txt = ""
+        parts.append(_ctx_section("EQUITY INTERNALS — sector breadth", sec_txt))
+
+        try:
+            up = dl.top_movers(n=5, direction="up")
+            dn = dl.top_movers(n=5, direction="down")
+            mov = ("Gainers: " + ", ".join(f"{m['symbol']} {float(m['change_pct']):+.1f}%" for m in up)
+                   + "\nLosers: " + ", ".join(f"{m['symbol']} {float(m['change_pct']):+.1f}%" for m in dn))
+        except Exception:
+            mov = ""
+        parts.append(_ctx_section("TOP MOVERS", mov))
+
+    # ---- FX ---------------------------------------------------------------
+    if _HAS_FXA:
+        try:
+            fx_px = fx_load_prices()
+            if not fx_px.empty:
+                uv_ = fxa.usd_values(fx_px)
+                st_ = fxa.currency_strength(uv_, fxa.G10, 21)
+                rates_ = fxa.policy_rates(get_secret("FRED_API_KEY"),
+                                          st.session_state.get("fx_rate_overrides") or {})
+                ct_ = fxa.carry_table(uv_, rates_, fxa.G10, vs="USD")
+                fx_txt = ("1-month currency strength vs G10 peers (%, + = appreciated):\n"
+                          + "\n".join(f"- {c}: {v:+.2f}" for c, v in st_["strength"].items()))
+                trusted = ct_[ct_["trusted"]] if "trusted" in ct_.columns else ct_
+                if not trusted.empty:
+                    fx_txt += ("\nCarry vs USD, confirmed policy rates only "
+                               "(carry %, realised spot 1y %, total %):\n"
+                               + "\n".join(
+                                   f"- {c}: carry {r['carry']:+.2f}, spot {r['spot_1y']:+.1f}, "
+                                   f"total {r['total_1y']:+.1f} [{r['regime']}]"
+                                   for c, r in trusted.iterrows()
+                                   if pd.notna(r.get("total_1y"))))
+            else:
+                fx_txt = ""
+        except Exception as e:
+            log_msg = f"(FX context unavailable: {type(e).__name__})"
+            fx_txt = log_msg
+        parts.append(_ctx_section("FX — relative strength and carry", fx_txt))
+
+    # ---- sentiment --------------------------------------------------------
+    try:
+        sents = _load_sentiments() or {}
+        s_lines = []
+        for k in ("crypto", "stocks", "commodities", "macro"):
+            d = sents.get(k)
+            if isinstance(d, dict) and d.get("value") is not None:
+                s_lines.append(f"- {k}: {d.get('value')} ({d.get('label', '')})")
+        sent_txt = "\n".join(s_lines)
+    except Exception:
+        sent_txt = ""
+    parts.append(_ctx_section(
+        "SENTIMENT — fear & greed, 0 = extreme fear, 100 = extreme greed", sent_txt))
+
+    # ---- crypto -----------------------------------------------------------
+    if _HAS_AGENT:
+        try:
+            cm = dl.latest_crypto_market() or {}
+            cm_txt = (f"- Total market cap: ${float(cm.get('total_mcap_usd', 0))/1e12:.2f}T\n"
+                      f"- BTC dominance: {cm.get('btc_dominance')}%\n"
+                      f"- 24h change: {cm.get('mcap_change_24h_pct')}%") if cm else ""
+        except Exception:
+            cm_txt = ""
+        parts.append(_ctx_section("CRYPTO MARKET", cm_txt))
+
+    # ---- calendar ---------------------------------------------------------
+    if _HAS_AGENT:
+        try:
+            evs = dl.query_econ_events(days_ahead=14, days_back=0) or []
+            ev_txt = "\n".join(
+                f"- {str(e.get('event_time'))[:10]} [{e.get('country', '?')}] "
+                f"{e.get('title')} (importance: {e.get('importance', '?')})"
+                for e in evs[:25])
+        except Exception:
+            ev_txt = ""
+        parts.append(_ctx_section("EVENT CALENDAR — next 14 days", ev_txt))
+
+    # ---- technical tables (kept, but framed for what they are) -----------
+    parts.append(_ctx_section(
+        "TECHNICAL INDICATOR ALIGNMENT — descriptive only, see caveat below",
+        df_to_brief(df_global if df_global is not None else pd.DataFrame(), "global")))
+    if df_crypto is not None and not df_crypto.empty:
+        parts.append(_ctx_section("TECHNICAL ALIGNMENT — crypto",
+                                  df_to_brief(df_crypto, "crypto")))
+
+    # ---- news -------------------------------------------------------------
     if news_items:
-        top_news = news_items[:10]
-        news_lines = [
-            f"- [{n.get('keyword','')}] {n.get('title','')} (source: {n.get('source','')})"
-            for n in top_news
-        ]
-        news_text = "\n".join(news_lines)
+        news_txt = "\n".join(
+            f"- [{n.get('keyword', '')}] {n.get('title', '')} ({n.get('source', '')}, "
+            f"{str(n.get('published_at', ''))[:16]})"
+            for n in news_items[:25])
     else:
-        news_text = "No news loaded."
+        news_txt = ""
+    parts.append(_ctx_section("NEWS — most recent headlines", news_txt))
 
-    ctx = f"""
-GLOBAL SIGNALS (top 10):
-{global_text}
-
-CRYPTO SIGNALS (top 10):
-{crypto_text}
-
-LATEST NEWS (top headlines):
-{news_text}
+    caveat = """
+### DATA CAVEATS — state these where they matter, do not work around them silently
+- The technical alignment score above summarises indicator agreement. It was
+  walk-forward tested over 25,128 signals on 12 assets and does NOT predict
+  returns (rank correlation +0.019 at 20 days, non-monotonic deciles, and the
+  bearish end was followed by gains on average). Treat it as a description of
+  current indicator state, never as evidence for a directional view.
+- CPI series are index levels, not year-on-year rates. Do not quote them as
+  inflation rates; derive a change if you need one, or say you cannot.
+- Any section marked (unavailable) is missing, not zero. Say so explicitly
+  rather than reasoning as if the data were neutral.
 """
-    return ctx.strip()
+    parts.append(caveat)
+
+    return "\n".join(parts).strip()
 
 
 def run_ai_analyst(df_global, df_crypto, news_items, target_asset, horizon, user_question):
@@ -1743,52 +1923,78 @@ FOCUS:
 """
 
         system_prompt = """
-You are a senior institutional macro analyst at a bulge-bracket investment bank.
-Your analysis reads like a Goldman Sachs or JPMorgan cross-asset morning note — direct, specific, actionable.
-Your audience: professional portfolio managers and sophisticated investors.
+You are a cross-asset macro analyst writing for portfolio managers. They are
+not impressed by confident prose; they are looking for whether you have read
+the data carefully and whether your reasoning survives being checked.
 
-Output format (use markdown headers):
+The single thing that distinguishes a good note from a generic one is that
+every claim is traceable to a number in the brief. Cite the number inline —
+"the 2s10s at +0.42pp" — not "the curve is steepening". A reader who cannot
+follow your claim back to the data will assume you made it up, and they will
+usually be right.
 
-## EXECUTIVE SUMMARY
-2-3 sentences: the single most important insight right now.
+## HOW TO HANDLE UNCERTAINTY
 
-## MACRO REGIME
-Identify current regime: growth trend, inflation, central bank posture, risk appetite (risk-on/risk-off).
+Separate three things and never blur them:
+- **What the data shows** — a number in the brief.
+- **What you infer from it** — your reasoning, labelled as reasoning.
+- **What you cannot tell from this brief** — say it plainly.
 
-## CROSS-ASSET VIEW
-Brief directional take: Equities | Fixed Income | FX | Crypto | Commodities
+Do NOT attach percentage probabilities to scenarios. A number like "Bull 30%"
+implies a model that produced it; there is none here, and an analyst will ask
+where it came from. Rank scenarios as more or less likely and say what
+specifically would tip the balance.
 
-## ASSET ANALYSIS
-(Deep dive on the target asset, or global view if no target specified)
-- Technical positioning: trend, momentum, key levels, indicator confluence
-- Macro/fundamental drivers
-- Upcoming catalysts
+## STRUCTURE
 
-## SCENARIOS & PROBABILITIES
-| Scenario | Probability | Trigger | Implication |
-|----------|-------------|---------|-------------|
-| Bull     | X%          | ...     | ...         |
-| Base     | X%          | ...     | ...         |
-| Bear     | X%          | ...     | ...         |
+### Bottom line
+Three sentences at most. What matters now and what you would watch.
 
-## ACTIONABLE PLAYBOOK
-- **Day Trader:** ...
-- **Swing Trader (1-4 weeks):** ...
-- **Position Trader (1-3 months):** ...
-- **Long-term Investor:** ...
+### Macro regime
+Growth, inflation, policy stance, credit conditions, risk appetite — each tied
+to specific series in the brief. If a series is unavailable, say which and what
+you cannot conclude without it.
 
-## TOP RISKS
-3-5 concrete risks to the base case with likely market impact.
+### What the data actually says
+The two or three observations that carry the most weight, with the numbers.
+Include anything that cuts against your own read — a note that only presents
+confirming evidence is not analysis.
 
-## BOTTOM LINE
-1-2 sentences: what matters most and what to watch.
+### Cross-asset read
+Equities, rates, FX, credit, commodities, crypto. One or two sentences each,
+skipping any where the brief gives you nothing to say. Explicit about the
+transmission: not "USD weakness supports gold" but the channel and the evidence
+for it here.
 
-Rules:
-- Use probabilities and scenarios, never certainties.
-- Do NOT give investment advice or specific position sizing.
-- Mark typical historical behavior as "typical behavior."
-- Be direct — no filler, no hedging every sentence.
-- Use ONLY the supplied data. Do not hallucinate prices or indicators.
+### Target asset
+If one is named: where it sits in its own range and volatility regime, which
+macro driver it is currently tracking, what the technical state is (descriptive
+only), and what the upcoming calendar does to it.
+
+### Scenarios
+Two or three, ranked by likelihood without percentages. For each: the trigger,
+the observable that would confirm it early, and the cross-asset consequence.
+
+### What would make this wrong
+The specific observations that would falsify the read. Be concrete: a level, a
+release, a spread — something checkable within the horizon.
+
+### What is missing
+What data would most change this analysis if you had it. This is not a
+disclaimer; it is the most useful section for a reader deciding how much weight
+to give the rest.
+
+## RULES
+
+- Use only the supplied brief. Never invent a price, level, spread or holding.
+- If you want to reference typical historical behaviour, mark it as such and be
+  clear it is not from this data.
+- No position sizing and no investment advice. Describe conditions and
+  consequences; the reader decides what to do.
+- Length follows substance. If the brief is thin, write a short note and say it
+  is thin — padding a weak dataset into a long note is the failure mode here.
+- Plain prose over bullet-fragments where the reasoning matters. Tables only
+  for genuinely tabular facts.
 """
 
         context = base_ctx + "\n\n" + focus_block
@@ -3427,6 +3633,7 @@ with tab_global:
                 return ["color: #00ff00; background-color: #000000;" for _ in row]
             styled_df = df_global.style.apply(color_terminal, axis=1)
             st.dataframe(styled_df, use_container_width=True)
+            st.caption(ALIGNMENT_NOTE)
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fx_econ_events() -> List[Dict[str, Any]]:
@@ -4134,6 +4341,7 @@ with tab_crypto:
 
                 styled_crypto = df_crypto.style.apply(color_crypto_row, axis=1)
                 st.dataframe(styled_crypto, use_container_width=True)
+                st.caption(ALIGNMENT_NOTE)
 
         # Signal cards
         if df_crypto is not None and not df_crypto.empty:
@@ -4144,9 +4352,9 @@ with tab_crypto:
                 if i < len(df_crypto):
                     row = df_crypto.iloc[i]
                     sig = row["signal"]
-                    if "BUY" in sig:
+                    if "bullish" in sig.lower():
                         sig_icon = "🟢"
-                    elif "SELL" in sig:
+                    elif "bearish" in sig.lower():
                         sig_icon = "🔴"
                     else:
                         sig_icon = "⚪"
@@ -4202,10 +4410,10 @@ with tab_crypto:
                         tail = compute_tail_risk_metrics(returns, bars_per_year=bpy)
 
                         # Signal header
-                        sig_val = sig.get("signal", "HOLD")
-                        if "BUY" in sig_val:
+                        sig_val = sig.get("signal", "Mixed")
+                        if "bullish" in sig_val.lower():
                             sig_color = "🟢"
-                        elif "SELL" in sig_val:
+                        elif "bearish" in sig_val.lower():
                             sig_color = "🔴"
                         else:
                             sig_color = "⚪"
@@ -4491,9 +4699,44 @@ with tab_quant:
     st.markdown("""
     <div style="padding:12px 0 4px 0">
     <span style="font-size:28px;font-weight:800;letter-spacing:-1px">QUANT LAB</span>
-    <span style="font-size:14px;color:#888;margin-left:12px">Institutional systematic analysis · Regime · Momentum · Tail risk · Monte Carlo</span>
+    <span style="font-size:14px;color:#888;margin-left:12px">Regime · Structure · Momentum · Tail risk · Monte Carlo</span>
     </div>
     """, unsafe_allow_html=True)
+
+    with st.expander("What this panel does, and how to read it", expanded=False):
+        st.markdown("""
+This measures one price series six ways. It is **descriptive**: every number
+characterises what the series has already done, and none of it forecasts
+direction.
+
+- **Price structure** — does this series trend or revert (Hurst), and how
+  unusual is current volatility against its own history.
+- **Regime & structure** — volatility percentile, distribution shape (skew,
+  kurtosis) and serial correlation. Answers *what kind of market is this*.
+- **Momentum** — return across five lookbacks. Whether one regime has held, or
+  the long trend is being challenged.
+- **Mean reversion** — distance from the rolling mean in standard deviations,
+  and the Ornstein-Uhlenbeck half-life: how long a deviation has historically
+  taken to decay by half. No half-life means the series trends rather than
+  reverts.
+- **Tail risk** — drawdown, VaR/CVaR, and the ratios that divide return by a
+  risk measure. What losing looks like here.
+- **Jump-diffusion** — separates ordinary noise from discrete gaps, since an
+  asset that is calm until it jumps needs different sizing than one that is
+  merely volatile.
+- **Monte Carlo** — the range of outcomes if the future resembles the window
+  above. Gaussian, so it understates the tails the panel itself measured.
+
+**A reading order that works:** structure first (does it trend or revert), then
+regime (is volatility normal), then the branch that matches — momentum if it
+trends, mean reversion if it reverts. Tail risk and jumps size the position.
+Monte Carlo last, as a sanity check on magnitude, never as a target.
+
+There is deliberately **no overall verdict**. One used to sit at the top of this
+panel. Tested on 457 S&P names over 2012-2026 it came out inverted — its most
+bearish reading preceded the *best* forward returns — so it was removed rather
+than tuned.
+        """)
 
     # ── ASSET SELECTOR (horizontal, compact) ──
     # Build the asset pool from:
@@ -4698,6 +4941,16 @@ with tab_quant:
                             m4.metric("Max DD", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
                             m5.metric("Sharpe", f"{qm.get('sharpe', 'N/A')}" if qm.get('sharpe') else f"{(float(tail_risk.get('annualized_return_pct',0)) / max(float(regime.get('current_vol_annualized',1))*100, 1)):.2f}")
                             m6.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
+                            st.caption(
+                                "**Ann. Vol** is realised volatility annualised to the bar size — "
+                                "how much the price actually moved, not an option-implied forecast. "
+                                "**Max DD** is the deepest peak-to-trough loss in the window, the "
+                                "number that decides whether a position is survivable. **Sharpe** "
+                                "here is return over volatility with no risk-free rate deducted, so "
+                                "it flatters everything equally. **Win Rate** counts up-bars and says "
+                                "nothing about their size: a 70% win rate with one catastrophic loss "
+                                "still loses money."
+                            )
 
                         # ═══════════════════════════════════════
                         # ROW 2: PRICE CHART + BOLLINGER + VOLUME-like indicator
@@ -4730,6 +4983,13 @@ with tab_quant:
                         fig_price.update_yaxes(title_text="RSI", row=2, col=1, gridcolor="#1a1a1a", range=[0, 100])
                         fig_price.update_xaxes(gridcolor="#1a1a1a")
                         st.plotly_chart(fig_price, use_container_width=True)
+                        st.caption(
+                            "Bollinger bands are two standard deviations around the 20-bar mean, so "
+                            "roughly 5% of bars close outside them by construction — touching a band "
+                            "is normal, not a signal. RSI compares average gains to average losses "
+                            "over 14 bars; the 70/30 lines are convention, and in a strong trend RSI "
+                            "can sit above 70 for weeks without the trend ending."
+                        )
 
                         # ═══════════════════════════════════════
                         # ROW 3: REGIME | MOMENTUM | MEAN REVERSION (3 columns, visual)
@@ -4760,6 +5020,12 @@ with tab_quant:
                                 fig_gauge.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=50, b=10),
                                                         paper_bgcolor="#000", plot_bgcolor="#000")
                                 st.plotly_chart(fig_gauge, use_container_width=True)
+                                st.caption(
+                                    "Where current 63-bar volatility sits against this asset's own "
+                                    "history. High percentile means the market is moving more than "
+                                    "usual for *this* asset — it says nothing about direction, and "
+                                    "the level is not comparable across assets."
+                                )
 
                             with rc2:
                                 st.markdown("##### Market Structure")
@@ -4778,6 +5044,18 @@ with tab_quant:
                                     ]
                                 }
                                 st.dataframe(pd.DataFrame(_struct_data).set_index("Metric"), use_container_width=True)
+                                st.caption(
+                                    "**Hurst** measures whether moves persist or reverse: above 0.5 "
+                                    "the series trends, below 0.5 it mean-reverts, 0.5 is a random "
+                                    "walk. It is direction-agnostic — a crashing market trends too. "
+                                    "**Skew** below zero means losses arrive in bigger single moves "
+                                    "than gains. **Excess kurtosis** above zero means fat tails: "
+                                    "extreme moves happen far more often than a normal distribution "
+                                    "implies, which is why the Monte Carlo below understates risk. "
+                                    "**VaR 95%** is the loss the worst 5% of bars exceed; **CVaR** is "
+                                    "the average loss once you are in that 5% — the more honest of "
+                                    "the two, because VaR says nothing about how bad the tail gets."
+                                )
 
                             # Rolling vol chart
                             _rvol_20 = returns.rolling(20).std() * np.sqrt(bpy)
@@ -4792,6 +5070,11 @@ with tab_quant:
                             fig_rvol.update_yaxes(gridcolor="#1a1a1a")
                             fig_rvol.update_xaxes(gridcolor="#1a1a1a")
                             st.plotly_chart(fig_rvol, use_container_width=True)
+                            st.caption(
+                                "Short-window volatility rising above the long window is the market "
+                                "repricing risk now rather than drifting; the two converging is a "
+                                "regime settling down."
+                            )
 
                             # Autocorrelation bar chart
                             if acf:
@@ -4831,6 +5114,12 @@ with tab_quant:
                                                        yaxis_title="%")
                                 fig_mom.update_yaxes(gridcolor="#1a1a1a")
                                 st.plotly_chart(fig_mom, use_container_width=True)
+                                st.caption(
+                                    "Return over each lookback, measured to now. Agreement across "
+                                    "horizons means one regime has held; disagreement — say 252d "
+                                    "positive but 21d negative — means the longer trend is being "
+                                    "challenged, which is usually the more informative reading."
+                                )
 
                                 mom_score_v = mom_feat.get("momentum_composite_score")
                                 if mom_score_v is not None:
@@ -4934,6 +5223,16 @@ with tab_quant:
                                     ]
                                 }
                                 st.dataframe(pd.DataFrame(_tr_data).set_index("Metric"), use_container_width=True)
+                                st.caption(
+                                    "**Sortino** is Sharpe with only downside deviation in the "
+                                    "denominator, so upside volatility is not punished. **Calmar** "
+                                    "is annual return over max drawdown — return per unit of worst "
+                                    "pain. **Tail ratio** compares the size of the best 5% of bars "
+                                    "to the worst 5%; below 1 means losses arrive larger than gains. "
+                                    "**Gain/pain** is total gains over total losses. All are "
+                                    "backward-looking descriptions of the window shown, not "
+                                    "expectations."
+                                )
 
                                 # Returns distribution histogram
                                 fig_hist = go.Figure()
@@ -4950,6 +5249,12 @@ with tab_quant:
                                 fig_hist.update_yaxes(gridcolor="#1a1a1a")
                                 fig_hist.update_xaxes(gridcolor="#1a1a1a")
                                 st.plotly_chart(fig_hist, use_container_width=True)
+                                st.caption(
+                                    "The shape matters more than the spread. Real return "
+                                    "distributions have fatter tails and a longer left side than a "
+                                    "bell curve, which is precisely the risk that volatility alone "
+                                    "does not capture."
+                                )
 
                         with tl2:
                             st.markdown("##### ⚡ Jump-Diffusion (Merton)")
@@ -4966,6 +5271,15 @@ with tab_quant:
                                 ]
                             }
                             st.dataframe(pd.DataFrame(_jd_data).set_index("Metric"), use_container_width=True)
+                            st.caption(
+                                "Merton's model splits price action into ordinary diffusion and "
+                                "discrete jumps, separating bars beyond the z-threshold set in "
+                                "**Advanced**. **λ** is how many such jumps a year this asset has "
+                                "produced, **Diffusion vol** is the volatility left once they are "
+                                "removed. A high λ with low diffusion vol describes an asset that is "
+                                "calm until it gaps — the profile that breaks stop-losses and makes "
+                                "the Gaussian Monte Carlo below too optimistic."
+                            )
 
                             # Drawdown chart
                             _cum = (1 + returns).cumprod()
@@ -4981,12 +5295,27 @@ with tab_quant:
                             fig_dd.update_yaxes(gridcolor="#1a1a1a")
                             fig_dd.update_xaxes(gridcolor="#1a1a1a")
                             st.plotly_chart(fig_dd, use_container_width=True)
+                            st.caption(
+                                "Distance below the running peak. The width of a trough — how long "
+                                "recovery took — is usually the harder constraint to hold through "
+                                "than its depth."
+                            )
 
                         # ═══════════════════════════════════════
                         # ROW 5: MONTE CARLO
                         # ═══════════════════════════════════════
                         st.markdown("---")
                         st.markdown(f"##### 🎲 Monte Carlo Scenarios — {horizon_label_q} ahead ({mc_sims_q:,} sims)")
+                        st.caption(
+                            "Simulated forward prices, drawing the drift and volatility of the "
+                            "window above and compounding them over the horizon. **P10 and P90 are "
+                            "not a forecast range** — they are where 10% and 90% of paths landed "
+                            "*if the future resembles the past*. Two limits worth stating out loud: "
+                            "shocks are drawn from a normal distribution, so the fat tails and jumps "
+                            "measured on the left are absent and the downside is understated; and "
+                            "the drift is simply the window's own average return, so a strong "
+                            "trailing run is projected forward as if it continues."
+                        )
 
                         # mc_result was drawn once above, before compute_quant_metrics.
                         mc_p10 = mc_result.get("mc_p10")
@@ -5035,11 +5364,19 @@ with tab_quant:
                             fig_mc.update_yaxes(gridcolor="#1a1a1a")
                             fig_mc.update_xaxes(gridcolor="#1a1a1a")
                             st.plotly_chart(fig_mc, use_container_width=True)
+                            st.caption(
+                                "The full distribution behind the four cards, from the same single "
+                                "draw. Its width is the useful part: a narrow spread means the "
+                                "horizon is short relative to volatility, a wide one means the "
+                                "central estimate carries little information."
+                            )
 
                         # ═══════════════════════════════════════
                         # ROW 6: FULL METRICS + AI ANALYSIS
                         # ═══════════════════════════════════════
                         with st.expander("📋 Full Quant Metrics (raw data)"):
+                            st.caption("Every value computed for this asset, unformatted — for "
+                                       "checking a number or exporting it.")
                             all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
                             st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
 

@@ -1479,8 +1479,7 @@ def _get_current_fetch_slot() -> Optional[int]:
     Determine which scheduled slot we're in based on current UTC hour.
     Returns the slot index (0, 1, 2) if it's time to fetch, or None if not.
     """
-    now_utc = dt.datetime.utcnow()
-    current_hour = now_utc.hour
+    current_hour = dt.datetime.utcnow().hour
 
     # Find which slot matches (allow 1-hour window after each scheduled hour)
     for i, sched_hour in enumerate(NEWS_FETCH_HOURS_UTC):
@@ -3489,10 +3488,18 @@ def _render_fg(col, title, data):
         return
     v = data.get("value")
     lbl = data.get("label") or ""
+    # The computed scores clamp their z-score at +/-2, so 0 and 100 mean the
+    # scale ran out rather than "the maximum possible reading". Shown next to
+    # CNN's genuinely bounded index, an unmarked 100 reads as the latter.
+    cap_note = ""
+    if v in (0, 100):
+        cap_note = ("<span style='font-size:11px;color:#888;font-weight:normal'>"
+                    " · capped</span>")
+    shown = v if v is not None else "—"
     col.markdown(
         f"<div style='padding:8px;border-radius:8px;background:#0a0a0a;border:1px solid #222'>"
         f"<div style='font-size:12px;color:#aaa'>{title}</div>"
-        f"<div style='font-size:28px;font-weight:bold;color:{_fg_color(v)}'>{v if v is not None else '—'}</div>"
+        f"<div style='font-size:28px;font-weight:bold;color:{_fg_color(v)}'>{shown}{cap_note}</div>"
         f"<div style='font-size:13px;color:{_fg_color(v)}'>{lbl}</div>"
         f"</div>", unsafe_allow_html=True)
 
@@ -3520,10 +3527,27 @@ labels differ — they are not equivalent benchmarks.
   spreads and dollar momentum, each converted to a score with its own hand-set
   scaling, then averaged.
 
+Both computed scores clamp their z-score at ±2, so **0 and 100 mean the scale
+ran out**, not that the reading is at some true maximum — those are marked
+*capped*. CNN's index is genuinely bounded; these are not the same thing.
+
 The two computed scores are directionally useful and have not been validated
 against anything. Read them as a summary of the inputs listed, not as an
 independent measure — and never quote them as if they were a published index.
     """)
+
+    _det_rows = []
+    for _k, _lbl in (("commodities", "Commodities"), ("macro", "Macro risk")):
+        _d = (_sents.get(_k) or {}).get("details") or {}
+        for _n, _v in _d.items():
+            _det_rows.append({"Score": _lbl, "Input": _n, "Current value": _v})
+    if _det_rows:
+        st.markdown("**What the two computed scores are reading right now:**")
+        st.dataframe(pd.DataFrame(_det_rows), use_container_width=True,
+                     hide_index=True)
+        st.caption("Commodity figures are 14-day percentage returns. Macro "
+                   "inputs are shown in their own units — VIX in points, the "
+                   "curve and spreads in percentage points.")
 
 with st.expander("Data source diagnostics"):
     _errs = st.session_state.get("yahoo_live_errors", {})
@@ -6145,7 +6169,8 @@ with tab_brief:
                     ph = placeholders.get(agent_id)
                     if ph is not None:
                         ph.success(
-                            f"✅ **{result.get('title','')}** — conf: `{confidence}`\n\n"
+                            f"✅ **{result.get('title','')}** — data coverage: "
+                            f"`{confidence}`\n\n"
                             f"{headline}"
                         )
 
@@ -6172,12 +6197,21 @@ with tab_brief:
 
             st.markdown("---")
             st.markdown("### 🔬 Specialist Briefings")
+            st.caption(
+                "**Data coverage** reports whether each agent's tools actually "
+                "returned what its brief needed — high means everything arrived "
+                "and was current, low means a tool failed or the data was too "
+                "stale to lean on. It is not the model's confidence in its own "
+                "conclusions, which would not be calibrated and is not worth "
+                "showing."
+            )
             for sid, r in brief.get("subagents", {}).items():
                 res = r.get("result") or {}
                 title = r.get("title", sid)
                 conf = res.get("confidence", "?")
                 headline = res.get("headline", "")
-                with st.expander(f"{title} — conf: `{conf}` — {headline}", expanded=False):
+                with st.expander(f"{title} — data coverage: `{conf}` — {headline}",
+                                 expanded=False):
                     if res.get("_parse_failed"):
                         st.warning("This agent's response could not be parsed as JSON. Raw output below.")
                         st.code(r.get("raw", ""), language="text")

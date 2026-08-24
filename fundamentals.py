@@ -272,7 +272,7 @@ def quality_flags(rec: Dict[str, Any]) -> List[Dict[str, str]]:
     """
     flags: List[Dict[str, str]] = []
 
-    fcf, ni_margin = rec.get("freeCashflow"), rec.get("profitMargins")
+    fcf = rec.get("freeCashflow")
     mcap = rec.get("marketCap")
     if fcf is not None and mcap:
         try:

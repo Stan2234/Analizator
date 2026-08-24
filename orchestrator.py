@@ -214,7 +214,15 @@ After your tool work, output ONLY a JSON object (no prose before or after, no ma
 Rules:
 - key_findings: 3-6 items, each with concrete numbers/sources/timestamps where possible
 - data_points: 5-10 key numeric values (e.g. "BTC price": "$67,432", "10y yield": "4.28%")
-- confidence must be exactly one of: "high", "medium", "low"
+- confidence must be exactly one of: "high", "medium", "low", and it describes
+  DATA COVERAGE, not how sure you feel. Judge it only on what your tools
+  returned:
+    high   - the tools returned everything this brief needed, and it was current
+    medium - some of it was missing, stale, or you worked around a gap
+    low    - a tool failed, returned nothing, or the data was too old to rely on
+  A language model's sense of its own certainty is not calibrated and is worth
+  nothing to the reader; whether the data arrived is a fact, and that is what
+  this field must report. If you inferred rather than measured, say low.
 - Do NOT wrap the JSON in code fences. Do NOT add commentary before or after.
 """
 

@@ -444,8 +444,7 @@ def fetch_commodities_sentiment() -> Optional[Dict[str, Any]]:
     Higher = risk-on / commodities rallying.
     """
     try:
-        symbols = ["GC=F", "SI=F", "DCOILWTICO"]  # gold, silver, WTI (via Yahoo: CL=F)
-        # Use Yahoo for all three for consistency
+        # Gold, silver and WTI, all via Yahoo for consistency.
         ymap = {"GC=F": "GC=F", "SI=F": "SI=F", "WTI": "CL=F"}
         scores = []
         details = {}

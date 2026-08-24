@@ -4632,11 +4632,23 @@ with tab_crypto:
                         mr3.metric("O-U Half-Life", f"{hl:.0f} bars" if hl else "N/A (trending)")
 
                         z20 = mean_rev.get("z_score_20")
-                        if z20 is not None:
-                            if z20 > 2.0:
-                                st.warning("⚠️ Z-Score > 2.0 — price significantly above mean. Potential reversion risk.")
-                            elif z20 < -2.0:
-                                st.info("💡 Z-Score < -2.0 — price significantly below mean. Potential bounce zone.")
+                        hl20 = mean_rev.get("ou_half_life")
+                        if z20 is not None and abs(z20) > 2.0:
+                            side = "above" if z20 > 0 else "below"
+                            # Whether a stretched z-score reverts depends on
+                            # whether this series reverts at all, which the
+                            # half-life answers and the z-score alone does not.
+                            if hl20:
+                                tail = (f"This series has historically decayed half of a "
+                                        f"deviation in about {hl20:.0f} bars, so the "
+                                        f"distance has tended to close.")
+                            else:
+                                tail = ("No Ornstein-Uhlenbeck half-life could be fitted, "
+                                        "which means this series has been trending rather "
+                                        "than reverting — a stretched reading here is not "
+                                        "evidence that it snaps back.")
+                            st.info(f"Price is {abs(z20):.1f} standard deviations {side} its "
+                                    f"20-bar mean. {tail}")
 
                         # Risk Profile
                         st.markdown("#### Risk Profile")
@@ -5652,11 +5664,26 @@ than tuned.
                                 st.plotly_chart(fig_acf, use_container_width=True)
                                 lag1 = acf.get("lag_1", 0)
                                 if lag1 > 0.05:
-                                    st.caption("📈 Positive autocorrelation — trend continuation likely. Trend-following favored.")
+                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: an up "
+                                                 "bar has been followed by another up bar "
+                                                 "slightly more often than chance.")
                                 elif lag1 < -0.05:
-                                    st.caption("🔄 Negative autocorrelation — mean-reversion signal. Contrarian strategies favored.")
+                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: bars "
+                                                 "have tended to alternate rather than "
+                                                 "follow through.")
                                 else:
-                                    st.caption("⚪ Near-zero — no strong serial pattern at this timeframe.")
+                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}, close "
+                                                 "to zero: one bar has said essentially "
+                                                 "nothing about the next.")
+                                st.caption(
+                                    _acf_read + " Correlation of each bar's return with the "
+                                    "return n bars earlier. Daily financial returns sit near "
+                                    "zero at every lag — values under about 0.1 are within "
+                                    "the range you would see in random data over this many "
+                                    "observations, so read the direction, not the presence of "
+                                    "a bar. This describes the measured window; it is not a "
+                                    "reason to favour a strategy."
+                                )
 
                         with qt2:
                             # Momentum visual

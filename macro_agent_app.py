@@ -2857,6 +2857,17 @@ def show_fomc_lab():
         def mag_label(m: str) -> str:
             return {"high": "⚡⚡⚡", "medium": "⚡⚡", "low": "⚡"}.get(m, "—")
 
+        def why(d: dict) -> str:
+            """The rationale, or an explicit note that the statement gave none.
+
+            The model is told to leave a market blank rather than invent a
+            reason for it — most FOMC statements say nothing about copper. An
+            empty string rendered as an empty italic line, which reads as a
+            rendering fault rather than as the honest answer it is.
+            """
+            r = (d or {}).get("rationale") or ""
+            return r.strip() or "_nothing in this statement bears on it_"
+
         # ── WALL STREET TAKE ──
         wst = result.get("wall_street_take", "")
         if wst:
@@ -2940,7 +2951,7 @@ def show_fomc_lab():
                         f"**{idx_label}:** {dir_emoji(d.get('direction',''))} "
                         f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
                     )
-                    st.caption(d.get("rationale", ""))
+                    st.caption(why(d))
             with col_sec:
                 st.markdown("**Sectors**")
                 sector_labels = {
@@ -2953,7 +2964,7 @@ def show_fomc_lab():
                     d = eq.get("sectors", {}).get(key, {})
                     st.markdown(
                         f"{dir_emoji(d.get('direction',''))} **{label}:** "
-                        f"{d.get('direction','').title()} — _{d.get('rationale','')}_"
+                        f"{d.get('direction','').title()} — {why(d)}"
                     )
 
         with tab_fx:
@@ -2968,7 +2979,7 @@ def show_fomc_lab():
                     f"**{label}:** {dir_emoji(d.get('direction',''))} "
                     f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
                 )
-                st.caption(d.get("rationale", ""))
+                st.caption(why(d))
                 st.markdown("---")
 
         with tab_cr:
@@ -2980,7 +2991,7 @@ def show_fomc_lab():
                     f"**{label}:** {dir_emoji(d.get('direction',''))} "
                     f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
                 )
-                st.caption(d.get("rationale", ""))
+                st.caption(why(d))
                 st.markdown("---")
             st.info(
                 "💡 **Why crypto reacts to the Fed:** Crypto is highly sensitive to USD liquidity conditions. "
@@ -3000,7 +3011,7 @@ def show_fomc_lab():
                     f"**{label}:** {dir_emoji(d.get('direction',''))} "
                     f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
                 )
-                st.caption(d.get("rationale", ""))
+                st.caption(why(d))
                 st.markdown("---")
             st.info(
                 "💡 **Key commodity mechanics:** Gold moves inversely to real rates and USD. "
@@ -3017,7 +3028,7 @@ def show_fomc_lab():
                     f"**{label}:** {dir_emoji(d.get('direction',''))} "
                     f"{d.get('direction','').title()} {mag_label(d.get('magnitude',''))}"
                 )
-                st.caption(d.get("rationale", ""))
+                st.caption(why(d))
                 st.markdown("---")
             yc = bn.get("yield_curve_shape", "")
             if yc:

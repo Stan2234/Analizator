@@ -29,6 +29,13 @@ except Exception as _fe:
     _FXA_IMPORT_ERROR = str(_fe)
 
 try:
+    import fundamentals as fnd
+    _HAS_FUND = True
+except Exception as _ue:
+    _HAS_FUND = False
+    _FUND_IMPORT_ERROR = str(_ue)
+
+try:
     import data_layer as dl
     import scheduler as bg_scheduler
     import agent as ai_agent
@@ -3432,8 +3439,9 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-tab_global, tab_fx, tab_crypto, tab_news, tab_quant, tab_ai, tab_fomc, tab_brief = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief"]
+tab_global, tab_fx, tab_crypto, tab_fund, tab_news, tab_quant, tab_ai, tab_fomc, tab_brief = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📐 Fundamentals",
+     "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief"]
 
 )
 
@@ -4504,6 +4512,371 @@ with tab_crypto:
 
                     except Exception as e:
                         st.error(f"Crypto analysis error: {type(e).__name__}: {e}")
+
+
+# -------- FUNDAMENTALS TAB --------
+# Valuation, profitability, growth and balance sheet, always against the
+# company's own sector. See fundamentals.py for why the peer column matters
+# more than the raw number.
+
+FUND_PEER_CAP = 40  # sector peers to pull; enough for a stable median
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fund_fetch_info(symbols: tuple) -> List[Dict[str, Any]]:
+    """Quote fundamentals for a set of symbols, fetched in parallel."""
+    import yfinance as yf
+
+    def _one(sym: str):
+        try:
+            info = yf.Ticker(sym).info or {}
+            if not info.get("marketCap"):
+                return None
+            info["symbol"] = sym
+            return info
+        except Exception:
+            return None
+
+    out = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for res in pool.map(_one, symbols):
+            if res:
+                out.append(res)
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fund_sector_symbols(sector: str, cap: int = FUND_PEER_CAP) -> List[str]:
+    if not _HAS_AGENT:
+        return []
+    try:
+        rows = dl.universe_by_sector(sector) or []
+        return [r["symbol"] for r in rows][:cap]
+    except Exception:
+        return []
+
+
+def fund_pct_badge(p: Optional[float], directional: bool) -> str:
+    if p is None or pd.isna(p):
+        return "—"
+    if not directional:
+        return f"{p:.0f} (rank only)"
+    dot = "🟢" if p >= 66 else ("🟠" if p >= 33 else "🔴")
+    return f"{dot} {p:.0f}"
+
+
+with tab_fund:
+    if not _HAS_FUND:
+        st.error(f"Fundamentals module failed to load: {_FUND_IMPORT_ERROR}")
+    else:
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">FUNDAMENTALS</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">Valuation · Profitability · Growth · Balance sheet — always vs sector</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Every other panel in this app measures **price**. This one measures the
+business underneath it.
+
+The organising idea is that a fundamental number means almost nothing on its
+own. A P/E of 35 is expensive for a utility, ordinary for a software company,
+and cheap for one compounding at 40%. So every metric is shown beside its
+sector's median and its **percentile within that sector** — and the percentile
+is usually the more informative half.
+
+Percentiles are oriented so **100 is always the favourable end**: a low P/E and
+a high margin both score high. Metrics with no favourable end — leverage, beta,
+payout — are shown as a plain rank with no colour, because calling debt "bad"
+is a judgement about the business, not a fact about the number.
+
+- **Valuation** — what you are paying. Cross-check the multiples against each
+  other: a low P/E with a high P/B usually means the earnings are cyclical.
+- **Profitability** — what the business earns. Gross margin is the ceiling on
+  everything below it.
+- **Growth** — direction. Compare revenue against earnings growth; when they
+  diverge, one of margin, buybacks or a weak base year explains it.
+- **Balance sheet** — what could break. The current ratio and the payout ratio
+  are the two that flag actual stress.
+- **DuPont** — splits return on equity into margin, asset turnover and
+  leverage. Two firms can post identical ROE for opposite reasons, and the
+  leveraged one is far more fragile when conditions turn.
+- **Observations** — cross-checks a reader would otherwise do by hand, each
+  quoting the numbers behind it. They are prompts to investigate, not verdicts.
+
+**There is no fundamental score here, deliberately.** Compressing these into a
+single number would look authoritative and would not have been tested against
+anything — the same failure this project removed from the technical panels.
+
+**Limits worth stating:** figures come from Yahoo's quote summary, are as
+current as the last filing, and are unaudited. Trailing multiples are
+meaningless where earnings are negative. Forward multiples rest on sell-side
+estimates, which skew optimistic. Financials and REITs are not comparable to
+industrials on P/B or EV/EBITDA, so read them against their own sector only.
+            """)
+
+        fc1, fc2, fc3 = st.columns([2, 1.4, 1])
+        with fc1:
+            fund_query = st.text_input(
+                "Company", value="AAPL", key="fund_query",
+                placeholder="Ticker or name — AAPL, Microsoft, JPM",
+                label_visibility="collapsed")
+        with fc2:
+            fund_sector_override = st.selectbox(
+                "Compare against", ["Own sector"] + (
+                    sorted(dl.universe_sector_counts().keys()) if _HAS_AGENT else []),
+                key="fund_sector", label_visibility="collapsed")
+        with fc3:
+            fund_run = st.button("▶ Analyse", type="primary", key="fund_run",
+                                 use_container_width=True)
+
+        fund_sym = None
+        if fund_query.strip():
+            q = fund_query.strip()
+            try:
+                hits = dl.universe_search(q, limit=1) if _HAS_AGENT else []
+            except Exception:
+                hits = []
+            if hits:
+                fund_sym = hits[0]["symbol"]
+            else:
+                fund_sym = q.upper()
+
+        if not fund_sym:
+            st.info("Enter a ticker or company name.")
+        else:
+            with st.spinner(f"Loading {fund_sym} and its sector…"):
+                base = fund_fetch_info((fund_sym,))
+            if not base:
+                st.error(f"No fundamental data returned for **{fund_sym}**. "
+                         "Check the ticker, or the company may not report the fields "
+                         "this panel uses.")
+            else:
+                rec_raw = base[0]
+                rec = fnd.normalise(rec_raw)
+                sector = (fund_sector_override if fund_sector_override != "Own sector"
+                          else fnd.gics_sector(rec.get("sector")))
+
+                name = rec.get("longName") or rec.get("shortName") or fund_sym
+                st.markdown(f"### {name} · `{fund_sym}`")
+                meta = " · ".join(x for x in [rec.get("sector"), rec.get("industry")] if x)
+                if meta:
+                    st.caption(meta)
+
+                # ---- headline row ----
+                h1, h2, h3, h4, h5, h6 = st.columns(6)
+                mc = rec.get("marketCap")
+                h1.metric("Market cap", fnd.fmt_value(mc, "cur") if mc else "—")
+                h2.metric("P/E trailing", fnd.fmt_value(rec.get("trailingPE"), "x"))
+                h3.metric("P/E forward", fnd.fmt_value(rec.get("forwardPE"), "x"))
+                h4.metric("Net margin", fnd.fmt_value(rec.get("profitMargins"), "%"))
+                h5.metric("Revenue growth", fnd.fmt_value(rec.get("revenueGrowth"), "%"))
+                rp = fnd.range_position(rec)
+                h6.metric("52w range", f"{rp:.0f}%" if rp is not None else "—")
+
+                peers = pd.DataFrame()
+                if sector:
+                    syms = fund_sector_symbols(sector)
+                    if fund_sym not in syms:
+                        syms = [fund_sym] + syms
+                    with st.spinner(f"Loading {len(syms)} peers in {sector}…"):
+                        peer_rows = fund_fetch_info(tuple(syms))
+                    peers = fnd.peer_frame(peer_rows)
+
+                if peers.empty or fund_sym not in peers.index:
+                    st.warning(
+                        "No peer set available, so the metrics below have no sector "
+                        "context. The raw values are still shown, but a multiple "
+                        "without a comparison is close to uninformative."
+                    )
+                    show = pd.DataFrame([
+                        {"Metric": m.label, "Group": m.group,
+                         "Value": fnd.fmt_value(rec.get(m.key), m.fmt),
+                         "What it is": m.note}
+                        for m in fnd.METRICS])
+                    st.dataframe(show, use_container_width=True, hide_index=True)
+                else:
+                    cmp_df = fnd.compare_to_peers(fund_sym, peers)
+                    st.caption(f"Compared against **{len(peers)}** companies in "
+                               f"**{sector}**. Percentile: 100 = the favourable end.")
+
+                    for grp in ["Valuation", "Profitability", "Growth",
+                                "Balance sheet", "Shareholder returns", "Market"]:
+                        sub = cmp_df[cmp_df["group"] == grp]
+                        if sub.empty:
+                            continue
+                        st.markdown(f"##### {grp}")
+                        disp = pd.DataFrame({
+                            "Metric": sub["metric"],
+                            fund_sym: [fnd.fmt_value(v, f) for v, f in
+                                       zip(sub["value"], sub["fmt"])],
+                            "Sector median": [fnd.fmt_value(v, f) for v, f in
+                                              zip(sub["peer_median"], sub["fmt"])],
+                            "Percentile": [fund_pct_badge(p, d) for p, d in
+                                           zip(sub["percentile"], sub["directional"])],
+                            "What it is": sub["note"],
+                        })
+                        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                    # ---- DuPont ----
+                    dp = fnd.dupont(rec)
+                    if dp and dp.get("asset_turnover") is not None:
+                        st.markdown("---")
+                        st.markdown("##### DuPont — where the return on equity comes from")
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.metric("Return on equity", f"{dp['roe']:.1f}%")
+                        d2.metric("Net margin", f"{dp['net_margin']:.1f}%")
+                        d3.metric("Asset turnover", f"{dp['asset_turnover']:.2f}x")
+                        d4.metric("Equity multiplier", f"{dp['equity_multiplier']:.2f}x")
+                        st.caption(
+                            f"ROE {dp['roe']:.1f}% = margin {dp['net_margin']:.1f}% × "
+                            f"turnover {dp['asset_turnover']:.2f} × leverage "
+                            f"{dp['equity_multiplier']:.2f}. A return built on margin and "
+                            "turnover is earned by the business; one built on the leverage "
+                            "term is borrowed, and reverses hard when funding costs rise or "
+                            "revenue falls. Asset turnover is derived from the identity "
+                            "rather than reported directly, so it absorbs any inconsistency "
+                            "between the three inputs."
+                        )
+
+                    # ---- observations ----
+                    flags = fnd.quality_flags(rec)
+                    if flags:
+                        st.markdown("---")
+                        st.markdown("##### Observations")
+                        for f in flags:
+                            (st.warning if f["level"] == "warn" else st.info)(f["text"])
+                        st.caption("Conditions worth explaining, not conclusions. Each "
+                                   "quotes the numbers it rests on so it can be checked.")
+
+                    # ---- valuation vs growth ----
+                    st.markdown("---")
+                    st.markdown("##### Valuation against growth — the sector map")
+                    scat = peers[["forwardPE", "revenueGrowth", "profitMargins",
+                                  "marketCap"]].copy()
+                    scat = scat.replace([np.inf, -np.inf], np.nan).dropna(
+                        subset=["forwardPE", "revenueGrowth"])
+                    scat = scat[(scat["forwardPE"] > 0) & (scat["forwardPE"] < 200)]
+                    if len(scat) >= 5:
+                        fig_v = go.Figure()
+                        others = scat.drop(index=fund_sym, errors="ignore")
+                        fig_v.add_trace(go.Scatter(
+                            x=others["revenueGrowth"], y=others["forwardPE"],
+                            mode="markers+text", text=others.index,
+                            textposition="top center", textfont=dict(size=9, color="#777"),
+                            marker=dict(size=9, color="#4488ff", opacity=0.75),
+                            name="Sector",
+                            hovertemplate="%{text}<br>growth %{x:.1f}%<br>fwd P/E %{y:.1f}x<extra></extra>"))
+                        if fund_sym in scat.index:
+                            me = scat.loc[[fund_sym]]
+                            fig_v.add_trace(go.Scatter(
+                                x=me["revenueGrowth"], y=me["forwardPE"],
+                                mode="markers+text", text=[fund_sym],
+                                textposition="top center",
+                                textfont=dict(size=12, color="#fff"),
+                                marker=dict(size=16, color="#00cc66",
+                                            line=dict(width=2, color="#fff")),
+                                name=fund_sym))
+                        fig_v.add_hline(y=float(scat["forwardPE"].median()),
+                                        line_dash="dash", line_color="#555",
+                                        annotation_text="sector median P/E")
+                        fig_v.add_vline(x=float(scat["revenueGrowth"].median()),
+                                        line_dash="dash", line_color="#555",
+                                        annotation_text="median growth")
+                        fig_v.update_layout(
+                            template="plotly_dark", height=460,
+                            margin=dict(l=0, r=0, t=10, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            xaxis_title="Revenue growth (%, YoY)",
+                            yaxis_title="Forward P/E (x)",
+                            legend=dict(orientation="h", y=1.08))
+                        fig_v.update_xaxes(gridcolor="#1a1a1a")
+                        fig_v.update_yaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_v, use_container_width=True)
+                        st.caption(
+                            "Bottom-right is cheap for the growth, top-left is expensive "
+                            "without it. The quadrants are a starting question, not an "
+                            "answer: a company sits bottom-right either because the market "
+                            "has missed something or because it expects the growth to stop, "
+                            "and this chart cannot tell you which."
+                        )
+
+                    # ---- sector distribution ----
+                    with st.expander(f"{sector} — full distribution"):
+                        ss = fnd.sector_summary(peers)
+                        if not ss.empty:
+                            ss_disp = pd.DataFrame({
+                                "Metric": ss["metric"], "Group": ss["group"],
+                                "P25": [fnd.fmt_value(v, f) for v, f in zip(ss["p25"], ss["fmt"])],
+                                "Median": [fnd.fmt_value(v, f) for v, f in zip(ss["median"], ss["fmt"])],
+                                "P75": [fnd.fmt_value(v, f) for v, f in zip(ss["p75"], ss["fmt"])],
+                                "n": ss["n"]})
+                            st.dataframe(ss_disp, use_container_width=True, hide_index=True)
+                            st.caption("The spread between P25 and P75 says how much the "
+                                       "metric varies within this sector — a wide spread "
+                                       "means the median is a weak benchmark.")
+
+                # ---- AI read ----
+                if fund_run:
+                    _err = ai_unavailable()
+                    if _err:
+                        st.error(f"AI read unavailable: {_err}.")
+                    else:
+                        with st.spinner("Reading the fundamentals…"):
+                            try:
+                                ctx = {
+                                    "company": name, "symbol": fund_sym,
+                                    "sector": rec.get("sector"),
+                                    "industry": rec.get("industry"),
+                                    "metrics": {k: v for k, v in rec.items()
+                                                if not isinstance(v, (list, dict))},
+                                    "peer_comparison": (
+                                        fnd.compare_to_peers(fund_sym, peers)
+                                        .drop(columns=["note"]).to_dict("records")
+                                        if not peers.empty and fund_sym in peers.index else []),
+                                    "peer_count": int(len(peers)),
+                                    "dupont": fnd.dupont(rec),
+                                    "observations": [f["text"] for f in fnd.quality_flags(rec)],
+                                    "range_position_pct": fnd.range_position(rec),
+                                }
+                                fund_system = (
+                                    "You are an equity analyst writing a fundamental note for "
+                                    "portfolio managers. You are given one company's metrics, "
+                                    "its sector peer medians and percentiles, a DuPont "
+                                    "decomposition, and mechanical observations.\n\n"
+                                    "Percentiles are oriented so 100 is the favourable end.\n\n"
+                                    "Write:\n"
+                                    "1. What this business is and how it makes money, from the "
+                                    "margin and turnover profile rather than from memory.\n"
+                                    "2. Valuation: what is being paid, against the sector and "
+                                    "against the company's own growth and returns. Reconcile "
+                                    "the multiples where they disagree.\n"
+                                    "3. Quality: is the return earned on operations or on "
+                                    "leverage — cite the DuPont split.\n"
+                                    "4. What the numbers cannot tell you, and which disclosure "
+                                    "would settle it.\n"
+                                    "5. The two or three things that would most change this "
+                                    "assessment, stated as checkable observations.\n\n"
+                                    "Rules: cite the specific figure behind every claim, with "
+                                    "the percentile where it matters. Never invent a number "
+                                    "that is not supplied — no revenue figures, segment splits, "
+                                    "management commentary or competitor names from memory. "
+                                    "Trailing multiples are meaningless on negative earnings; "
+                                    "say so instead of interpreting them. These figures are "
+                                    "unaudited and as current as the last filing. No price "
+                                    "target, no recommendation, no position sizing. If the "
+                                    "peer set is small, say the comparison is weak."
+                                )
+                                read = ai_agent.complete(
+                                    fund_system, json.dumps(ctx, default=str, indent=2),
+                                    max_tokens=10000, effort="high")
+                                st.markdown("---")
+                                st.markdown("### 🤖 Analyst read")
+                                st.markdown(read)
+                            except Exception as e:
+                                st.error(f"AI read failed: {type(e).__name__}: {e}")
 
 
 # -------- NEWS TAB --------

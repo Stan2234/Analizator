@@ -123,7 +123,8 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
         "tools": ["get_institution_filings", "get_institution_top_holdings",
                   "get_analyst_recommendations", "get_market_quote",
                   "get_company_news", "get_top_movers",
-                  "get_sector_performance", "search_universe"],
+                  "get_sector_performance", "search_universe",
+                  "get_fundamentals"],
         "system": (
             "You are a smart-money tracker. Surface what large institutions "
             "(JPMorgan, Goldman, BlackRock, Berkshire, Bridgewater, Renaissance, "
@@ -132,7 +133,12 @@ SUBAGENT_SPECS: List[Dict[str, Any]] = [
             "Form 4 for insider trades, 8-K for material events), top holdings, "
             "and analyst recommendation trends on the most-mentioned tickers. "
             "Look for signal: large new positions, concentrated exits, insider "
-            "clusters, analyst rating shifts. Be honest about 13F staleness."
+            "clusters, analyst rating shifts. Be honest about 13F staleness.\n\n"
+            "When a name matters to the story, pull its fundamentals with "
+            "peers=true and say what is being paid for it relative to its "
+            "sector. Smart-money flow without valuation context is half an "
+            "argument — a fund adding to a position tells you nothing until "
+            "you know whether it is buying growth, value or a falling knife."
         ),
         "default_task": (
             "Pull recent filings for 2-3 of the tracked institutions, surface "

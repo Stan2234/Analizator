@@ -168,7 +168,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_signal",
-        "description": "Get the latest technical signal (trend, RSI, MACD, BB, score, BUY/SELL recommendation) for a symbol.",
+        "description": "Latest technical indicator state for a symbol (trend, RSI, MACD, Bollinger, composite alignment score). This is descriptive, not predictive: walk-forward testing put its rank correlation with forward returns at +0.019 at 20 days, so report it as current indicator state and never as evidence for a directional call.",
         "input_schema": {
             "type": "object",
             "properties": {"symbol": {"type": "string"}},
@@ -246,6 +246,30 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "get_fundamentals",
+        "description": (
+            "Fundamental data for a listed company: valuation (P/E trailing and "
+            "forward, P/B, P/S, EV/EBITDA), profitability (gross, operating and net "
+            "margin, return on equity), growth (revenue and earnings), balance sheet "
+            "(debt/equity, current ratio, cash, debt, free cash flow), dividends, and "
+            "the analyst target. Set peers=true to also get the company's sector "
+            "median and its percentile within that sector — do this whenever the "
+            "question is whether something is cheap or expensive, because a multiple "
+            "on its own carries almost no information. Also returns a DuPont split of "
+            "return on equity and mechanical observations worth checking. Use for any "
+            "question about valuation, quality, profitability or financial health."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Ticker, e.g. AAPL"},
+                "peers": {"type": "boolean",
+                          "description": "Include sector median and percentile (slower)"}
+            },
             "required": ["symbol"]
         }
     },
@@ -409,6 +433,86 @@ def _tool_get_analyst_recommendations(args: Dict[str, Any]) -> Any:
     return src.fetch_finnhub_recommendation(api_key, args["symbol"])
 
 
+def _tool_get_fundamentals(args: Dict[str, Any]) -> Any:
+    """Company fundamentals, optionally with sector context.
+
+    The peer comparison is the expensive half — it fetches up to 40 sector
+    constituents — so it is opt-in. It is also the half that makes the numbers
+    mean anything, which is why the tool description pushes the model toward it
+    for any cheap/expensive question.
+    """
+    import fundamentals as fnd
+    try:
+        import yfinance as yf
+    except Exception as e:
+        return {"error": f"yfinance unavailable: {e}"}
+
+    symbol = str(args.get("symbol", "")).strip().upper()
+    if not symbol:
+        return {"error": "symbol is required"}
+
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception as e:
+        return {"error": f"lookup failed for {symbol}: {type(e).__name__}"}
+    if not info.get("marketCap"):
+        return {"error": f"no fundamental data for {symbol} — check the ticker, or "
+                         "the company may not report these fields"}
+
+    rec = fnd.normalise(info)
+    out: Dict[str, Any] = {
+        "symbol": symbol,
+        "name": rec.get("longName") or rec.get("shortName"),
+        "sector": rec.get("sector"),
+        "industry": rec.get("industry"),
+        "metrics": {k: v for k, v in rec.items() if not isinstance(v, (dict, list))},
+        "dupont": fnd.dupont(rec),
+        "observations": [f["text"] for f in fnd.quality_flags(rec)],
+        "range_position_pct": fnd.range_position(rec),
+        "caveats": ("Figures are unaudited and as current as the last filing. "
+                    "Trailing multiples are meaningless where earnings are negative. "
+                    "Forward multiples rest on sell-side estimates, which skew "
+                    "optimistic."),
+    }
+
+    if args.get("peers") and rec.get("sector"):
+        try:
+            # Yahoo's sector label is not the GICS name the universe indexes on.
+            sector = fnd.gics_sector(rec.get("sector"))
+            syms = [r["symbol"] for r in (dl.universe_by_sector(sector) or [])][:40]
+            if symbol not in syms:
+                syms = [symbol] + syms
+            rows = []
+            for s in syms:
+                try:
+                    i = yf.Ticker(s).info or {}
+                    if i.get("marketCap"):
+                        i["symbol"] = s
+                        rows.append(i)
+                except Exception:
+                    continue
+            peers = fnd.peer_frame(rows)
+            out["peer_sector"] = sector
+            out["peer_count"] = int(len(peers))
+            if len(peers) < fnd.MIN_PEERS:
+                out["peer_warning"] = (
+                    f"only {len(peers)} peers resolved in {sector} — too few for a "
+                    "meaningful median, so no percentiles are provided. Say the "
+                    "comparison is unavailable rather than reasoning from the raw "
+                    "multiples as if they were contextualised.")
+            elif not peers.empty and symbol in peers.index:
+                cmp_df = fnd.compare_to_peers(symbol, peers)
+                out["peer_comparison"] = cmp_df.drop(columns=["note"]).to_dict("records")
+                out["peer_note"] = ("percentile is oriented so 100 is the favourable "
+                                    "end; metrics with no favourable end (leverage, "
+                                    "beta, payout) carry directional=false and should "
+                                    "be read as a rank only")
+        except Exception as e:
+            out["peer_error"] = f"{type(e).__name__}: {e}"
+
+    return out
+
+
 def _tool_list_all_symbols(_args: Dict[str, Any]) -> Any:
     return [s["symbol"] for s in dl.all_latest_snapshots()]
 
@@ -498,6 +602,7 @@ TOOL_DISPATCH = {
     "get_institution_top_holdings": _tool_get_institution_top_holdings,
     "get_company_news":             _tool_get_company_news,
     "get_analyst_recommendations":  _tool_get_analyst_recommendations,
+    "get_fundamentals":             _tool_get_fundamentals,
     "list_all_symbols":             _tool_list_all_symbols,
     "get_db_health":                _tool_get_db_health,
     "get_sentiment_indexes":        _tool_get_sentiment_indexes,

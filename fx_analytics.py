@@ -702,3 +702,179 @@ def pair_snapshot(uv: pd.DataFrame, base: str, quote: str,
             out["dominant_driver"] = dom
 
     return out
+
+
+# --------------------------------------------------------------------------
+# Carry trade construction
+# --------------------------------------------------------------------------
+# A carry table says what a position pays. It does not say what the trade has
+# actually done, and those are different questions: carry accrues in a straight
+# line while the spot leg does not, so the equity curve is the only place the
+# real shape of the trade shows up — long quiet stretches of accrual broken by
+# short violent unwinds.
+
+def carry_leg_returns(uv: pd.DataFrame, rates: pd.DataFrame,
+                      target: str, funding: str,
+                      bars_per_year: int = FX_BARS_PER_YEAR) -> Optional[pd.Series]:
+    """Daily total return of long `target` funded in `funding`.
+
+    Two components: the spot move of the pair, and the interest differential
+    accrued per session. The differential is held at today's policy rates,
+    which is the simplification to flag — the real trade accrued yesterday's
+    rates, and around a policy turn that difference is exactly what matters.
+    It biases the curve toward the current regime.
+    """
+    px = cross(uv, target, funding)
+    if px.empty or len(px) < 30:
+        return None
+    r_t, r_f = rates["rate"].get(target), rates["rate"].get(funding)
+    if r_t is None or r_f is None or pd.isna(r_t) or pd.isna(r_f):
+        return None
+
+    spot = px.pct_change()
+    daily_carry = (float(r_t) - float(r_f)) / 100.0 / float(bars_per_year)
+    return (spot + daily_carry).dropna()
+
+
+def carry_basket(uv: pd.DataFrame, rates: pd.DataFrame, targets: List[str],
+                 funding: str = "JPY",
+                 trusted_only: bool = True) -> Dict[str, Any]:
+    """Equal-weighted basket of carry legs, funded in one currency.
+
+    Equal weights rather than yield weights: weighting by carry concentrates
+    the basket into whichever currency pays most, which is reliably the one
+    with the most to go wrong. The result is close to the trade a desk would
+    run, and its drawdowns are the ones it would have worn.
+    """
+    legs: Dict[str, pd.Series] = {}
+    skipped: List[str] = []
+
+    for t in targets:
+        if t == funding:
+            continue
+        if trusted_only and "status" in rates.columns:
+            if rates["status"].get(t) not in TRUSTED_RATE_STATUS:
+                skipped.append(t)
+                continue
+        r = carry_leg_returns(uv, rates, t, funding)
+        if r is None or r.empty:
+            skipped.append(t)
+            continue
+        legs[t] = r
+
+    if not legs:
+        return {"error": f"no usable legs against {funding}", "skipped": skipped}
+
+    frame = pd.DataFrame(legs).dropna(how="any")
+    if len(frame) < 60:
+        return {"error": "not enough overlapping history", "skipped": skipped}
+
+    basket = frame.mean(axis=1)
+    equity = (1.0 + basket).cumprod()
+    peak = equity.cummax()
+    dd = (equity / peak - 1.0) * 100.0
+
+    ann_ret = float(basket.mean() * FX_BARS_PER_YEAR * 100.0)
+    ann_vol = float(basket.std() * np.sqrt(FX_BARS_PER_YEAR) * 100.0)
+
+    return {
+        "legs": list(legs.keys()),
+        "skipped": skipped,
+        "returns": basket,
+        "equity": equity,
+        "drawdown": dd,
+        "total_return_pct": float((equity.iloc[-1] - 1.0) * 100.0),
+        "ann_return_pct": ann_ret,
+        "ann_vol_pct": ann_vol,
+        "return_to_vol": (ann_ret / ann_vol) if ann_vol > 0 else None,
+        "max_drawdown_pct": float(dd.min()),
+        "current_drawdown_pct": float(dd.iloc[-1]),
+        "n_bars": int(len(basket)),
+        "funding": funding,
+    }
+
+
+def worst_episodes(dd: pd.Series, n: int = 3, min_depth: float = -3.0) -> List[Dict[str, Any]]:
+    """The deepest distinct drawdowns, with when each began and how long it ran.
+
+    Carry unwinds are episodic, and the summary statistic hides them. Each
+    episode is bounded by the peak it fell from and the recovery back to it, so
+    two dips inside one drawdown are reported once rather than twice.
+    """
+    if dd is None or dd.empty:
+        return []
+
+    episodes, start = [], None
+    for ts, v in dd.items():
+        if v < 0 and start is None:
+            start = ts
+        elif v >= 0 and start is not None:
+            seg = dd.loc[start:ts]
+            episodes.append((start, ts, float(seg.min()), seg.idxmin()))
+            start = None
+    if start is not None:                       # still under water
+        seg = dd.loc[start:]
+        episodes.append((start, dd.index[-1], float(seg.min()), seg.idxmin()))
+
+    episodes = [e for e in episodes if e[2] <= min_depth]
+    episodes.sort(key=lambda e: e[2])
+    return [{
+        "start": s, "end": e, "trough": t, "depth_pct": d,
+        "days": int((e - s).days),
+        "ongoing": bool(e == dd.index[-1] and dd.iloc[-1] < 0),
+    } for s, e, d, t in episodes[:n]]
+
+
+# The conditions that have accompanied carry unwinds, reported individually and
+# measured. Deliberately not blended into a score: a composite here would be
+# the same unvalidated construct this project has spent its time removing, and
+# it would be read as a prediction of the one event it cannot predict.
+def unwind_conditions(uv: pd.DataFrame, drivers: pd.DataFrame,
+                      funding: str = "JPY",
+                      basket_targets: Optional[List[str]] = None,
+                      rates: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Measure the state of the three conditions that attend a carry unwind.
+
+    - **Funding-currency volatility.** An unwind is a scramble to buy back the
+      funding currency, so its volatility rises as the trade comes off.
+    - **Funding currency versus equities.** In calm the yen tracks rate
+      differentials. In an unwind it moves inversely to equities, because the
+      same deleveraging sells one and buys the other. A correlation turning
+      sharply negative is that mechanism becoming visible.
+    - **Return per unit of risk.** The compensation for holding the trade.
+      When it collapses, leveraged holders leave first.
+
+    None of this forecasts. All three were present in past unwinds and are also
+    present at times when nothing follows.
+    """
+    out: Dict[str, Any] = {"funding": funding}
+
+    fx_pair = cross(uv, funding, "USD")
+    if not fx_pair.empty:
+        r = np.log(fx_pair.astype(float)).diff().dropna()
+        roll = (r.rolling(21).std() * np.sqrt(FX_BARS_PER_YEAR) * 100).dropna()
+        if len(roll) > 60:
+            out["funding_vol"] = float(roll.iloc[-1])
+            out["funding_vol_pct"] = float((roll < roll.iloc[-1]).mean() * 100)
+            out["funding_vol_series"] = roll
+
+    spx_tkr = DRIVERS.get("S&P 500", {}).get("ticker")
+    if drivers is not None and not drivers.empty and spx_tkr in drivers.columns:
+        spx = pd.to_numeric(drivers[spx_tkr], errors="coerce")
+        r_spx = np.log(spx.where(spx > 0)).diff()
+        r_fx = np.log(cross(uv, funding, "USD").astype(float)).diff()
+        joined = pd.concat([r_fx, r_spx], axis=1).dropna()
+        if len(joined) > 90:
+            roll_c = joined.iloc[:, 0].rolling(63).corr(joined.iloc[:, 1]).dropna()
+            if not roll_c.empty:
+                out["equity_corr"] = float(roll_c.iloc[-1])
+                out["equity_corr_pct"] = float((roll_c < roll_c.iloc[-1]).mean() * 100)
+                out["equity_corr_series"] = roll_c
+
+    if rates is not None and basket_targets:
+        b = carry_basket(uv, rates, basket_targets, funding)
+        if "error" not in b:
+            out["basket_return_to_vol"] = b.get("return_to_vol")
+            out["basket_ann_vol"] = b.get("ann_vol_pct")
+
+    return out

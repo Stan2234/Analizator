@@ -3585,11 +3585,11 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-(tab_global, tab_fx, tab_crypto, tab_fund, tab_news, tab_quant, tab_ai,
- tab_fomc, tab_brief, tab_method) = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "🪙 Crypto (Binance)", "📐 Fundamentals",
-     "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab",
-     "🎯 Deep Brief", "📖 Methodology"]
+(tab_global, tab_fx, tab_carry, tab_crypto, tab_fund, tab_news, tab_quant,
+ tab_ai, tab_fomc, tab_brief, tab_method) = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🪙 Crypto (Binance)",
+     "📐 Fundamentals", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst",
+     "🏛 FOMC Lab", "🎯 Deep Brief", "📖 Methodology"]
 )
 
 # -------- GLOBAL TAB (Bloomberg-style dashboard) --------
@@ -4503,6 +4503,366 @@ with tab_fx:
                                 except Exception as e:
                                     st.error(f"AI read failed: {type(e).__name__}: {e}")
 
+
+
+# -------- CARRY TRADE TAB --------
+# The yen carry trade, built rather than described: the actual position, its
+# equity curve, and the conditions that have attended past unwinds. See
+# fx_analytics.carry_basket and unwind_conditions.
+
+with tab_carry:
+    if not _HAS_FXA:
+        st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
+    else:
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CARRY TRADE MONITOR</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">The position · what it has paid · what precedes an unwind</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+A carry trade borrows in a low-yielding currency and holds a higher-yielding
+one. The yen has been the classic funding leg for thirty years, which is why it
+is the default here — though the funding currency is selectable, because the
+franc has played the same role and the euro did for a stretch.
+
+The trade earns the rate differential every day and is exposed to the spot move
+of the pair. That asymmetry is its whole character: **carry accrues in a
+straight line, and the spot leg does not.** So the equity curve matters more
+than the yield, because it is the only place the real shape shows up — long
+quiet stretches of accrual broken by short violent unwinds.
+
+- **The position today** — what each leg pays, and what it has actually
+  returned once the spot move is netted off.
+- **The basket** — an equal-weighted version of the trade, with its equity
+  curve, drawdowns and worst episodes. Equal weights rather than yield weights:
+  weighting by carry concentrates into whichever currency pays most, which is
+  reliably the one with the most to go wrong.
+- **Unwind conditions** — the three things measured to have accompanied past
+  unwinds, reported separately.
+
+**There is deliberately no unwind score.** All three conditions were present
+before past unwinds and are also present at times when nothing follows;
+compressing them into one number would produce something that looks like a
+prediction of an event nothing here can predict. They are shown individually,
+against their own history, for a reader to weigh.
+
+**A simplification to keep in mind:** the carry accrual uses today's policy
+rates held constant across the whole history. The real trade accrued the rates
+prevailing at the time, so the curve is tilted toward the current regime, and
+that error is largest exactly where it matters most — around a policy turn.
+            """)
+
+        cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+        with cc1:
+            funding_ccy = st.selectbox(
+                "Funding currency", ["JPY", "CHF", "EUR", "USD"],
+                key="carry_funding", label_visibility="collapsed")
+        with cc2:
+            target_scope = st.radio("Targets", ["G10", "G10 + EM"], horizontal=True,
+                                    key="carry_scope", label_visibility="collapsed")
+        with cc3:
+            if st.button("🔄 Refresh", key="carry_refresh", use_container_width=True):
+                fx_load_prices.clear()
+
+        carry_targets = fxa.G10 if target_scope == "G10" else fxa.G10 + fxa.EM
+
+        with st.spinner("Loading FX universe…"):
+            c_prices, c_failed = fx_load_prices()
+
+        if c_prices.empty:
+            st.error("No FX data available — Yahoo returned no series.")
+        else:
+            c_uv = fxa.usd_values(c_prices)
+            c_rates = fxa.policy_rates(
+                get_secret("FRED_API_KEY"),
+                st.session_state.get("fx_rate_overrides") or {})
+            if c_failed:
+                st.caption(f"⚠️ No data for: {', '.join(c_failed)} — omitted.")
+
+            f_rate = c_rates["rate"].get(funding_ccy)
+            f_status = c_rates["status"].get(funding_ccy)
+            f_missing = f_rate is None or pd.isna(f_rate)
+            if f_missing:
+                st.error(
+                    f"No policy rate is available for {funding_ccy}, so no differential "
+                    "can be computed against it. Enter one in the Currencies → Carry "
+                    "panel and this page will populate."
+                )
+
+            ct1, ct2, ct3, ct4 = st.tabs([
+                "💴 The position", "📈 The basket", "🌡 Unwind conditions", "🤖 Desk read"])
+
+            # ═══════════════════════════════════════════════════
+            with ct1:
+                _fr = "rate unavailable" if f_missing else f"{f_rate:.2f}%"
+                st.markdown(f"##### Funding in {fxa.CURRENCIES[funding_ccy].flag} "
+                            f"{funding_ccy} at {_fr}")
+                if f_status not in fxa.TRUSTED_RATE_STATUS:
+                    st.warning(
+                        f"The {funding_ccy} policy rate has not been confirmed recently, so "
+                        "every differential on this page inherits that uncertainty. "
+                        "Correct it in the Currencies → Carry panel and this page "
+                        "recomputes."
+                    )
+
+                ct = fxa.carry_table(c_uv, c_rates, carry_targets, vs=funding_ccy)
+                if ct.empty:
+                    st.warning("No carry legs available for this combination.")
+                else:
+                    disp = ct.copy()
+                    disp["Currency"] = disp["flag"] + " " + disp.index
+                    disp["Rate"] = disp["rate_status"].map(
+                        {"live": "🟢", "verified": "🟢", "override": "✏️",
+                         "unverified": "🟠", "missing": "⚪"}).fillna("") + " " + \
+                        disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                    view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
+                                 "spot_1y", "total_1y", "regime"]].rename(columns={
+                        "carry": f"Carry vs {funding_ccy}", "vol_3m": "Vol (3m)",
+                        "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
+                        "total_1y": "Total (1y)", "regime": "Regime"})
+                    st.dataframe(
+                        view.style.apply(fx_heat_col, subset=["Total (1y)"]).format(
+                            {f"Carry vs {funding_ccy}": "{:+.2f}%", "Vol (3m)": "{:.1f}%",
+                             "Carry / vol": "{:.2f}", "Spot (1y ann.)": "{:+.1f}%",
+                             "Total (1y)": "{:+.1f}%"}, na_rep="—"),
+                        use_container_width=True, hide_index=True)
+                    st.caption(
+                        "**Carry** is what the differential pays per year. **Total** nets "
+                        "the realised spot move against it — the difference between the two "
+                        "columns is the whole risk of the trade. A currency flagged "
+                        "*managed* drifts far more than it wobbles, so its low volatility "
+                        "flatters carry-to-vol; read its total, not its ratio."
+                    )
+
+            # ═══════════════════════════════════════════════════
+            with ct2:
+                basket = fxa.carry_basket(c_uv, c_rates, carry_targets, funding=funding_ccy)
+                if "error" in basket:
+                    st.warning(
+                        f"Basket unavailable: {basket['error']}. "
+                        + (f"Legs skipped for want of a confirmed policy rate: "
+                           f"{', '.join(basket.get('skipped', []))}."
+                           if basket.get("skipped") else "")
+                    )
+                else:
+                    st.markdown(f"##### Equal-weighted basket funded in {funding_ccy}")
+                    st.caption(
+                        "Long " + ", ".join(f"{fxa.CURRENCIES[c].flag} {c}" for c in basket["legs"])
+                        + f" against {funding_ccy}, rebalanced to equal weight."
+                        + (f" Excluded for want of a confirmed policy rate: "
+                           f"{', '.join(basket['skipped'])}." if basket["skipped"] else "")
+                    )
+
+                    b1, b2, b3, b4, b5 = st.columns(5)
+                    b1.metric("Total return", f"{basket['total_return_pct']:+.1f}%")
+                    b2.metric("Annualised", f"{basket['ann_return_pct']:+.1f}%")
+                    b3.metric("Volatility", f"{basket['ann_vol_pct']:.1f}%")
+                    b4.metric("Return / vol",
+                              f"{basket['return_to_vol']:.2f}" if basket['return_to_vol'] else "—")
+                    b5.metric("Worst drawdown", f"{basket['max_drawdown_pct']:.1f}%",
+                              f"now {basket['current_drawdown_pct']:.1f}%")
+
+                    eq, dd = basket["equity"], basket["drawdown"]
+                    fig_b = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                          row_heights=[0.65, 0.35], vertical_spacing=0.08,
+                                          subplot_titles=("Growth of 1 unit",
+                                                          "Drawdown from peak (%)"))
+                    fig_b.add_trace(go.Scatter(
+                        x=eq.index, y=eq.values, name="Basket",
+                        line=dict(color="#00cc66", width=1.5),
+                        hovertemplate="%{x|%d %b %Y}<br>%{y:.3f}<extra></extra>"), row=1, col=1)
+                    fig_b.add_hline(y=1.0, line_dash="dot", line_color="#555", row=1, col=1)
+                    fig_b.add_trace(go.Scatter(
+                        x=dd.index, y=dd.values, name="Drawdown", fill="tozeroy",
+                        fillcolor="rgba(255,68,68,0.20)", line=dict(color="#ff4444", width=1),
+                        hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"), row=2, col=1)
+                    fig_b.update_layout(
+                        template="plotly_dark", height=500,
+                        margin=dict(l=0, r=0, t=34, b=0),
+                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                        showlegend=False, hovermode="x unified")
+                    for ann in fig_b.layout.annotations[:2]:
+                        ann.font.size, ann.font.color = 12, "#bbb"
+                        ann.xanchor, ann.x = "left", 0
+                    fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="× initial", row=1, col=1)
+                    fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="%", row=2, col=1)
+                    fig_b.update_xaxes(gridcolor="#1a1a1a")
+                    st.plotly_chart(fig_b, use_container_width=True)
+                    st.caption(
+                        "The shape is the point. Carry accrues steadily and the spot leg "
+                        "does not, so the curve climbs quietly and falls abruptly — the "
+                        "drawdowns below are where the accrued profit went."
+                    )
+
+                    eps = fxa.worst_episodes(dd, n=4)
+                    if eps:
+                        st.markdown("##### Worst episodes")
+                        st.dataframe(pd.DataFrame([{
+                            "From": str(e["start"])[:10],
+                            "Trough": str(e["trough"])[:10],
+                            "Recovered": "still under water" if e["ongoing"] else str(e["end"])[:10],
+                            "Depth": f"{e['depth_pct']:.1f}%",
+                            "Days": e["days"],
+                        } for e in eps]), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "Bounded by the peak each fell from and the recovery back to it, "
+                            "so two dips inside one drawdown are counted once. The duration "
+                            "column is usually the harder constraint to hold through."
+                        )
+
+            # ═══════════════════════════════════════════════════
+            with ct3:
+                cond = fxa.unwind_conditions(
+                    c_uv, c_prices, funding=funding_ccy,
+                    basket_targets=carry_targets, rates=c_rates)
+
+                st.markdown(f"##### The three conditions, measured — {funding_ccy} funding")
+                st.caption(
+                    "Each is a fact about the present, shown against its own history. "
+                    "They are not combined, and none of them predicts: all three were "
+                    "present before past unwinds and are also present at times when "
+                    "nothing follows."
+                )
+
+                u1, u2, u3 = st.columns(3)
+                fv, fvp = cond.get("funding_vol"), cond.get("funding_vol_pct")
+                u1.metric(f"{funding_ccy} volatility",
+                          f"{fv:.1f}%" if fv is not None else "—",
+                          f"{fvp:.0f}th percentile" if fvp is not None else None)
+                ec, ecp = cond.get("equity_corr"), cond.get("equity_corr_pct")
+                u2.metric(f"{funding_ccy} vs S&P 500",
+                          f"{ec:+.2f}" if ec is not None else "—",
+                          f"{ecp:.0f}th percentile" if ecp is not None else None)
+                rv = cond.get("basket_return_to_vol")
+                u3.metric("Basket return / vol", f"{rv:.2f}" if rv is not None else "—")
+
+                st.markdown(f"""
+- **{funding_ccy} volatility.** An unwind is a scramble to buy back the funding
+  currency, so its volatility rises as the trade comes off. A high percentile
+  means the funding leg is already moving more than usual.
+- **{funding_ccy} against equities.** In calm conditions the funding currency
+  tracks rate differentials. In an unwind it moves *inversely* to equities,
+  because the same deleveraging sells one and buys the other. A correlation
+  turning sharply negative is that mechanism becoming visible.
+- **Return per unit of risk.** What the basket compensates you for holding it.
+  When this collapses, leveraged holders leave first — which is what turns an
+  ordinary drawdown into a disorderly one.
+                """)
+
+                vs = cond.get("funding_vol_series")
+                cs = cond.get("equity_corr_series")
+                if vs is not None and not vs.empty:
+                    fig_u = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
+                        subplot_titles=(f"{funding_ccy}/USD realised volatility, 21-day (% ann.)",
+                                        f"{funding_ccy}/USD vs S&P 500 — 63-day rolling correlation"))
+                    fig_u.add_trace(go.Scatter(x=vs.index, y=vs.values, name="vol",
+                                               line=dict(color="#ffaa00", width=1.2)), row=1, col=1)
+                    if cs is not None and not cs.empty:
+                        fig_u.add_trace(go.Scatter(x=cs.index, y=cs.values, name="corr",
+                                                   line=dict(color="#4488ff", width=1.2)), row=2, col=1)
+                        fig_u.add_hline(y=0, line_dash="dot", line_color="#555", row=2, col=1)
+                    fig_u.update_layout(
+                        template="plotly_dark", height=460,
+                        margin=dict(l=0, r=0, t=34, b=0),
+                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                        showlegend=False, hovermode="x unified")
+                    for ann in fig_u.layout.annotations[:2]:
+                        ann.font.size, ann.font.color = 12, "#bbb"
+                        ann.xanchor, ann.x = "left", 0
+                    fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=1, col=1)
+                    fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="ρ",
+                                       range=[-1, 1], row=2, col=1)
+                    fig_u.update_xaxes(gridcolor="#1a1a1a")
+                    st.plotly_chart(fig_u, use_container_width=True)
+
+                ev = fxa.fx_event_risk(fx_econ_events(), [funding_ccy] + carry_targets, 14)
+                st.markdown("##### Policy events in the next 14 days")
+                if ev.empty:
+                    st.caption("No tier-1 releases scheduled for the currencies in this trade.")
+                else:
+                    evs = ev.copy()
+                    evs["Event"] = evs["flag"] + " " + evs["event"]
+                    evs["Type"] = evs["is_cb"].map({True: "🏛 Central bank", False: "📊 Data"})
+                    st.dataframe(evs[["date", "ccy", "Event", "Type"]].rename(
+                        columns={"date": "Date", "ccy": "Ccy"}),
+                        use_container_width=True, hide_index=True)
+                    st.caption("A funding-currency policy decision is the single event most "
+                               "capable of repricing this trade in one session.")
+
+            # ═══════════════════════════════════════════════════
+            with ct4:
+                st.caption("Reads the measured figures above. It has no positioning data, "
+                           "no options pricing and no flow — say so if the question needs them.")
+                if st.button("▶ Read the carry trade", type="primary", key="carry_ai"):
+                    _err = ai_unavailable()
+                    if _err:
+                        st.error(f"AI read unavailable: {_err}.")
+                    else:
+                        with st.spinner("Reading…"):
+                            try:
+                                _b = fxa.carry_basket(c_uv, c_rates, carry_targets,
+                                                      funding=funding_ccy)
+                                ctx = {
+                                    "funding_currency": funding_ccy,
+                                    "funding_rate": f_rate,
+                                    "funding_rate_status": f_status,
+                                    "carry_legs": (
+                                        fxa.carry_table(c_uv, c_rates, carry_targets,
+                                                        vs=funding_ccy)
+                                        .drop(columns=["name", "flag"], errors="ignore")
+                                        .reset_index().to_dict("records")),
+                                    "basket": {k: v for k, v in _b.items()
+                                               if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                    "worst_episodes": [
+                                        {**e, "start": str(e["start"])[:10],
+                                         "end": str(e["end"])[:10],
+                                         "trough": str(e["trough"])[:10]}
+                                        for e in fxa.worst_episodes(_b["drawdown"], 4)
+                                    ] if "error" not in _b else [],
+                                    "unwind_conditions": {
+                                        k: v for k, v in cond.items()
+                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                    "events": ev.to_dict("records") if not ev.empty else [],
+                                }
+                                sysmsg = (
+                                    "You are an FX strategist writing on the carry trade for "
+                                    "a portfolio manager. You are given the funding rate, each "
+                                    "leg's differential and realised spot move, an equal-weighted "
+                                    "basket with its equity curve statistics and worst drawdown "
+                                    "episodes, three measured unwind conditions with their "
+                                    "historical percentiles, and the policy calendar.\n\n"
+                                    "Write:\n"
+                                    "1. What the trade currently pays, and what it has actually "
+                                    "returned once spot is netted off. Those differ, and the "
+                                    "difference is the argument.\n"
+                                    "2. Where the risk sits — which leg carries it and why. "
+                                    "Note any leg flagged as a managed regime: its volatility "
+                                    "understates the risk, so its carry-to-vol flatters it.\n"
+                                    "3. What the three unwind conditions currently say, one by "
+                                    "one, against their own history. Do not aggregate them into "
+                                    "a verdict.\n"
+                                    "4. What the drawdown history implies about how this trade "
+                                    "fails — the shape and duration, not just the depth.\n"
+                                    "5. What on the calendar could reprice it.\n\n"
+                                    "Rules: cite the numbers. The basket holds today's policy "
+                                    "rates constant across its whole history, so say the curve "
+                                    "is tilted toward the current regime — that error is largest "
+                                    "around a policy turn. Attach no probability to an unwind; "
+                                    "nothing here produces one. You have no positioning, options "
+                                    "or flow data — name that as a gap rather than working "
+                                    "around it. No position sizing, no recommendation."
+                                )
+                                read = ai_agent.complete(
+                                    sysmsg, json.dumps(ctx, default=str, indent=2),
+                                    max_tokens=9000, effort="high")
+                                st.markdown("---")
+                                st.markdown(read)
+                            except Exception as e:
+                                st.error(f"AI read failed: {type(e).__name__}: {e}")
 
 
 # -------- CRYPTO TAB --------

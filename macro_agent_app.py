@@ -3545,7 +3545,9 @@ with tab_fx:
             if fx_failed:
                 st.caption(f"⚠️ No data for: {', '.join(fx_failed)} — those rows are omitted.")
 
-            fx_rates = fxa.policy_rates(get_secret("FRED_API_KEY"))
+            # Rate corrections entered in the Carry tab survive reruns.
+            fx_rate_overrides = st.session_state.setdefault("fx_rate_overrides", {})
+            fx_rates = fxa.policy_rates(get_secret("FRED_API_KEY"), fx_rate_overrides)
 
             fxt1, fxt2, fxt3, fxt4, fxt5 = st.tabs([
                 "🌐 Strength Board", "💰 Carry", "📉 Vol & Correlation",
@@ -3675,16 +3677,19 @@ with tab_fx:
 
                     disp = ct.copy()
                     disp.insert(0, "Currency", disp["flag"] + " " + disp.index)
-                    view = disp[["Currency", "rate", "carry", "vol_3m", "carry_to_vol",
+                    disp["Rate"] = disp["rate_status"].map(
+                        {"live": "🟢", "verified": "🟢", "override": "✏️",
+                         "unverified": "🟠", "missing": "⚪"}).fillna("") + " " +                         disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                    view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
                                  "spot_1y", "total_1y", "regime", "as_of"]].rename(columns={
-                        "rate": "Policy rate", "carry": "Carry vs USD", "vol_3m": "Vol (3m)",
+                        "carry": "Carry vs USD", "vol_3m": "Vol (3m)",
                         "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
                         "total_1y": "Total (1y)", "regime": "Regime", "as_of": "Rate as of",
                     })
                     st.dataframe(
                         view.style
                         .apply(fx_heat_col, subset=["Total (1y)"])
-                        .format({"Policy rate": "{:.2f}%", "Carry vs USD": "{:+.2f}%",
+                        .format({"Carry vs USD": "{:+.2f}%",
                                  "Vol (3m)": "{:.1f}%", "Carry / vol": "{:.2f}",
                                  "Spot (1y ann.)": "{:+.1f}%", "Total (1y)": "{:+.1f}%"},
                                 na_rep="—"),
@@ -3725,22 +3730,72 @@ with tab_fx:
                         st.caption("Up and to the left is the attractive quadrant — paid to wait, "
                                    "without much to endure. Red points sit there for the wrong reason.")
 
-                    with st.expander("Policy rate sources and vintage"):
-                        prov = fx_rates.loc[[c for c in fx_codes if c in fx_rates.index]].copy()
-                        prov["flag"] = [fxa.CURRENCIES[c].flag for c in prov.index]
-                        prov.insert(0, "Currency", prov["flag"] + " " + prov.index)
-                        st.dataframe(
-                            prov[["Currency", "rate", "as_of", "source", "stale_days"]].rename(
-                                columns={"rate": "Rate", "as_of": "Effective from",
-                                         "source": "Source", "stale_days": "Days since"}),
-                            use_container_width=True, hide_index=True,
+                    n_unver = int((ct["rate_status"] == "unverified").sum()) if "rate_status" in ct else 0
+                    if n_unver:
+                        st.info(
+                            f"{n_unver} of these rest on a policy rate that has not been "
+                            "confirmed recently. They are shown but ranked last, and are not "
+                            "used to draw conclusions. Correct any of them below and every "
+                            "carry number on this page recomputes."
                         )
+
+                    with st.expander("Policy rates — source, vintage, and corrections",
+                                     expanded=bool(n_unver)):
                         st.caption(
-                            "Rates marked *manual table* are maintained in `fx_analytics.py` and do "
-                            "not update themselves. Check any whose **Days since** has run past the "
-                            "central bank's latest meeting — a stale rate silently corrupts every "
-                            "carry number on this page."
+                            "FRED supplies the dollar and euro legs daily. It has no clean "
+                            "series for the rest — its other policy-rate entries are monthly "
+                            "interbank proxies, not the rate a desk funds at — so those are "
+                            "seeded by hand and carry the date they were last confirmed "
+                            "against the central bank. Anything unconfirmed for more than "
+                            f"{fxa.VERIFICATION_MAX_AGE_DAYS} days is marked **unverified**: "
+                            "most central banks meet eight times a year, so a quarter is "
+                            "already a meeting or two of drift."
                         )
+
+                        prov = fx_rates.loc[[c for c in fx_codes if c in fx_rates.index]].copy()
+                        badge = {"live": "🟢 live (FRED)", "verified": "🟢 confirmed",
+                                 "override": "✏️ entered here", "unverified": "🟠 unverified",
+                                 "missing": "⚪ none"}
+                        edit = pd.DataFrame({
+                            "Currency": [f"{fxa.CURRENCIES[c].flag} {c}" for c in prov.index],
+                            "Rate %": prov["rate"],
+                            "Status": prov["status"].map(badge).fillna(prov["status"]),
+                            "Effective from": prov["as_of"],
+                            "What it is": prov["note"].fillna(""),
+                            "Source": prov["source"].fillna(""),
+                        })
+                        edited = st.data_editor(
+                            edit, use_container_width=True, hide_index=True,
+                            key="fx_rate_editor",
+                            disabled=["Currency", "Status", "Effective from",
+                                      "What it is", "Source"],
+                            column_config={"Rate %": st.column_config.NumberColumn(
+                                "Rate %", help="Type the current policy rate to override it",
+                                format="%.2f", step=0.05)},
+                        )
+
+                        changed = {}
+                        for code, new_rate in zip(prov.index, edited["Rate %"]):
+                            old = prov["rate"].get(code)
+                            if pd.isna(new_rate):
+                                continue
+                            if old is None or pd.isna(old) or abs(float(new_rate) - float(old)) > 1e-9:
+                                changed[code] = float(new_rate)
+
+                        bc1, bc2 = st.columns([1, 3])
+                        with bc1:
+                            if st.button("Apply corrections", key="fx_rate_apply",
+                                         type="primary", use_container_width=True,
+                                         disabled=not changed):
+                                fx_rate_overrides.update(changed)
+                                st.rerun()
+                        with bc2:
+                            if fx_rate_overrides:
+                                st.caption("Overridden: " + ", ".join(
+                                    f"{c} {v:.2f}%" for c, v in sorted(fx_rate_overrides.items())))
+                                if st.button("Clear overrides", key="fx_rate_clear"):
+                                    fx_rate_overrides.clear()
+                                    st.rerun()
 
             # ═══════════════════════════════════════════════════════
             # 3. VOL & CORRELATION

@@ -96,59 +96,122 @@ FRED_POLICY_SERIES: Dict[str, str] = {
     "EUR": "ECBDFR",   # ECB deposit facility rate, daily
 }
 
-# Fallbacks: policy rate (%) and the date that decision took effect.
-POLICY_RATE_FALLBACK: Dict[str, Tuple[float, str]] = {
-    "USD": (3.75, "2025-12-10"),
-    "EUR": (2.00, "2025-06-11"),
-    "JPY": (0.75, "2025-12-19"),
-    "GBP": (3.75, "2025-12-18"),
-    "CHF": (0.00, "2025-06-19"),
-    "AUD": (3.60, "2025-08-12"),
-    "CAD": (2.25, "2025-09-17"),
-    "NZD": (2.25, "2025-11-26"),
-    "SEK": (1.75, "2025-06-18"),
-    "NOK": (4.00, "2025-09-18"),
-    "CNY": (3.00, "2025-05-20"),
-    "MXN": (7.25, "2025-12-18"),
-    "ZAR": (6.75, "2025-11-20"),
-    "BRL": (15.00, "2025-06-18"),
-    "INR": (5.50, "2025-06-06"),
-    "TRY": (39.50, "2025-12-11"),
-    "PLN": (4.25, "2025-11-05"),
+# FRED carries daily series for those two and nothing clean for the rest — its
+# other "policy rate" entries are monthly interbank proxies, not the rate a
+# desk funds at. So the remainder is seeded by hand.
+#
+# A seeded rate is a claim, and an unverified claim on a carry screen is worse
+# than a blank: it is checkable, and a bank analyst will check it. Each entry
+# therefore records when it was last confirmed against the central bank, and
+# anything without a recent confirmation is published as unverified and kept
+# out of the rankings rather than quietly averaged into them.
+#
+# Verified 2026-08-16. Re-confirm before relying on any of these.
+SEED_VERIFIED_ON = "2026-08-16"
+
+POLICY_RATE_SEED: Dict[str, Dict[str, Any]] = {
+    # code:  rate,  effective from,  confirmed on,      what the number is
+    "USD": {"rate": 4.50,  "effective": "2026-03-18", "verified": SEED_VERIFIED_ON,
+            "note": "Fed target range upper bound"},
+    "EUR": {"rate": 2.25,  "effective": "2026-07-23", "verified": SEED_VERIFIED_ON,
+            "note": "ECB deposit facility rate"},
+    "JPY": {"rate": 1.00,  "effective": "2026-06-16", "verified": SEED_VERIFIED_ON,
+            "note": "BoJ short-term policy rate"},
+    "TRY": {"rate": 37.00, "effective": "2026-08-01", "verified": SEED_VERIFIED_ON,
+            "note": "CBRT one-week repo"},
+    "BRL": {"rate": 14.25, "effective": "2026-06-18", "verified": SEED_VERIFIED_ON,
+            "note": "Selic target"},
+    "MXN": {"rate": 6.50,  "effective": "2026-06-26", "verified": SEED_VERIFIED_ON,
+            "note": "Banxico overnight"},
+    # Not confirmed at the last review — shown, but excluded from rankings.
+    "GBP": {"rate": 4.50,  "effective": "2026-03-19", "verified": None,
+            "note": "BoE Bank Rate"},
+    "CHF": {"rate": 0.25,  "effective": "2026-03-20", "verified": None,
+            "note": "SNB policy rate"},
+    "AUD": {"rate": 4.10,  "effective": "2026-04-01", "verified": None,
+            "note": "RBA cash rate"},
+    "CAD": {"rate": 2.75,  "effective": "2026-03-12", "verified": None,
+            "note": "BoC overnight target"},
+    "NZD": {"rate": 3.50,  "effective": "2026-04-09", "verified": None,
+            "note": "RBNZ official cash rate"},
+    "SEK": {"rate": 2.25,  "effective": "2026-03-20", "verified": None,
+            "note": "Riksbank policy rate"},
+    "NOK": {"rate": 4.25,  "effective": "2026-03-27", "verified": None,
+            "note": "Norges Bank policy rate"},
+    "CNY": {"rate": 3.10,  "effective": "2026-03-20", "verified": None,
+            "note": "PBoC 1y LPR"},
+    "ZAR": {"rate": 7.25,  "effective": "2026-03-20", "verified": None,
+            "note": "SARB repo rate"},
+    "INR": {"rate": 6.00,  "effective": "2026-04-09", "verified": None,
+            "note": "RBI repo rate"},
+    "PLN": {"rate": 5.75,  "effective": "2026-03-05", "verified": None,
+            "note": "NBP reference rate"},
 }
 
+# A confirmation older than this is treated as no confirmation. Most central
+# banks meet eight times a year, so a quarter is already a meeting or two.
+VERIFICATION_MAX_AGE_DAYS = 90
 
-def policy_rates(fred_key: str = "") -> pd.DataFrame:
-    """Current policy rate per currency, with provenance.
 
-    Columns: ccy, rate, as_of, source, stale_days. Callers should surface
-    `source` and `stale_days` — a hand-maintained rate that has drifted past a
-    central bank meeting is exactly the kind of number that quietly poisons a
-    carry screen.
+def policy_rates(fred_key: str = "",
+                 overrides: Optional[Dict[str, float]] = None) -> pd.DataFrame:
+    """Current policy rate per currency, with provenance and a trust flag.
+
+    Columns: rate, as_of, source, stale_days, note, status.
+
+    `status` is what callers should gate on:
+      live       — pulled from FRED this run
+      verified   — hand-seeded and confirmed within VERIFICATION_MAX_AGE_DAYS
+      override   — supplied by the caller, e.g. corrected in the UI
+      unverified — seeded but not recently confirmed; display, do not rank on
+      missing    — no rate at all
+
+    `overrides` maps a currency code to a rate the user has entered, which
+    always wins. Rates change a handful of times a year at unpredictable
+    moments; letting someone correct one in place beats shipping a stale
+    constant and hoping nobody checks.
     """
-    import sources as src  # imported lazily; module must stay importable offline
+    import sources as src  # lazy; the module must stay importable offline
 
     today = dt.date.today()
+    overrides = overrides or {}
     rows = []
+
     for code in CURRENCIES:
-        rate, as_of, source = None, None, None
+        rate = as_of = source = note = None
+        status = "missing"
 
         series = FRED_POLICY_SERIES.get(code)
         if series and fred_key:
             try:
                 obs = src.fetch_fred_observations(fred_key, series, limit=10)
-                for o in obs:  # newest first; skip FRED's "." for missing
+                for o in obs:  # newest first; FRED writes "." for missing
                     if o.get("value") not in (None, "", "."):
-                        rate = float(o["value"])
-                        as_of = o.get("date")
-                        source = f"FRED:{series}"
+                        rate, as_of = float(o["value"]), o.get("date")
+                        source, status = f"FRED:{series}", "live"
                         break
             except Exception:
                 log.exception("FRED policy rate failed for %s", code)
 
-        if rate is None and code in POLICY_RATE_FALLBACK:
-            rate, as_of = POLICY_RATE_FALLBACK[code]
-            source = "manual table"
+        if rate is None and code in POLICY_RATE_SEED:
+            seed = POLICY_RATE_SEED[code]
+            rate, as_of, note = seed["rate"], seed["effective"], seed.get("note")
+            source = "seeded"
+            verified = seed.get("verified")
+            status = "unverified"
+            if verified:
+                try:
+                    age = (today - dt.date.fromisoformat(verified)).days
+                    if age <= VERIFICATION_MAX_AGE_DAYS:
+                        status = "verified"
+                        source = f"seeded, confirmed {verified}"
+                except Exception:
+                    pass
+
+        if code in overrides and overrides[code] is not None:
+            rate = float(overrides[code])
+            source, status = "entered in app", "override"
+            as_of = today.isoformat()
 
         stale = None
         if as_of:
@@ -157,9 +220,13 @@ def policy_rates(fred_key: str = "") -> pd.DataFrame:
             except Exception:
                 stale = None
 
-        rows.append({"ccy": code, "rate": rate, "as_of": as_of,
-                     "source": source, "stale_days": stale})
+        rows.append({"ccy": code, "rate": rate, "as_of": as_of, "source": source,
+                     "stale_days": stale, "note": note, "status": status})
+
     return pd.DataFrame(rows).set_index("ccy")
+
+
+TRUSTED_RATE_STATUS = ("live", "verified", "override")
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +462,12 @@ def carry_table(uv: pd.DataFrame, rates: pd.DataFrame, codes: List[str],
             elif drift_to_vol >= 1.0:
                 regime = "heavily trending"
 
+        # Both legs must be trustworthy: the differential is only as sound as
+        # the weaker of the two rates behind it.
+        st_base = rates["status"].get(code) if "status" in rates.columns else "verified"
+        st_quote = rates["status"].get(vs) if "status" in rates.columns else "verified"
+        trusted = (st_base in TRUSTED_RATE_STATUS) and (st_quote in TRUSTED_RATE_STATUS)
+
         rows.append({
             "ccy": code,
             "name": CURRENCIES[code].name,
@@ -407,16 +480,20 @@ def carry_table(uv: pd.DataFrame, rates: pd.DataFrame, codes: List[str],
             "total_1y": (carry + spot_1y) if spot_1y is not None else None,
             "drift_to_vol": drift_to_vol,
             "regime": regime,
+            "rate_status": st_base,
+            "trusted": trusted,
             "as_of": rates["as_of"].get(code),
             "stale_days": rates["stale_days"].get(code),
         })
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # Rank by what the trade actually paid, not by the ratio that a managed
-    # currency games.
-    return df.set_index("ccy").sort_values("total_1y", ascending=False,
-                                           na_position="last")
+    df = df.set_index("ccy")
+    # Trusted rows rank first, then by what the trade actually paid — not by
+    # the ratio a managed currency games. Rows resting on an unconfirmed rate
+    # stay visible but sink below the ones that can be defended.
+    return df.sort_values(["trusted", "total_1y"], ascending=[False, False],
+                          na_position="last")
 
 
 # --------------------------------------------------------------------------

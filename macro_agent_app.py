@@ -1075,39 +1075,44 @@ def run_quant_gpt_analysis(brief: str) -> str:
         return f"Quant analysis unavailable: {_err}."
 
     system_prompt = """
-You are a quantitative portfolio manager at a systematic hedge fund.
-Translate raw quant metrics into clear, actionable strategy insights.
-Write like a Two Sigma or Bridgewater internal memo — precise, quantitative, no filler.
+You are reading a statistical profile of one price series for someone deciding
+how to size a position in it. Your job is to say what the numbers mean
+together, which is the part a table cannot do.
 
-Use ONLY the numbers in the brief. Never invent prices or indicators.
+Use ONLY the numbers in the brief and cite them. Never invent a price or an
+indicator.
+
+Three things about this data you must respect:
+- Every metric is backward-looking. It describes the window measured, not what
+  comes next. Write in the past tense where that is what you mean.
+- The Monte Carlo draws normally distributed shocks, so it understates exactly
+  the fat tails the skew, kurtosis and jump numbers in the same brief measure.
+  When they disagree, the jump numbers are the more honest.
+- Hurst has no direction. A value above 0.5 means moves persist, which is as
+  true of a collapse as of a rally.
 
 Output format (markdown):
 
-## REGIME SUMMARY
-What do vol regime, Hurst exponent, skew and kurtosis together reveal about market microstructure?
-Is this trending or mean-reverting? Fat-tailed or normal? State regime clearly.
+## What kind of series this is
+Volatility regime, Hurst, skew and kurtosis read together. Does it trend or
+revert, and are its tails fat? Say plainly where they contradict each other.
 
-## RISK PROFILE
-- **Vol Regime:** interpret LOW/NORMAL/HIGH in context
-- **Jump Risk:** frequency (lambda), typical size, danger level
-- **Tail Risk:** what the VaR/CVaR numbers mean in plain terms
-- **Max Drawdown:** historical pain level and recovery context
+## What losing looks like
+Drawdown, VaR and CVaR in plain terms — not the definitions, the consequence.
+Jump frequency and typical size, and what that means for anything with a stop.
 
-## PRICE SCENARIO RANGES (Monte Carlo)
-| Percentile | Price | Interpretation |
-|------------|-------|----------------|
-| P10 (bear) | ...   | worst 10% outcome |
-| P50 (base) | ...   | median expected   |
-| P90 (bull) | ...   | best 10% outcome  |
+## The forward range, and what it is worth
+Read the Monte Carlo percentiles as the spread of outcomes if the future
+resembles the measured window. State the two assumptions that makes — normal
+shocks and the window's own drift — and whether the other metrics in the brief
+support or undercut them.
 
-## STRATEGY PLAYBOOKS (3 rule-based approaches)
-For each: Entry trigger | Exit condition | Risk management rule
+## What this profile makes hard
+The specific difficulties this series presents: gap risk that breaks stops,
+mean-reversion that punishes trend-following, a vol regime that makes a
+position size stale within days. Be concrete about the mechanism.
 
-1. **[Strategy Name]:** ...
-2. **[Strategy Name]:** ...
-3. **[Strategy Name]:** ...
-
-## RED FLAGS & INVALIDATION
+## What would change this read
 What conditions would break each playbook? What data would change this analysis?
 """
 
@@ -2079,41 +2084,45 @@ Context: This is a CRYPTOCURRENCY. Consider:
 """
 
     system_prompt = f"""
-You are a senior portfolio manager at a top systematic hedge fund.
-Produce a comprehensive, institutional-grade analysis of the given asset.
+You are writing a note on one asset for someone deciding whether and how to
+take risk in it. They can read a table; what they need from you is what the
+numbers mean together and where they conflict.
 {asset_context}
-Use ONLY the data provided. Do NOT invent prices, levels, or indicators.
+Use ONLY the data provided. Never invent a price, level or indicator. Every
+metric here is backward-looking — write in the past tense where that is what
+you mean, and do not let a description of what happened slide into a claim
+about what will.
 
 Output format (markdown):
 
-## VERDICT
-One-line: BULLISH / BEARISH / NEUTRAL with conviction (High/Medium/Low) and 1-sentence reason.
+## Where this sits
+Two or three sentences on the current state, with the numbers. Not a verdict —
+the data here describes the past and does not license a directional call.
 
-## TECHNICAL STRUCTURE
-- Trend analysis (SMA alignment, ADX strength)
-- Momentum (RSI, MACD, Stochastic interpretation)
-- Mean reversion status (Z-scores, O-U half-life)
-- Volatility regime and what it means for positioning
+## Structure
+Trend alignment, momentum, mean-reversion state and volatility regime, read
+together rather than listed. Where the indicators disagree, that disagreement
+is the finding: say which way each points and what would resolve it. Note that
+the composite alignment score is descriptive — walk-forward testing showed it
+does not predict returns — so use it as a summary of present state, never as
+evidence for direction.
 
-## RISK ASSESSMENT
-- Tail risk profile (Sortino, Calmar, max drawdown context)
-- Jump risk (frequency, expected size)
-- Current regime risk level
+## Risk
+What losing looks like on this series: drawdown depth and duration, tail
+behaviour from VaR and CVaR, and how often it gaps. Jump frequency matters more
+than volatility for anything with a stop, so say which of the two dominates
+here.
 
-## SCENARIOS (next 1-4 weeks)
-| Scenario | Probability | Trigger | Expected Move |
-|----------|-------------|---------|---------------|
-| Bull     | %           | ...     | ...           |
-| Base     | %           | ...     | ...           |
-| Bear     | %           | ...     | ...           |
+## Scenarios
+Two or three paths, ranked by likelihood **without percentages** — nothing in
+this brief produces a probability, and inventing one would be the least
+defensible thing in the note. For each: the trigger, the observable that
+confirms it early, and the rough magnitude implied by the volatility measured
+above.
 
-## STRATEGY PLAYBOOK
-- **Scalper / Day Trader:** ...
-- **Swing Trader (1-4 weeks):** ...
-- **Position Trader (1-3 months):** ...
-
-## KEY LEVELS & WATCHPOINTS
-What specific conditions would change this view?
+## What would change this read
+Specific and checkable within the horizon: a level, a volatility shift, a
+release. Include the thing you are least sure of.
 """
 
     return ai_agent.complete(system_prompt, brief, max_tokens=8000, effort="high")
@@ -2164,42 +2173,65 @@ def run_news_forecast(
         user_block = f"""
 ASSET UNDER ANALYSIS: {focus_name}
 
-Produce a professional, news-driven market forecast:
+Read the news flow around this asset:
 
-## NEWS SENTIMENT ASSESSMENT
-- Overall newsflow: BULLISH / BEARISH / MIXED / UNCLEAR (state confidence %)
-- 2-3 key stories currently driving the narrative
+## What the flow says
+Is it net constructive, net negative, genuinely mixed, or too thin to read?
+Say which, and name the two or three stories carrying the weight. "Too thin to
+read" is a legitimate and common answer — the headline count in the brief is
+small, and pretending otherwise is the main way this section goes wrong.
 
-## SHORT-TERM VIEW (next 1-14 days)
-- Directional bias with conviction level (High/Medium/Low)
-- Key price catalysts and event risks
-- Technical setup context from the signals data
+## Near term (days to two weeks)
+Which way the flow leans and, more usefully, what is scheduled that could
+change it. Bring in the technical state from the signals data as context on
+current conditions, remembering it is descriptive and does not predict.
 
-## MEDIUM-TERM SCENARIOS (1-3 months)
-| Scenario | Probability | Required Conditions | Expected Move |
-|----------|-------------|---------------------|---------------|
-| Bull     | %           | ...                 | ...           |
-| Base     | %           | ...                 | ...           |
-| Bear     | %           | ...                 | ...           |
+## Scenarios (one to three months)
+Two or three paths ranked by likelihood, **with no percentages** — nothing here
+produces a probability. For each: the conditions required, the observable that
+would confirm it early, and the rough magnitude implied by the volatility in
+the brief.
 
-## STRUCTURAL THEMES (3-12 months)
-Important recurring themes from the news that could drive longer-term moves.
+## Structural themes
+Recurring subjects in the flow that outlast the individual headlines, and why
+they persist.
 
-## RISK WATCHLIST
-Top 3-5 concrete risks: "If X happens → expect Y reaction"
+## What would go wrong
+Three to five concrete risks in the form "if X, then Y, because Z" — the
+mechanism matters more than the assertion.
 
-## ACTIONABLE TAKEAWAYS BY PLAYER TYPE
-- **Momentum Trader:** ...
-- **Swing Trader:** ...
-- **Position/Long-term Investor:** ...
+## What is missing
+The reporting or data that would most sharpen this read. Say if the headline
+set is too narrow to support a view.
 
-Be specific. Reference the actual news where relevant. Use directional language.
+Reference specific headlines from the brief. Where you are inferring rather
+than reporting, say so.
 """
 
         system_prompt = """
-You are a macro/news-driven trading analyst at a top hedge fund.
-You translate news flow into precise directional views and actionable scenarios.
-Write like a Bloomberg Intelligence or Morgan Stanley research note — direct, specific, no filler.
+You read news flow for a desk that has already seen the headlines. Your value
+is in what they imply and what is being missed, not in restating them.
+
+Work from the supplied headlines only. Do not add events, figures or quotes
+from memory — if a story matters and the brief does not carry the detail, say
+what detail you would need.
+
+Structure your read as:
+- **What actually happened** — the two or three stories that carry real market
+  consequence, separated from the volume of noise around them. Say why each
+  matters mechanically, not that it is "significant".
+- **What is priced and what is not** — where the news is already old to the
+  market versus where it has not been absorbed. Be explicit that you cannot see
+  positioning or prices here, so this is a reasoned inference.
+- **The link that would break** — the assumption connecting a story to its
+  supposed market effect, and what would falsify it.
+- **What to watch next** — specific, dated, checkable. A release, a decision, a
+  publication — not "developments in the region".
+
+Rules: no probability percentages, since nothing here produces one. Attribute
+every claim to a headline in the brief. Where the news flow genuinely does not
+support a view, say the flow is thin — that is a finding, and padding it into a
+confident note is the failure mode this section exists to avoid.
 """
 
         context = base_ctx + "\n\n" + user_block
@@ -2434,23 +2466,41 @@ def analyze_fomc_with_gpt(
         return {"error": f"AI unavailable: {_err}."}
 
     system_msg = """
-You are a senior macro strategist at a top-tier investment bank with 20+ years of Fed-watching experience.
-Analyze the FOMC statement and press conference, then deliver a complete cross-market impact assessment.
-Write as if briefing the trading desk and portfolio managers on a Fed decision day.
+You are a Fed watcher reading an FOMC statement against the previous one for a
+trading desk. The desk has the statement too, so your value is entirely in
+catching what changed and saying what follows from it — not in restating it.
 
-Hard rules:
-- Return ONLY valid JSON. No markdown, no extra text.
-- Base ALL factual claims strictly on the provided text.
-- You MAY give probabilistic market interpretations using typical historical Fed transmission mechanisms.
-- Be specific, direct, and actionable — like a Goldman Sachs macro flash note.
+What you are working from and what you are not:
+- You have the statement text, the previous statement, and press conference
+  text where available. Every factual claim must come from those.
+- You do NOT have market prices, fed funds futures, or positioning data. Do not
+  state or imply a market-implied probability; you cannot see one.
+- Where you apply a typical historical transmission channel (a hawkish surprise
+  supporting the dollar, for instance), say that is what you are doing. It is a
+  prior, not an observation from this statement, and the reader needs to know
+  which they are getting.
+
+Rules:
+- Return ONLY valid JSON. No markdown, no prose outside the object.
+- Every `rationale` must point at specific statement language — a changed word,
+  a dropped sentence, a new risk. "Policy remains data dependent" is not a
+  rationale; "dropped 'additional policy firming may be appropriate'" is.
+- Leave a `rationale` empty and the direction "neutral" where the statement
+  gives you no basis for that market. An empty field is information; a
+  fabricated one is damage. Do NOT fill a field just because it exists.
+- Where the statement is genuinely ambiguous, say so in the summary rather than
+  resolving it artificially.
 
 Direction values: "bullish" | "bearish" | "neutral"
 Magnitude values: "high" | "medium" | "low"
 Allowed tone_change: "more_hawkish" | "more_dovish" | "similar"
 Allowed trade_bias: "risk_on" | "risk_off" | "mixed"
-hawk_dove_score: -5 (extremely dovish) to +5 (extremely hawkish), decimals allowed.
+Allowed next_meeting_lean: "hike" | "cut" | "hold" — the direction the
+statement's own language leans toward, with reasoning quoting that language.
+hawk_dove_score: -5 (extremely dovish) to +5 (extremely hawkish), decimals
+allowed, judged against the previous statement rather than in the abstract.
 
-Output this exact JSON structure (fill every field):
+Output this exact JSON structure:
 {
   "hawk_dove_score": 0,
   "tone_change": "similar",
@@ -2462,9 +2512,8 @@ Output this exact JSON structure (fill every field):
   "summary": "",
   "trade_bias": "mixed",
   "rate_path": {
-    "next_meeting_hike_pct": 5,
-    "next_meeting_hold_pct": 75,
-    "next_meeting_cut_pct": 20,
+    "next_meeting_lean": "hold",
+    "next_meeting_reasoning": "",
     "year_end_trajectory": "",
     "key_data_dependency": ""
   },
@@ -2542,12 +2591,26 @@ PRESS CONFERENCE EXCERPTS (may be empty):
 {press_t}
 
 Instructions:
-- key_changes: up to 8 concise bullets on exact wording/emphasis shifts vs. previous.
-- summary: 4-6 sentences — what changed, what it implies for the policy path, what markets must price in.
-- market_impact: explain the Fed transmission mechanism for EACH asset. Be specific about WHY each market moves.
-  Use typical historical Fed transmission: hawkish = USD up, gold down, bonds down, growth stocks down, financials up, etc.
-- investor_guide: 2-4 sentences per player type. What should they watch? How does this change positioning?
-- wall_street_take: 1-2 punchy sentences. The "so what" headline a trader sends to their book right now.
+- key_changes: the wording and emphasis shifts against the previous statement,
+  up to 8. Quote the changed phrasing. If the previous statement is empty, say
+  so and leave this list short rather than inventing comparisons.
+- summary: 4-6 sentences — what changed, what it implies for the policy path,
+  and what remains genuinely unresolved. Name the ambiguity rather than
+  smoothing over it.
+- market_impact: only where this statement gives you a basis. For each one you
+  do fill, the rationale must name the statement language driving it and label
+  whether you are reading the text or applying a historical transmission
+  channel. The channels are priors, not observations: a hawkish surprise has
+  usually supported the dollar and pressured long-duration equities, but this
+  statement is the evidence, not the prior. Leave a market neutral with an
+  empty rationale when the statement says nothing that bears on it — most Fed
+  statements do not move the needle on copper or natural gas, and saying so is
+  the correct answer.
+- investor_guide: what genuinely changes for that horizon. If a decision does
+  not change anything for a long-term investor, say that in one line. Do not
+  manufacture a difference between the horizons to fill the fields.
+- wall_street_take: one or two sentences — the single thing that matters,
+  stated plainly.
 """
 
     return ai_agent.complete_json(system_msg, user_msg, max_tokens=12000, effort="high")
@@ -2600,9 +2663,9 @@ Output MUST strictly follow this JSON structure:
   "implied_change_vs_previous": "",
   "trade_bias": "mixed",
   "scenarios": [
-    { "name": "Base case", "probability": 60, "description": "" },
-    { "name": "Alt case", "probability": 25, "description": "" },
-    { "name": "Risk case", "probability": 15, "description": "" }
+    { "name": "Most likely", "rank": 1, "description": "", "what_confirms_it": "" },
+    { "name": "Alternative", "rank": 2, "description": "", "what_confirms_it": "" },
+    { "name": "Risk case", "rank": 3, "description": "", "what_confirms_it": "" }
   ]
 }
 """
@@ -2821,12 +2884,19 @@ def show_fomc_lab():
         st.markdown("---")
         st.subheader("🗺️ Rate Path Outlook")
         rp = result.get("rate_path", {})
-        rp_c1, rp_c2, rp_c3 = st.columns(3)
-        rp_c1.metric("Next Meeting: Hike", f"{rp.get('next_meeting_hike_pct', 0)}%")
-        rp_c2.metric("Next Meeting: Hold", f"{rp.get('next_meeting_hold_pct', 0)}%")
-        rp_c3.metric("Next Meeting: Cut", f"{rp.get('next_meeting_cut_pct', 0)}%")
+        lean = str(rp.get("next_meeting_lean", "")).lower()
+        lean_label = {"hike": "🔺 Lean: hike", "cut": "🔻 Lean: cut",
+                      "hold": "▪️ Lean: hold"}.get(lean, "▪️ Lean: unclear")
+        st.markdown(f"**{lean_label}** — {rp.get('next_meeting_reasoning', '')}")
         st.markdown(f"**Year-end trajectory:** {rp.get('year_end_trajectory', '')}")
         st.markdown(f"**Key data to watch:** {rp.get('key_data_dependency', '')}")
+        st.caption(
+            "This is a qualitative read of the statement's own language, not a "
+            "probability. Market-implied odds for the next meeting come from fed "
+            "funds futures, which this app does not price — check CME FedWatch or "
+            "an OIS curve for those. A number here would have been invented, and "
+            "invented odds next to a real Fed statement are worse than none."
+        )
 
         # ── SUMMARY + KEY CHANGES ──
         st.markdown("---")
@@ -3002,11 +3072,16 @@ def show_fomc_lab():
                         f"- **{t.get('topic','')}** ({t.get('stance','')}) — "
                         f"{t.get('summary','')} | _Market take: {t.get('market_take','')}_"
                     )
-                st.markdown("**Scenarios:**")
-                for sc in lvl2.get("scenarios", []):
-                    st.markdown(
-                        f"- **{sc.get('name','')}** ({sc.get('probability',0)}%): {sc.get('description','')}"
-                    )
+                st.markdown("**Scenarios** — ranked by likelihood, not priced:")
+                for sc in sorted(lvl2.get("scenarios", []),
+                                 key=lambda x: x.get("rank", 99)):
+                    line = f"- **{sc.get('name','')}** — {sc.get('description','')}"
+                    if sc.get("what_confirms_it"):
+                        line += f" — _early tell: {sc['what_confirms_it']}_"
+                    st.markdown(line)
+                st.caption("Ranked rather than given percentages: a press "
+                           "conference transcript does not produce a probability, "
+                           "and a number here would be invented.")
                 with st.expander("Raw Level 2 JSON"):
                     st.json(lvl2)
         else:
@@ -3932,12 +4007,12 @@ with tab_fx:
                             ))
                         fig_c.add_hline(y=0, line_dash="dash", line_color="#444")
                         fig_c.update_layout(
-                            template="plotly_dark", height=420,
-                            margin=dict(l=0, r=0, t=10, b=0),
+                            template="plotly_dark", height=440,
+                            margin=dict(l=0, r=0, t=44, b=0),
                             paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                            xaxis_title="Realised volatility, 3m (%)",
-                            yaxis_title="Carry vs USD (% p.a.)",
-                            legend=dict(orientation="h", y=1.1),
+                            xaxis_title="Realised volatility, 3 months (% annualised)",
+                            yaxis_title="Carry vs USD (% per year)",
+                            legend=dict(orientation="h", y=1.12, x=0, xanchor="left"),
                         )
                         fig_c.update_xaxes(gridcolor="#1a1a1a")
                         fig_c.update_yaxes(gridcolor="#1a1a1a")
@@ -4177,29 +4252,56 @@ with tab_fx:
                               if snap.get("range_pct") is not None else "—")
 
                     series = fxa.cross(uv, dd_base, dd_quote)
-                    fig_p = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                          row_heights=[0.7, 0.3], vertical_spacing=0.04)
+                    # Each row is labelled on its own axis rather than by a shared
+                    # legend and a figure title, which collided with each other and
+                    # with the header above the chart.
+                    st.markdown(f"##### {dd_base}/{dd_quote} — spot and realised volatility")
+                    fig_p = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.7, 0.3], vertical_spacing=0.08,
+                        subplot_titles=("Spot rate", "Realised volatility, 21-day (% annualised)"))
                     fig_p.add_trace(go.Scatter(x=series.index, y=series.values, name="Spot",
-                                               line=dict(color="#00cc66", width=1.4)), row=1, col=1)
+                                               line=dict(color="#00cc66", width=1.4),
+                                               hovertemplate="%{x|%d %b %Y}<br>%{y:.4f}<extra></extra>"),
+                                    row=1, col=1)
                     if snap.get("range_low"):
-                        fig_p.add_hline(y=snap["range_low"], line_dash="dot", line_color="#666",
-                                        annotation_text="52w low", row=1, col=1)
-                        fig_p.add_hline(y=snap["range_high"], line_dash="dot", line_color="#666",
-                                        annotation_text="52w high", row=1, col=1)
+                        fig_p.add_hline(y=snap["range_low"], line_dash="dot", line_color="#777",
+                                        annotation_text="52w low",
+                                        annotation_position="bottom right",
+                                        annotation_font=dict(size=10, color="#999"),
+                                        row=1, col=1)
+                        fig_p.add_hline(y=snap["range_high"], line_dash="dot", line_color="#777",
+                                        annotation_text="52w high",
+                                        annotation_position="top right",
+                                        annotation_font=dict(size=10, color="#999"),
+                                        row=1, col=1)
                     r_ = np.log(series.astype(float)).diff()
                     rv = (r_.rolling(21).std() * np.sqrt(fxa.FX_BARS_PER_YEAR) * 100).dropna()
                     fig_p.add_trace(go.Scatter(x=rv.index, y=rv.values, name="21d vol",
-                                               line=dict(color="#ffaa00", width=1)), row=2, col=1)
+                                               line=dict(color="#ffaa00", width=1.2),
+                                               hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"),
+                                    row=2, col=1)
                     fig_p.update_layout(
-                        template="plotly_dark", height=460, margin=dict(l=0, r=0, t=30, b=0),
+                        template="plotly_dark", height=480,
+                        margin=dict(l=0, r=0, t=34, b=0),
                         paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                        title=dict(text=f"{dd_base}/{dd_quote} — spot and realised volatility",
-                                   font=dict(size=14)),
-                        legend=dict(orientation="h", y=1.12, font=dict(size=10)),
+                        showlegend=False, hovermode="x unified",
                     )
-                    fig_p.update_yaxes(gridcolor="#1a1a1a")
+                    for ann in fig_p.layout.annotations[:2]:
+                        ann.font.size = 12
+                        ann.font.color = "#bbb"
+                        ann.xanchor, ann.x = "left", 0
+                    fig_p.update_yaxes(gridcolor="#1a1a1a",
+                                       title_text=f"{dd_quote} per {dd_base}", row=1, col=1)
+                    fig_p.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=2, col=1)
                     fig_p.update_xaxes(gridcolor="#1a1a1a")
                     st.plotly_chart(fig_p, use_container_width=True)
+                    st.caption(
+                        f"Top: the {dd_base}/{dd_quote} rate — how many {dd_quote} one "
+                        f"{dd_base} buys — with the 52-week extremes marked. Bottom: "
+                        "volatility of the last 21 sessions, annualised, so it reads on "
+                        "the same scale as a quoted vol."
+                    )
 
                     dcol1, dcol2 = st.columns([1, 1])
                     with dcol1:
@@ -4786,12 +4888,12 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
                                         line_dash="dash", line_color="#555",
                                         annotation_text="median growth")
                         fig_v.update_layout(
-                            template="plotly_dark", height=460,
-                            margin=dict(l=0, r=0, t=10, b=0),
+                            template="plotly_dark", height=480,
+                            margin=dict(l=0, r=0, t=44, b=0),
                             paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                            xaxis_title="Revenue growth (%, YoY)",
+                            xaxis_title="Revenue growth, year on year (%)",
                             yaxis_title="Forward P/E (x)",
-                            legend=dict(orientation="h", y=1.08))
+                            legend=dict(orientation="h", y=1.12, x=0, xanchor="left"))
                         fig_v.update_xaxes(gridcolor="#1a1a1a")
                         fig_v.update_yaxes(gridcolor="#1a1a1a")
                         st.plotly_chart(fig_v, use_container_width=True)
@@ -5347,10 +5449,12 @@ than tuned.
                         fig_price.add_hline(y=70, line_dash="dash", line_color="#ff4444", line_width=0.5, row=2, col=1)
                         fig_price.add_hline(y=30, line_dash="dash", line_color="#44ff44", line_width=0.5, row=2, col=1)
                         fig_price.update_layout(
-                            template="plotly_dark", height=420, margin=dict(l=0, r=0, t=30, b=0),
-                            title=dict(text=f"{sym} — Price + Bollinger + RSI", font=dict(size=14)),
-                            legend=dict(orientation="h", y=1.08, font=dict(size=10)),
+                            template="plotly_dark", height=440,
+                            margin=dict(l=0, r=0, t=46, b=0),
+                            legend=dict(orientation="h", y=1.10, x=0, xanchor="left",
+                                        font=dict(size=10)),
                             paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            hovermode="x unified",
                         )
                         fig_price.update_yaxes(title_text="Price", row=1, col=1, gridcolor="#1a1a1a")
                         fig_price.update_yaxes(title_text="RSI", row=2, col=1, gridcolor="#1a1a1a", range=[0, 100])
@@ -5436,9 +5540,14 @@ than tuned.
                             fig_rvol = go.Figure()
                             fig_rvol.add_trace(go.Scatter(y=_rvol_20 * 100, name="20d Rolling Vol %", line=dict(color="#ff8800", width=1)))
                             fig_rvol.add_trace(go.Scatter(y=_rvol_60 * 100, name="60d Rolling Vol %", line=dict(color="#4488ff", width=1)))
-                            fig_rvol.update_layout(template="plotly_dark", height=200, margin=dict(l=0, r=0, t=30, b=0),
-                                                    title=dict(text="Rolling Volatility", font=dict(size=13)),
+                            fig_rvol.update_layout(template="plotly_dark", height=230,
+                                                    margin=dict(l=0, r=0, t=34, b=0),
+                                                    title=dict(text="Rolling volatility, annualised",
+                                                               font=dict(size=13)),
                                                     paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                    yaxis_title="% annualised",
+                                                    xaxis_title="Bars (oldest to newest)",
+                                                    hovermode="x unified",
                                                     legend=dict(orientation="h", font=dict(size=10)))
                             fig_rvol.update_yaxes(gridcolor="#1a1a1a")
                             fig_rvol.update_xaxes(gridcolor="#1a1a1a")
@@ -5458,9 +5567,13 @@ than tuned.
                                                             marker_color=acf_colors))
                                 fig_acf.add_hline(y=0.05, line_dash="dash", line_color="#444", line_width=0.5)
                                 fig_acf.add_hline(y=-0.05, line_dash="dash", line_color="#444", line_width=0.5)
-                                fig_acf.update_layout(template="plotly_dark", height=180, margin=dict(l=0, r=0, t=30, b=0),
-                                                       title=dict(text="Autocorrelation", font=dict(size=13)),
-                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a")
+                                fig_acf.update_layout(template="plotly_dark", height=230,
+                                                       margin=dict(l=0, r=0, t=34, b=0),
+                                                       title=dict(text="Return autocorrelation by lag",
+                                                                  font=dict(size=13)),
+                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                       yaxis_title="Correlation coefficient",
+                                                       xaxis_title="Lag (bars)")
                                 fig_acf.update_yaxes(gridcolor="#1a1a1a")
                                 st.plotly_chart(fig_acf, use_container_width=True)
                                 lag1 = acf.get("lag_1", 0)
@@ -5618,7 +5731,8 @@ than tuned.
                                 fig_hist.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
                                                         title=dict(text="Returns Distribution", font=dict(size=13)),
                                                         paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                        xaxis_title="Daily Return %")
+                                                        xaxis_title="Return per bar (%)",
+                                                        yaxis_title="Number of bars")
                                 fig_hist.update_yaxes(gridcolor="#1a1a1a")
                                 fig_hist.update_xaxes(gridcolor="#1a1a1a")
                                 st.plotly_chart(fig_hist, use_container_width=True)
@@ -5733,7 +5847,8 @@ than tuned.
                             fig_mc.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
                                                   title=dict(text="Monte Carlo Price Distribution", font=dict(size=13)),
                                                   paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                  xaxis_title="Price")
+                                                  xaxis_title="Simulated price at horizon",
+                                                  yaxis_title="Number of paths")
                             fig_mc.update_yaxes(gridcolor="#1a1a1a")
                             fig_mc.update_xaxes(gridcolor="#1a1a1a")
                             st.plotly_chart(fig_mc, use_container_width=True)

@@ -3496,13 +3496,43 @@ def _render_fg(col, title, data):
         f"<div style='font-size:13px;color:{_fg_color(v)}'>{lbl}</div>"
         f"</div>", unsafe_allow_html=True)
 
-_render_fg(sc1, "🪙 Crypto F&G",       _sents.get("crypto"))
-_render_fg(sc2, "📈 Stocks F&G (CNN)", _sents.get("stocks"))
-_render_fg(sc3, "🛢 Commodities Mood", _sents.get("commodities"))
-_render_fg(sc4, "🌍 Global Macro Risk", _sents.get("macro"))
+# Two of these four are published indices and two are computed here. Shown side
+# by side without saying so, a reader reasonably assumes all four are external
+# benchmarks — so the source is on the label.
+_render_fg(sc1, "🪙 Crypto F&G · published",   _sents.get("crypto"))
+_render_fg(sc2, "📈 Stocks F&G · CNN",         _sents.get("stocks"))
+_render_fg(sc3, "🛢 Commodities · computed",   _sents.get("commodities"))
+_render_fg(sc4, "🌍 Macro risk · computed",    _sents.get("macro"))
 
-with st.expander("Yahoo Live Debug"):
-    st.write(st.session_state.get("yahoo_live_errors", {}))
+with st.expander("What these four numbers are"):
+    st.markdown("""
+All four run 0-100, where 0 is extreme fear and 100 extreme greed. **Two are
+published indices and two are computed inside this app**, which is why the
+labels differ — they are not equivalent benchmarks.
+
+- **Crypto F&G** — the published Alternative.me index.
+- **Stocks F&G** — CNN's published index.
+- **Commodities** — *computed here.* Average 14-day return across gold, silver
+  and WTI, converted to a score on the assumption that a 5% move over 14 days
+  is roughly one standard deviation. That divisor is a calibration choice, not
+  a measured parameter.
+- **Macro risk** — *computed here.* Combines VIX, the 10y-2y curve, high-yield
+  spreads and dollar momentum, each converted to a score with its own hand-set
+  scaling, then averaged.
+
+The two computed scores are directionally useful and have not been validated
+against anything. Read them as a summary of the inputs listed, not as an
+independent measure — and never quote them as if they were a published index.
+    """)
+
+with st.expander("Data source diagnostics"):
+    _errs = st.session_state.get("yahoo_live_errors", {})
+    if _errs:
+        st.caption("Symbols whose live Yahoo fetch failed this session. "
+                   "Panels using them fall back to the cached snapshot.")
+        st.write(_errs)
+    else:
+        st.caption("All live fetches succeeded this session.")
 
 
 
@@ -3535,7 +3565,14 @@ with tab_global:
     col_heat, col_movers = st.columns([3, 2])
 
     with col_heat:
-        st.markdown("### 🔥 Sector Heatmap (S&P 500 avg)")
+        st.markdown("### 🔥 Sector heatmap — average move since the previous close")
+        st.caption(
+            "Equal-weighted average across the S&P 500 constituents in each GICS "
+            "sector, measured against the previous session's close. Equal-weighted, "
+            "so a sector carried by one mega-cap looks the same as one moving "
+            "together — the up/down counts beside each figure are what separate "
+            "the two."
+        )
         try:
             perf = dl.sector_performance()
             perf_with_data = [r for r in perf if r.get("avg_change") is not None]
@@ -3582,7 +3619,11 @@ with tab_global:
             st.error(f"Heatmap failed: {_e}")
 
     with col_movers:
-        st.markdown("### 🚀 Top Movers")
+        st.markdown("### 🚀 Biggest movers since the previous close")
+        st.caption(
+            "S&P 500 equities only, ranked on the move since the previous close. "
+            "Moves beyond ±50% are excluded as probable splits or bad prints."
+        )
         try:
             gainers = dl.top_movers(8, "up",  asset_types=["equity"])
             losers  = dl.top_movers(8, "down", asset_types=["equity"])
@@ -4987,7 +5028,10 @@ with tab_news:
 
     if not NEWSAPI_KEY:
         st.info(
-            "NEWSAPI_KEY is missing in .env. Add NEWSAPI_KEY=... to load news."
+            "NEWSAPI_KEY is not configured, so the NewsAPI headlines are "
+            "unavailable. The RSS feeds the scheduler collects still populate "
+            "the news database — set NEWSAPI_KEY in the environment to add "
+            "NewsAPI coverage on top."
         )
     else:
         # ── AUTO-FETCH on page load ──

@@ -22,6 +22,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 # New modules: SQLite data layer, source clients, background scheduler, Claude agent
 try:
+    import sources as src_mod
+    _HAS_SRC = True
+except Exception:
+    _HAS_SRC = False
+
+try:
     import fx_analytics as fxa
     _HAS_FXA = True
 except Exception as _fe:
@@ -5942,7 +5948,15 @@ than tuned.
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:
     st.subheader("🤖 Analizator — Conversational Agent")
-    st.caption("Powered by Claude. Has tool access to news (NewsAPI + 25 RSS feeds), market quotes (Yahoo + Binance), technical signals, FRED macro data, economic calendar, SEC filings (JPM/GS/BlackRock/Berkshire/Bridgewater/Renaissance/Citadel/Two Sigma/Point72/Tiger Global), Finnhub analyst recs, and the global crypto market overview. Ask anything.")
+    st.caption(
+        f"Claude with tool access to this app's data: news (NewsAPI plus "
+        f"{len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} RSS feeds), market quotes "
+        "(Yahoo, Binance), technical indicator state, company fundamentals with "
+        "sector comparison, FRED macro series, the economic calendar, SEC filings "
+        "for ten large institutions, Finnhub analyst estimates, and the crypto "
+        "market aggregate. It reads live data rather than answering from memory, "
+        "and will tell you when a tool returns nothing."
+    )
 
     if not _HAS_AGENT:
         st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
@@ -6042,11 +6056,11 @@ with tab_fomc:
 with tab_brief:
     st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
     st.caption(
-        "Six specialist sub-agents (News, Macro, Crypto, Smart Money, FOMC, "
-        "Sentiment) run in parallel on Opus, each with a curated tool subset. "
-        "A Chief Strategist agent then synthesizes their structured briefings "
-        "into a single executive brief with TL;DR, cross-asset themes, "
-        "contradictions, actionable insights, and risks."
+        f"{len(orch.SUBAGENT_SPECS)} specialist sub-agents run in parallel, each "
+        "with its own tool subset and its own brief. A synthesiser then reconciles "
+        "their findings into one note — including where they contradict each "
+        "other, which is usually the most informative part. Deselect any below to "
+        "cut cost and time; the synthesiser is told which ones ran."
     )
 
     if not _HAS_ORCH:
@@ -6174,7 +6188,9 @@ with tab_brief:
                             f"{headline}"
                         )
 
-                status_holder.info("🧠 Running 5 specialists in parallel on Opus…")
+                status_holder.info(
+                    f"🧠 Running {len(selected_ids)} specialist"
+                    f"{'s' if len(selected_ids) != 1 else ''} in parallel…")
                 try:
                     brief = orch.run_deep_brief(
                         user_query=user_focus,

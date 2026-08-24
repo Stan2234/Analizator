@@ -1,10 +1,13 @@
 """
 Multi-agent orchestrator for Analizator Deep Brief.
 
-Spawns N specialist sub-agents (news, macro, crypto, equity/smart-money,
-sentiment) in parallel — each with a curated subset of the existing tools
-from agent.py — collects their structured JSON briefings, then feeds them
-to a synthesizer agent that produces a single executive brief.
+Spawns the specialist sub-agents defined in SUBAGENT_SPECS (news, macro,
+crypto, equity/smart-money, fomc, sentiment) in parallel — each with a curated
+subset of the tools from agent.py — collects their structured JSON briefings,
+then feeds them to a synthesizer that produces a single executive brief.
+
+The caller chooses which specialists run, so nothing downstream should assume a
+fixed count.
 
 Public entry point: run_deep_brief(user_query, ...)
 
@@ -37,7 +40,7 @@ SUBAGENT_MAX_TOKENS = 8000
 SUBAGENT_MAX_ITER = 6
 SYNTH_MAX_TOKENS = 12000
 
-# Effort is the cost lever for this path: a Deep Brief is five specialists in
+# Effort is the cost lever for this path: a Deep Brief is several specialists in
 # parallel plus a synthesis pass. Opus 5 performs well below its default of
 # "high" — "medium" is a reasonable starting point here; raise to "high" or
 # "xhigh" if briefs come back shallow. Only Opus accepts this, which is why it
@@ -406,9 +409,16 @@ def _synthesize(subagent_results: Dict[str, Any], user_query: str) -> str:
             for sid, r in subagent_results.items()
         },
     }
+    # The count is variable — the user can deselect agents before a run — so it
+    # is derived rather than asserted. Telling the synthesiser it has five
+    # briefings when it has three invites it to reason about ones it never got.
+    n_briefs = len(subagent_results)
     user_msg = (
-        "Here are the five specialist briefings. Synthesize them into the "
-        "executive brief described in the system prompt.\n\n"
+        f"Here are the {n_briefs} specialist briefing"
+        f"{'s' if n_briefs != 1 else ''} that ran for this request. "
+        "Synthesize them into the executive brief described in the system "
+        "prompt. Do not refer to specialists that are not present below — if a "
+        "perspective is missing, name which and what it would have added.\n\n"
         + json.dumps(payload, default=str, indent=2)
     )
     try:

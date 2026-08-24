@@ -1,6 +1,6 @@
 import os
 import datetime as dt
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import textwrap  # за да махнем водещите интервали от HTML
 import json
 import re
@@ -1823,7 +1823,7 @@ def build_ai_context(
     # ---- FX ---------------------------------------------------------------
     if _HAS_FXA:
         try:
-            fx_px = fx_load_prices()
+            fx_px, _ = fx_load_prices()
             if not fx_px.empty:
                 uv_ = fxa.usd_values(fx_px)
                 st_ = fxa.currency_strength(uv_, fxa.G10, 21)
@@ -3806,8 +3806,20 @@ def fx_econ_events() -> List[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fx_load_prices(period_days: int = 760) -> pd.DataFrame:
-    """Closes for the FX universe plus the macro drivers, on one index."""
+def fx_load_prices(period_days: int = 760) -> Tuple[pd.DataFrame, List[str]]:
+    """Daily closes for the FX universe plus the macro drivers, on one index.
+
+    Yahoo stamps each daily bar with that instrument's own close time — FX at
+    23:00, the 10-year at 12:20, futures elsewhere again. Joined on the raw
+    timestamp those never coincide, so a correlation between a pair and a
+    driver was computed over an empty intersection and silently returned
+    nothing. Normalising to the calendar date is what makes the join mean what
+    it looks like it means.
+
+    Returns the frame and the tickers that failed. The failures used to travel
+    in `DataFrame.attrs`, which does not survive Streamlit's cache, so a data
+    outage showed up as a blank panel with no explanation.
+    """
     rng = "2y" if period_days > 400 else "1y"
     frames: Dict[str, pd.Series] = {}
     failed: List[str] = []
@@ -3819,7 +3831,11 @@ def fx_load_prices(period_days: int = 760) -> pd.DataFrame:
         try:
             df = fetch_yahoo_history(tkr, range_str=rng, interval="1d",
                                      max_points=period_days)
-            return tkr, df["close"]
+            s = df["close"]
+            s.index = pd.to_datetime(s.index).normalize()
+            # An intraday bar for today can duplicate the date; keep the latest.
+            s = s[~s.index.duplicated(keep="last")]
+            return tkr, s
         except Exception:
             return tkr, None
 
@@ -3831,10 +3847,8 @@ def fx_load_prices(period_days: int = 760) -> pd.DataFrame:
                 frames[tkr] = series
 
     if not frames:
-        return pd.DataFrame()
-    out = pd.DataFrame(frames)
-    out.attrs["failed"] = failed
-    return out
+        return pd.DataFrame(), failed
+    return pd.DataFrame(frames).sort_index(), failed
 
 
 def fx_pct(v, digits: int = 2) -> str:
@@ -3896,13 +3910,12 @@ with tab_fx:
         fx_bars = fxa.HORIZON_BARS[fx_horizon]
 
         with st.spinner("Loading FX universe…"):
-            fx_prices = fx_load_prices()
+            fx_prices, fx_failed = fx_load_prices()
 
         if fx_prices.empty:
             st.error("No FX data available — Yahoo did not return any series.")
         else:
             uv = fxa.usd_values(fx_prices)
-            fx_failed = fx_prices.attrs.get("failed") or []
             if fx_failed:
                 st.caption(f"⚠️ No data for: {', '.join(fx_failed)} — those rows are omitted.")
 

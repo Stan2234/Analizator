@@ -49,6 +49,13 @@ except Exception as _ce:
     _CBK_IMPORT_ERROR = str(_ce)
 
 try:
+    import metals as mtl
+    _HAS_MTL = True
+except Exception as _me:
+    _HAS_MTL = False
+    _MTL_IMPORT_ERROR = str(_me)
+
+try:
     import data_layer as dl
     import scheduler as bg_scheduler
     import agent as ai_agent
@@ -1137,10 +1144,30 @@ What conditions would break each playbook? What data would change this analysis?
 
 
 def fetch_yahoo_history(
-    ticker: str, range_str: str = "1y", interval: str = "1d", max_points: int = DAYS_BACK
+    ticker: str, range_str: str = "1y", interval: str = "1d",
+    max_points: int = DAYS_BACK, years: Optional[float] = None
 ) -> pd.DataFrame:
+    """Daily bars from Yahoo's chart endpoint.
+
+    `years` asks for an explicit window instead of a named range, and exists
+    because the two are not equivalent. Yahoo honours `interval` for named
+    ranges up to ten years, but for `range=max` it silently answers with
+    monthly bars — same response shape, same field names, roughly a twentieth
+    of the rows. Anything that annualises those as daily is then wrong by a
+    factor of four and a half while looking entirely reasonable. Explicit
+    period bounds return true daily bars over any span.
+    """
     url = YAHOO_CHART_URL.format(ticker)
-    params = {"range": range_str, "interval": interval}
+    if years:
+        now = int(dt.datetime.now().timestamp())
+        params = {
+            "period1": int((dt.datetime.now()
+                            - dt.timedelta(days=int(years * 365.25))).timestamp()),
+            "period2": now,
+            "interval": interval,
+        }
+    else:
+        params = {"range": range_str, "interval": interval}
     headers = {"User-Agent": "Mozilla/5.0"}
 
     r = requests.get(url, params=params, headers=headers, timeout=15)
@@ -1681,6 +1708,23 @@ def get_relevant_news_for_asset(focus_asset: str, max_items: int = 40) -> List[D
 # ------------------------------------
 # AI ANALYST
 # ------------------------------------
+
+
+def ordinal(n: Optional[float]) -> str:
+    """1 -> "1st", 22 -> "22nd", 53 -> "53rd", 11 -> "11th".
+
+    Written out because a panel that prints "51th percentile" reads as one
+    nobody proofread, and a reader who catches that starts wondering what else
+    was not checked. The teens are the exception every naive version misses.
+    """
+    if n is None or (isinstance(n, float) and not np.isfinite(n)):
+        return "—"
+    i = int(round(n))
+    if 10 <= abs(i) % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(abs(i) % 10, "th")
+    return f"{i}{suffix}"
 
 
 def ai_unavailable() -> Optional[str]:
@@ -3591,11 +3635,12 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-(tab_global, tab_fx, tab_carry, tab_cb, tab_crypto, tab_fund, tab_news, tab_quant,
- tab_ai, tab_fomc, tab_brief, tab_method) = st.tabs(
+(tab_global, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
+ tab_news, tab_quant, tab_ai, tab_fomc, tab_brief, tab_method) = st.tabs(
     ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🏦 Central Banks",
-     "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro", "🧮 Quant Lab",
-     "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief", "📖 Methodology"]
+     "🥇 Metals", "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro",
+     "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief",
+     "📖 Methodology"]
 )
 
 # -------- GLOBAL TAB (Bloomberg-style dashboard) --------
@@ -4347,7 +4392,7 @@ with tab_fx:
                     k2.metric("1M", fx_pct(snap.get("chg_1M")))
                     k3.metric("YTD", fx_pct(snap.get("chg_YTD")))
                     k4.metric("Vol 1m", f"{snap['vol_1m']:.1f}%" if snap.get("vol_1m") else "—",
-                              f"{snap.get('vol_percentile', 0):.0f}th pct"
+                              f"{ordinal(snap.get('vol_percentile'))} pct"
                               if snap.get("vol_percentile") is not None else None)
                     k5.metric("Carry p.a.", fx_pct(snap.get("carry")) if snap.get("carry") is not None else "—")
                     k6.metric("52w range", f"{snap.get('range_pct', 0):.0f}%"
@@ -4737,11 +4782,11 @@ that error is largest exactly where it matters most — around a policy turn.
                 fv, fvp = cond.get("funding_vol"), cond.get("funding_vol_pct")
                 u1.metric(f"{funding_ccy} volatility",
                           f"{fv:.1f}%" if fv is not None else "—",
-                          f"{fvp:.0f}th percentile" if fvp is not None else None)
+                          f"{ordinal(fvp)} percentile" if fvp is not None else None)
                 ec, ecp = cond.get("equity_corr"), cond.get("equity_corr_pct")
                 u2.metric(f"{funding_ccy} vs S&P 500",
                           f"{ec:+.2f}" if ec is not None else "—",
-                          f"{ecp:.0f}th percentile" if ecp is not None else None)
+                          f"{ordinal(ecp)} percentile" if ecp is not None else None)
                 rv = cond.get("basket_return_to_vol")
                 u3.metric("Basket return / vol", f"{rv:.2f}" if rv is not None else "—")
 
@@ -5417,6 +5462,592 @@ judgement that their rates are settled.
                                     "decision and do not attach a probability to one. If "
                                     "something the argument needs is absent from the "
                                     "payload, say so rather than supplying it from memory."
+                                )
+                                st.markdown(ai_agent.complete(
+                                    sysmsg, json.dumps(ctx, indent=1, default=str),
+                                    max_tokens=3000, effort="medium"))
+                            except Exception as _e:
+                                st.error(f"Model call failed: {_e}")
+
+
+# ============================== METALS ==============================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def mt_load_prices(years: float = 26, max_points: int = 12000
+                   ) -> Tuple[pd.DataFrame, List[str]]:
+    """Daily closes for the metals complex, the miners, the themes and the drivers.
+
+    Normalised to the calendar date for the same reason the FX loader is:
+    Yahoo stamps each instrument with its own close time, so a metal and a
+    yield joined on the raw timestamp share no rows at all.
+
+    Asked for by an explicit number of years rather than a named range, and
+    with `max_points` raised, because both defaults would quietly truncate:
+    the client trims every series to a year, and Yahoo answers `range=max`
+    with monthly bars. Either alone would turn a percentile "since 2000" into
+    something else without saying so.
+    """
+    tickers = ([m.yahoo for m in mtl.METALS.values()]
+               + [t for t, _ in mtl.MINERS.values()]
+               + list(mtl.THEMES.values())
+               + list(mtl.DRIVERS.values()))
+
+    frames: Dict[str, pd.Series] = {}
+    failed: List[str] = []
+    for t in tickers:
+        try:
+            h = fetch_yahoo_history(t, years=years, max_points=max_points)
+            col = next((c for c in h.columns if str(c).lower() == "close"), None)
+            if col is None or h.empty:
+                failed.append(t)
+                continue
+            s = pd.to_numeric(h[col], errors="coerce").dropna()
+            s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+            frames[t] = s[~s.index.duplicated(keep="last")]
+        except Exception:
+            failed.append(t)
+
+    if not frames:
+        return pd.DataFrame(), failed
+    return pd.DataFrame(frames).sort_index(), failed
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def mt_load_cpi():
+    return cbk.cpi_index("USD", "1990-01") if _HAS_CBK else pd.Series(dtype=float)
+
+
+with tab_metals:
+    if not _HAS_MTL:
+        st.error(f"Metals module failed to load: {_MTL_IMPORT_ERROR}")
+    else:
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">METALS</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">Prices · metal or dollar · ratios · what they trade on</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Metals are quoted in dollars, which means the price answers two questions at
+once and separates neither. A dollar that falls ten percent lifts the gold
+price ten percent without a single ounce changing hands, and a great deal of
+what gets written about gold is really about the dollar.
+
+**So the first thing this panel does is take those apart.** Priced into every
+currency the app tracks, the part of a move that survives translation belongs
+to the metal and the residual belongs to the money. It is a simple calculation
+and it regularly overturns the headline.
+
+- **The board** — level, returns over five horizons, volatility, and position
+  in the 52-week range. The range matters because a return says how far
+  something travelled and the range says where it arrived.
+- **Metal or dollar?** — the decomposition, plus the metal repriced into each
+  currency.
+- **Ratios** — gold to silver, copper to gold, platinum to gold, palladium to
+  platinum. Each against its own history since 2000, with what it is asking.
+- **What drives them** — correlations to real-economy drivers and to each
+  other, and mining equity against the metal it digs.
+
+**No composite metals score.** A ratio at its fifth percentile is a fact about
+where it sits; what it implies depends entirely on why it got there, and
+averaging it against three other facts would destroy the only thing that made
+it useful.
+
+**On the ratios' levels.** Gold against silver is two dollar-per-ounce prices,
+so the level means something — sixty-nine is a number a desk recognises.
+Copper against gold is dollars per pound over dollars per ounce, and its level
+is an artefact of contract specifications. Those are shown as an index against
+their own median instead of as a decimal that only looks precise.
+            """)
+
+        mc1, mc2, mc3 = st.columns([1.5, 1.6, 1])
+        with mc1:
+            mt_window = st.selectbox(
+                "Comparison window", ["1 year", "6 months", "3 months", "2 years"],
+                key="mt_window", label_visibility="collapsed")
+        with mc2:
+            mt_corr_window = st.radio(
+                "Correlation window", ["6 months", "1 year"], horizontal=True,
+                key="mt_corr_win", label_visibility="collapsed")
+        with mc3:
+            if st.button("🔄 Refresh", key="mt_refresh", use_container_width=True):
+                mt_load_prices.clear()
+                st.rerun()
+
+        # Calendar days, not bar counts — the label has to mean the same thing
+        # whatever frequency the feed returns.
+        _WINDOW_DAYS = {"3 months": 91, "6 months": 182,
+                        "1 year": 365, "2 years": 730}
+        win = _WINDOW_DAYS[mt_window]
+        corr_win = _WINDOW_DAYS[mt_corr_window]
+
+        mt_px, mt_failed = mt_load_prices()
+
+        if mt_px.empty:
+            st.error(
+                "No metals prices returned this run, so the panel cannot be built. "
+                + (f"Failed tickers: {', '.join(mt_failed)}." if mt_failed else "")
+            )
+        else:
+            if mt_failed:
+                st.warning(
+                    "No data for: " + ", ".join(mt_failed)
+                    + ". Anything derived from these is omitted rather than "
+                      "estimated."
+                )
+
+            mtt1, mtt2, mtt3, mtt4, mtt5 = st.tabs([
+                "🥇 The board", "💵 Metal or dollar?", "⚖️ Ratios",
+                "🔗 What drives them", "🤖 Desk read"])
+
+            # ---------------- the board ----------------
+            with mtt1:
+                bd = mtl.board(mt_px)
+                if bd.empty:
+                    st.info("No metal had enough history to build the board.")
+                else:
+                    show = bd.copy()
+                    show["Price"] = [
+                        f"{r['last']:,.2f}" for _, r in bd.iterrows()]
+                    for col, label in (("ret_1w", "1w"), ("ret_1m", "1m"),
+                                       ("ret_3m", "3m"), ("ret_ytd", "YTD"),
+                                       ("ret_1y", "1y")):
+                        show[label] = show[col].map(
+                            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                    show["Vol"] = show["vol_1y"].map(
+                        lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                    show["52w range"] = [
+                        (f"{r['pct_of_range']:.0f}%" if pd.notna(r["pct_of_range"]) else "—")
+                        for _, r in bd.iterrows()]
+
+                    st.dataframe(
+                        show[["unit", "Price", "1w", "1m", "3m", "YTD", "1y",
+                              "Vol", "52w range"]]
+                        .rename(columns={"unit": "Quoted in"}),
+                        use_container_width=True, height=250)
+                    st.caption(
+                        "**52w range** is where the price sits between its "
+                        "one-year low and high — 0% is on the low, 100% on the "
+                        "high. **Vol** is annualised from daily moves over the "
+                        "last year. Both describe the past; neither forecasts."
+                    )
+
+                    with st.expander("What each metal actually trades on"):
+                        for name, row in bd.iterrows():
+                            if row.get("note"):
+                                st.markdown(f"**{name}** — {row['note']}")
+
+                    st.markdown("##### Thematic baskets")
+                    th = mtl.board(mt_px, mtl.THEMES)
+                    if th.empty:
+                        st.info("No thematic basket returned data.")
+                    else:
+                        tshow = th.copy()
+                        tshow["Price"] = tshow["last"].map(lambda v: f"{v:,.2f}")
+                        for col, label in (("ret_1m", "1m"), ("ret_3m", "3m"),
+                                           ("ret_ytd", "YTD"), ("ret_1y", "1y")):
+                            tshow[label] = tshow[col].map(
+                                lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                        tshow["Vol"] = tshow["vol_1y"].map(
+                            lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                        st.dataframe(
+                            tshow[["Price", "1m", "3m", "YTD", "1y", "Vol"]],
+                            use_container_width=True, height=180)
+                        st.caption(
+                            "These are equity baskets, not metal prices, and "
+                            "they are kept apart from the table above for that "
+                            "reason. A uranium fund holds miners and enrichers "
+                            "whose relationship to the uranium price is loose, "
+                            "geared, and mediated by everything else that moves "
+                            "equities."
+                        )
+
+                    st.markdown("##### In real terms")
+                    cpi = mt_load_cpi()
+                    if cpi.empty:
+                        st.info(
+                            "Consumer price data unavailable this run, so the "
+                            "real series cannot be computed. The nominal prices "
+                            "above are unaffected."
+                        )
+                    else:
+                        rp_metal = st.selectbox(
+                            "Metal", list(mtl.METALS.keys()), key="mt_real_pick")
+                        tkr = mtl.METALS[rp_metal].yahoo
+                        rp = (mtl.real_price(mt_px[tkr], cpi)
+                              if tkr in mt_px.columns else {"available": False})
+
+                        if not rp.get("available"):
+                            st.info(f"Not enough history to deflate {rp_metal}.")
+                        else:
+                            r1, r2, r3 = st.columns(3)
+                            r1.metric(f"{rp_metal} today", f"{rp['nominal_last']:,.0f}")
+                            r2.metric("Real peak", f"{rp['real_peak']:,.0f}",
+                                      rp["real_peak_date"])
+                            r3.metric("Below real peak",
+                                      f"{rp['below_real_peak_pct']:+.1f}%")
+
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=rp["nominal"].index, y=rp["nominal"],
+                                name="Nominal", line=dict(width=1.5, color="#888")))
+                            fig.add_trace(go.Scatter(
+                                x=rp["real"].index, y=rp["real"],
+                                name=f"In {rp['cpi_last'][:7]} money",
+                                line=dict(width=2.5, color="#ffb300")))
+                            fig.update_layout(
+                                height=380, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title=mtl.METALS[rp_metal].unit,
+                                legend=dict(orientation="h", y=1.12, x=0))
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            st.caption(
+                                "Deflated by US consumer prices and expressed in "
+                                f"the money of {rp['cpi_last'][:7]}, which is why "
+                                "the two lines meet at the right-hand edge. "
+                                f"Consumer prices are published in arrears — the "
+                                f"latest reading is {rp['cpi_lag_days']} days old, "
+                                "so the most recent stretch of the real line will "
+                                "move slightly when the next print lands. History "
+                                f"starts {rp['from']}, which is as far back as the "
+                                "futures contract goes; earlier peaks are outside "
+                                "what this data can speak to."
+                            )
+
+            # ---------------- metal or dollar ----------------
+            with mtt2:
+                dec_metal = st.selectbox(
+                    "Metal", list(mtl.METALS.keys()), key="mt_dec_pick")
+                tkr = mtl.METALS[dec_metal].yahoo
+
+                fx_px, _fx_failed = fx_load_prices()
+                uv = fxa.usd_values(fx_px) if _HAS_FXA and not fx_px.empty else pd.DataFrame()
+
+                if uv.empty or tkr not in mt_px.columns:
+                    st.info(
+                        "The currency universe or the metal price was "
+                        "unavailable this run, so the split cannot be computed."
+                    )
+                else:
+                    dec = mtl.in_currencies(mt_px[tkr], uv, days=win)
+                    if not dec.get("available"):
+                        st.info(
+                            f"Not enough overlapping history to split "
+                            f"{dec_metal} over {mt_window.lower()}."
+                        )
+                    else:
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.metric(f"{dec_metal} in USD",
+                                  f"{dec['usd_return_pct']:+.1f}%",
+                                  help=f"{dec['start']} to {dec['end']}")
+                        d2.metric("Typical local currency",
+                                  f"{dec['median_local_pct']:+.1f}%",
+                                  help=f"Median across {dec['n_currencies']} currencies.")
+                        d3.metric("The dollar's part",
+                                  f"{dec['dollar_contribution_pct']:+.1f}pp")
+                        if "reading" in dec:
+                            d4.metric("This move was", dec["reading"])
+
+                        st.markdown(f"""
+Over {mt_window.lower()}, {dec_metal.lower()} returned
+**{dec['usd_return_pct']:+.1f}% in dollars**. Repriced into
+{dec['n_currencies']} other currencies, the typical return was
+**{dec['median_local_pct']:+.1f}%**. The gap —
+**{dec['dollar_contribution_pct']:+.1f} percentage points** — is what the
+dollar contributed, because a return quoted in dollars is the metal's move
+less the dollar's own.
+                        """)
+
+                        per = pd.Series(dec["per_currency"]).sort_values()
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(
+                            x=per.values, y=per.index, orientation="h",
+                            marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                               for v in per.values]),
+                            text=[f"{v:+.1f}%" for v in per.values],
+                            textposition="outside",
+                            hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
+                        fig.add_vline(
+                            x=dec["usd_return_pct"], line_dash="dash",
+                            line_color="#42a5f5",
+                            annotation_text=f"in USD {dec['usd_return_pct']:+.1f}%",
+                            annotation_position="top")
+                        fig.add_vline(
+                            x=dec["median_local_pct"], line_dash="dot",
+                            line_color="#ffb300",
+                            annotation_text=f"median {dec['median_local_pct']:+.1f}%",
+                            annotation_position="bottom")
+                        fig.update_layout(
+                            height=520, template="plotly_dark",
+                            margin=dict(l=10, r=60, t=40, b=10),
+                            xaxis_title=f"{dec_metal} return over {mt_window.lower()}, "
+                                        f"in each currency (%)",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("""
+**Reading the spread.** A currency near the top of this chart is one that has
+weakened — its holders paid much more for the same ounce. A currency near the
+bottom has held its value. The chart is therefore as much a picture of the
+currencies as of the metal, and the two readings are the same fact seen from
+either end.
+
+**Why the median and not the average.** One currency running thirty percent
+inflation would drag an average on its own and make the dollar look innocent.
+The median is unmoved by an outlier, which is the whole reason to use it here.
+                        """)
+
+                        st.markdown("##### Rebased to 100")
+                        default_ccys = [c for c in ("USD", "EUR", "JPY", "CNY", "TRY")
+                                        if c == "USD" or c in uv.columns]
+                        picks = st.multiselect(
+                            "Currencies", ["USD"] + [c for c in uv.columns if c != "USD"],
+                            default=default_ccys, key="mt_ccy_pick")
+                        if picks:
+                            reb = mtl.in_currencies_series(
+                                mt_px[tkr].tail(win + 1), uv, picks)
+                            if reb.empty:
+                                st.info("No overlapping history for that selection.")
+                            else:
+                                fig2 = go.Figure()
+                                for c in reb.columns:
+                                    fig2.add_trace(go.Scatter(
+                                        x=reb.index, y=reb[c], name=c,
+                                        line=dict(width=2.5 if c == "USD" else 1.6)))
+                                fig2.update_layout(
+                                    height=380, template="plotly_dark",
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    yaxis_title="Rebased to 100 at the start",
+                                    legend=dict(orientation="h", y=1.12, x=0))
+                                st.plotly_chart(fig2, use_container_width=True)
+                                st.caption(
+                                    "Rebased because an ounce costs a few "
+                                    "thousand dollars and a few hundred thousand "
+                                    "lira; on one axis the comparison would be "
+                                    "invisible. Lines that travel together mean "
+                                    "the metal moved. Lines that fan apart mean "
+                                    "the currencies did."
+                                )
+
+            # ---------------- ratios ----------------
+            with mtt3:
+                rt = mtl.ratio_table(mt_px)
+                if rt.empty:
+                    st.info("No ratio had enough history to compute.")
+                else:
+                    cols = st.columns(len(rt))
+                    for col, (name, row) in zip(cols, rt.iterrows()):
+                        with col:
+                            pct = row["percentile"]
+                            if pct >= 80:
+                                colour, where = "#ef5350", "historically high"
+                            elif pct <= 20:
+                                colour, where = "#42a5f5", "historically low"
+                            else:
+                                colour, where = "#888", "mid-range"
+                            level = (f"{row['display']:,.2f}" if row["comparable"]
+                                     else f"{row['display']:,.0f}")
+                            unit = "" if row["comparable"] else " (median = 100)"
+                            st.markdown(
+                                f"<div style='border-left:3px solid {colour};padding-left:10px'>"
+                                f"<b>{name}</b><br>"
+                                f"<span style='font-size:22px;font-weight:700'>{level}</span>"
+                                f"<span style='font-size:11px;color:#888'>{unit}</span><br>"
+                                f"<span style='font-size:12px;color:#888'>"
+                                f"{ordinal(pct)} percentile — {where}<br>"
+                                f"{row['vs_median_pct']:+.0f}% vs median · "
+                                f"{row['ret_1y']:+.0f}% over 1y</span></div>",
+                                unsafe_allow_html=True)
+
+                    st.caption(
+                        f"Percentiles are against each ratio's own history from "
+                        f"{rt['from'].min()} — as far back as these futures "
+                        "contracts go. A percentile over twenty-six years is a "
+                        "different claim from one over fifty, and only the first "
+                        "is available here."
+                    )
+
+                    pick_ratio = st.selectbox(
+                        "Chart", list(rt.index), key="mt_ratio_pick")
+                    spec = next(s for s in mtl.RATIOS if s["name"] == pick_ratio)
+                    r = mtl.ratio(mt_px, spec["num"], spec["den"])
+                    if r.get("available"):
+                        s = r["series"]
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=s.index, y=s.values, name=pick_ratio,
+                            line=dict(width=1.8, color="#42a5f5")))
+                        fig.add_hline(
+                            y=r["median"], line_dash="dash", line_color="#888",
+                            annotation_text="median", annotation_position="right")
+                        fig.update_layout(
+                            height=400, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title=pick_ratio, showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("##### What each ratio is asking")
+                    for name, row in rt.iterrows():
+                        st.markdown(f"**{name}** — {row['asks']}")
+
+            # ---------------- what drives them ----------------
+            with mtt4:
+                uni = {**{m.name: m.yahoo for m in mtl.METALS.values()},
+                       **mtl.DRIVERS}
+                cm = mtl.correlations(mt_px, uni, window=corr_win)
+                if cm.empty:
+                    st.info("Not enough overlapping history for correlations.")
+                else:
+                    fig = go.Figure(data=go.Heatmap(
+                        z=cm.values, x=cm.columns, y=cm.index,
+                        zmin=-1, zmax=1, colorscale="RdBu", reversescale=True,
+                        text=cm.round(2).values, texttemplate="%{text}",
+                        hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>"))
+                    fig.update_layout(
+                        height=520, template="plotly_dark",
+                        margin=dict(l=10, r=10, t=30, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        f"Correlation of daily returns over the last "
+                        f"{mt_corr_window.lower()}. Returns rather than price "
+                        "levels — two rising series correlate near one whatever "
+                        "they are, which measures only that both went up."
+                    )
+
+                    metal_cm = mtl.correlations(
+                        mt_px, {m.name: m.yahoo for m in mtl.METALS.values()},
+                        window=corr_win)
+                    groups = mtl.clustered(metal_cm, 0.7)
+                    if groups:
+                        st.warning(
+                            "Effectively one position at |ρ| ≥ 0.7:\n\n"
+                            + "\n\n".join(" · ".join(g) for g in groups)
+                            + "\n\nSizing these separately multiplies the "
+                              "exposure without diversifying it — they fall "
+                              "together, and they fall together precisely when "
+                              "the reason for holding them is being tested."
+                        )
+                    else:
+                        st.info(
+                            "No pair of metals is correlated above 0.7 over this "
+                            "window, so each is currently carrying its own risk."
+                        )
+
+                    st.markdown("##### Mining equity against the metal")
+                    ms = mtl.miner_spread(mt_px, window=win)
+                    if ms.empty:
+                        st.info("No miner had enough overlapping history.")
+                    else:
+                        mshow = ms.copy()
+                        mshow["Beta to metal"] = mshow["beta"].map(
+                            lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                        mshow["Correlation"] = mshow["corr"].map(
+                            lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                        for c, label in (("equity_1y", "Equity"),
+                                         ("metal_1y", "Metal"),
+                                         ("excess_1y", "Excess")):
+                            mshow[label] = mshow[c].map(
+                                lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                        st.dataframe(
+                            mshow[["metal", "Beta to metal", "Correlation",
+                                   "Equity", "Metal", "Excess"]]
+                            .rename(columns={"metal": "Against"}),
+                            use_container_width=True, height=170)
+                        st.markdown(f"""
+A miner is a levered claim on the metal net of a cost base, so it should move
+further than the metal in both directions — that is what **beta** measures,
+and a beta above one is the normal state rather than a discovery.
+
+The column to watch is **excess**: equity return less metal return over
+{mt_window.lower()}. Persistently positive excess with a stable beta says
+costs are contained and the leverage is working. Excess turning negative while
+the metal rallies says the market is pricing the cost base eating the upside —
+energy, labour, grades, or a jurisdiction going wrong. That is information
+about the industry which the metal price cannot carry, and it is the reason to
+look at the equity at all.
+                        """)
+
+            # ---------------- desk read ----------------
+            with mtt5:
+                st.caption(
+                    "Reads the measured figures above. It has no inventory "
+                    "data, no mine supply, no positioning — say so if the "
+                    "question needs them."
+                )
+                if st.button("▶ Read the metals complex", type="primary",
+                             key="mt_ai"):
+                    _err = ai_unavailable()
+                    if _err:
+                        st.error(f"AI read unavailable: {_err}.")
+                    else:
+                        with st.spinner("Reading…"):
+                            try:
+                                fx_px, _ = fx_load_prices()
+                                uv = (fxa.usd_values(fx_px)
+                                      if _HAS_FXA and not fx_px.empty else pd.DataFrame())
+                                bd = mtl.board(mt_px)
+                                rt = mtl.ratio_table(mt_px)
+                                ctx = {
+                                    "window": mt_window,
+                                    "board": (bd.drop(columns=["note"], errors="ignore")
+                                              .reset_index().to_dict("records")),
+                                    "themes": mtl.board(mt_px, mtl.THEMES)
+                                              .reset_index().to_dict("records"),
+                                    "ratios": (rt.drop(columns=["asks"], errors="ignore")
+                                               .reset_index().to_dict("records")),
+                                    "decomposition": {
+                                        name: {k: v for k, v in
+                                               mtl.in_currencies(
+                                                   mt_px[m.yahoo], uv, days=win).items()
+                                               if k != "per_currency"}
+                                        for name, m in mtl.METALS.items()
+                                        if m.yahoo in mt_px.columns and not uv.empty},
+                                    "driver_correlations":
+                                        mtl.driver_betas(mt_px, window=corr_win)
+                                        .reset_index().to_dict("records"),
+                                    "clusters": mtl.clustered(
+                                        mtl.correlations(
+                                            mt_px,
+                                            {m.name: m.yahoo for m in mtl.METALS.values()},
+                                            window=corr_win), 0.7),
+                                    "miners": mtl.miner_spread(mt_px, window=win)
+                                              .reset_index().to_dict("records"),
+                                    "caveats": [
+                                        "Decomposition splits a dollar-quoted move into "
+                                        "the metal's part and the dollar's, using the "
+                                        "median return across currencies.",
+                                        "Ratio percentiles run from 2000 at the earliest "
+                                        "— as far back as these futures go.",
+                                        "No inventory, mine supply, ETF flow or "
+                                        "positioning data is in this payload.",
+                                    ],
+                                }
+                                sysmsg = (
+                                    "You are a commodities strategist writing the metals "
+                                    "section of a morning note. You are given prices and "
+                                    "returns, the split of each metal's move into the "
+                                    "metal's part and the dollar's, the classic ratios "
+                                    "against their own history, correlations to macro "
+                                    "drivers, correlation clusters, and mining equity "
+                                    "against its metal.\n\n"
+                                    "Write 250-350 words covering:\n"
+                                    "1. What actually moved — and for each notable move, "
+                                    "whether it was the metal or the dollar. The "
+                                    "decomposition is given; use it rather than assuming.\n"
+                                    "2. What the ratios say about the regime, one at a "
+                                    "time. Do not blend them into a verdict.\n"
+                                    "3. Where the complex is concentrated — a cluster is "
+                                    "one position held several times, and worth saying "
+                                    "plainly.\n"
+                                    "4. Whether the miners confirm or contradict their "
+                                    "metal, and what that would imply about costs.\n\n"
+                                    "Quote the numbers you rely on. Do not forecast a "
+                                    "price. If the argument needs something absent from "
+                                    "the payload — inventories, flows, supply — say so "
+                                    "rather than supplying it from memory."
                                 )
                                 st.markdown(ai_agent.complete(
                                     sysmsg, json.dumps(ctx, indent=1, default=str),
@@ -6430,7 +7061,7 @@ than tuned.
                             <div style="font-size:26px;font-weight:800;color:{_struct_col}">{_struct_txt}</div>
                             <div style="font-size:12px;color:#666">{_hurst_txt}</div>
                             <div style="font-size:16px;font-weight:700;color:#ccc;margin-top:12px">{_regime_now}</div>
-                            <div style="font-size:12px;color:#666">vol regime · {_regime_pct if _regime_pct is not None else '?'}th pct</div>
+                            <div style="font-size:12px;color:#666">vol regime · {ordinal(_regime_pct) if _regime_pct is not None else '?'} pct</div>
                             <div style="font-size:12px;color:#666;margin-top:12px">{sym} · {tf_used} · {qm.get('n_bars', 0)} bars</div>
                             </div>
                             """, unsafe_allow_html=True)

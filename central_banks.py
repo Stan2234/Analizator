@@ -374,6 +374,54 @@ def inflation(currencies: Optional[List[str]] = None) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("ccy") if rows else pd.DataFrame()
 
 
+def cpi_index(ccy: str = "USD", start: str = "1990-01") -> pd.Series:
+    """The consumer price *index* for one country, monthly.
+
+    Distinct from inflation(), which returns the year-on-year rate. The index
+    is what deflates a price series into real terms, and it must be read from
+    unit 628 specifically — the same REF_AREA also carries the published rate
+    under unit 771, and a parser that ignores the unit will interleave a level
+    around 150 with a rate around 3 and produce nonsense.
+    """
+    cb = CENTRAL_BANKS.get(ccy)
+    if not cb:
+        return pd.Series(dtype=float)
+
+    body = _bis_get("WS_LONG_CPI", f"M.{cb.area}", startPeriod=start)
+    if not body:
+        return pd.Series(dtype=float)
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        log.exception("BIS CPI index returned unparseable XML")
+        return pd.Series(dtype=float)
+
+    pairs: List[Tuple[str, float]] = []
+    for series in root.iter():
+        if series.tag.split("}")[-1] != "Series":
+            continue
+        if series.attrib.get("UNIT_MEASURE") != "628":
+            continue
+        for obs in series:
+            if obs.tag.split("}")[-1] != "Obs":
+                continue
+            period, raw = obs.attrib.get("TIME_PERIOD"), obs.attrib.get("OBS_VALUE")
+            if not period or raw in (None, "", "NaN"):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                pairs.append((period, value))
+
+    if not pairs:
+        return pd.Series(dtype=float)
+    pairs.sort()
+    return pd.Series({pd.Timestamp(p): v for p, v in pairs}).sort_index()
+
+
 def policy_board(hist: pd.DataFrame, infl: pd.DataFrame,
                  currencies: Optional[List[str]] = None,
                  observed: Optional[Dict[str, str]] = None) -> pd.DataFrame:

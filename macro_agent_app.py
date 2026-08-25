@@ -42,6 +42,13 @@ except Exception as _ue:
     _FUND_IMPORT_ERROR = str(_ue)
 
 try:
+    import central_banks as cbk
+    _HAS_CBK = True
+except Exception as _ce:
+    _HAS_CBK = False
+    _CBK_IMPORT_ERROR = str(_ce)
+
+try:
     import data_layer as dl
     import scheduler as bg_scheduler
     import agent as ai_agent
@@ -1524,7 +1531,6 @@ def auto_fetch_news_if_needed() -> Optional[List[Dict[str, Any]]]:
     state = _load_fetch_state()
     now_utc = dt.datetime.utcnow()
     today_str = now_utc.strftime("%Y-%m-%d")
-    current_hour = now_utc.hour
 
     # Reset daily counter if new day
     if state.get("last_date") != today_str:
@@ -3585,11 +3591,11 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
-(tab_global, tab_fx, tab_carry, tab_crypto, tab_fund, tab_news, tab_quant,
+(tab_global, tab_fx, tab_carry, tab_cb, tab_crypto, tab_fund, tab_news, tab_quant,
  tab_ai, tab_fomc, tab_brief, tab_method) = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🪙 Crypto (Binance)",
-     "📐 Fundamentals", "📰 News & Macro", "🧮 Quant Lab", "🤖 AI Analyst",
-     "🏛 FOMC Lab", "🎯 Deep Brief", "📖 Methodology"]
+    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🏦 Central Banks",
+     "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro", "🧮 Quant Lab",
+     "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief", "📖 Methodology"]
 )
 
 # -------- GLOBAL TAB (Bloomberg-style dashboard) --------
@@ -4866,6 +4872,558 @@ that error is largest exactly where it matters most — around a policy turn.
 
 
 # -------- CRYPTO TAB --------
+
+# ============================ CENTRAL BANKS ============================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cb_load_history(years: int = 6):
+    """Policy rate history for every covered bank, from the BIS."""
+    return cbk.policy_rate_history(years=years)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cb_load_inflation():
+    return cbk.inflation()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cb_load_crosschecks(rates: Dict[str, float]):
+    """Confirm the BIS figure against each bank's own publication.
+
+    Takes a plain dict rather than the board frame so the cache key is stable —
+    a DataFrame hashes by contents and would re-fetch on any unrelated change.
+    """
+    board = pd.DataFrame({"rate": pd.Series(rates)})
+    return cbk.crosschecks(board)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cb_load_fed_curve(months: int = 15):
+    """Fed funds futures strip, fetched through the app's own Yahoo client.
+
+    A thin contract that has not traded lately returns an empty frame rather
+    than raising, so the curve simply stops where the liquidity does.
+    """
+    def _fetch(ticker: str, period: str = "3mo"):
+        try:
+            return fetch_yahoo_history(ticker, range_str=period)
+        except Exception:
+            return pd.DataFrame()
+    return cbk.fed_futures_curve(_fetch, months=months)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cb_load_gold():
+    return cbk.gold_holdings()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cb_gold_latest():
+    return cbk.latest_published()
+
+
+with tab_cb:
+    if not _HAS_CBK:
+        st.error(f"Central bank module failed to load: {_CBK_IMPORT_ERROR}")
+    else:
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CENTRAL BANKS</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">Policy rates · real rates · what the market has priced · gold</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Every number on this panel is fetched from the institution that published it.
+None of it is typed into this app by hand, and that is the point: a policy rate
+is checkable, and a table maintained by hand rots quietly between checks. When
+the hand-maintained table this panel replaced was tested against the BIS,
+**twelve of its seventeen rates were wrong** — the dollar by 87 basis points,
+the zloty by 200 — and all of them had been feeding the carry arithmetic.
+
+- **The board** — every bank's rate, when it last moved, and how far it sits
+  from its own cycle peak. A level means little on its own: 4% is restrictive
+  arriving from 1% and easy arriving from 8%.
+- **Real rates** — the policy rate less inflation. This is what actually
+  bears on a currency, and it regularly disagrees with the nominal ranking:
+  the highest nominal rate in the world can still be the loosest policy.
+- **What's priced** — the fed funds futures curve, which is the market paying
+  real money for a view on the Fed. Available for the dollar only; no free
+  feed carries the euro or sterling equivalents.
+- **Gold** — official holdings, and the share of reserves they represent.
+
+**Where the numbers come from.** Rates and inflation from the BIS, which is
+where central banks themselves report. The Federal Reserve Bank of New York,
+the ECB and the Bank of England are read directly as well, so the three
+largest are confirmed by two independent sources rather than one — the result
+of that comparison is shown on the board, including when it fails.
+
+**What is not here.** No forecast of the next decision, and no probability
+attached to one. The futures curve is an expectation with a risk premium
+inside it, not a prediction, and it is reported as the basis points it implies
+rather than converted into a percentage chance of a cut — that conversion
+takes an assumed move size and an assumed meeting calendar and quietly does
+most of the work.
+            """)
+
+        hist, observed = cb_load_history(6)
+        infl = cb_load_inflation()
+
+        if hist.empty:
+            st.error(
+                "The BIS returned no policy rate data, so this panel cannot be "
+                "built. The rest of the app falls back to a stored table of "
+                "rates confirmed on 2026-08-25 — see Currencies → Carry for "
+                "what each currency is currently using."
+            )
+        else:
+            board = cbk.policy_board(hist, infl, observed=observed)
+
+            cbt1, cbt2, cbt3, cbt4, cbt5 = st.tabs([
+                "🏛 The board", "📉 Real rates", "🇺🇸 What's priced",
+                "🥇 Gold", "🤖 Desk read"])
+
+            # ---------------- the board ----------------
+            with cbt1:
+                stale = board[board["stale_days"].fillna(0) > cbk.RATE_STALE_DAYS]
+                if not stale.empty:
+                    st.warning(
+                        "Last published more than "
+                        f"{cbk.RATE_STALE_DAYS} days ago: "
+                        + " · ".join(f"{c} ({int(board.loc[c, 'stale_days'])}d)"
+                                     for c in stale.index)
+                        + ". These banks meet less often rather than the feed "
+                          "being broken, but a decision could have landed since."
+                    )
+
+                show = board.copy()
+                show["Rate"] = show["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                show["Real"] = show["real_rate"].map(
+                    lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
+                show["Last move"] = [
+                    (f"{r['last_change']}  {r['last_change_bp']:+.0f}bp"
+                     if pd.notna(r.get("last_change_bp")) else "no move on record")
+                    for _, r in board.iterrows()]
+                show["12m"] = show["bp_12m"].map(
+                    lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
+                show["From peak"] = show["from_peak_bp"].map(
+                    lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
+                show["Published"] = [
+                    f"{r['as_of']}" + (f"  ({int(r['stale_days'])}d)"
+                                       if pd.notna(r["stale_days"]) else "")
+                    for _, r in board.iterrows()]
+
+                cols = ["bank", "instrument", "Rate", "Real", "Last move",
+                        "12m", "From peak", "Published"]
+                st.dataframe(
+                    show[cols].rename(columns={"bank": "Central bank",
+                                               "instrument": "What the rate is"}),
+                    use_container_width=True, height=640)
+
+                st.caption(
+                    "**Real** is the policy rate less year-on-year inflation — "
+                    "realised, not expected. The forward-looking version needs "
+                    "inflation expectations, which trade for a handful of these "
+                    "countries and are surveyed for the rest; mixing the two "
+                    "would make the column incomparable across the very rows it "
+                    "exists to compare. **From peak** measures against the "
+                    "highest rate of the last six years."
+                )
+
+                st.markdown("##### Confirmed against the banks themselves")
+                xc = cb_load_crosschecks(
+                    {c: float(board.loc[c, "rate"])
+                     for c in board.index if pd.notna(board.loc[c, "rate"])})
+
+                if xc.empty:
+                    st.info("No cross-checks returned.")
+                else:
+                    xcols = st.columns(len(xc))
+                    for col, (ccy, row) in zip(xcols, xc.iterrows()):
+                        with col:
+                            verdict = row["verdict"]
+                            if verdict == "agrees":
+                                colour, icon = "#26a69a", "✓"
+                            elif verdict == "DISAGREES":
+                                colour, icon = "#ef5350", "✗"
+                            else:
+                                colour, icon = "#888", "—"
+                            own = (f"{row['own_rate']:.3f}%"
+                                   if pd.notna(row["own_rate"]) else "unavailable")
+                            st.markdown(
+                                f"<div style='border-left:3px solid {colour};padding-left:10px'>"
+                                f"<b>{ccy}</b> {icon} {verdict}<br>"
+                                f"<span style='font-size:12px;color:#888'>"
+                                f"{row['bank_source']}<br>"
+                                f"says {own}"
+                                + (f", BIS says {row['bis_rate']:.3f}%"
+                                   if pd.notna(row["bis_rate"]) else "")
+                                + (f"<br>{row['note']}" if row.get("note") else "")
+                                + "</span></div>",
+                                unsafe_allow_html=True)
+
+                    bad = xc[xc["verdict"] == "DISAGREES"]
+                    if not bad.empty:
+                        st.error(
+                            "A source disagrees by more than "
+                            f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points: "
+                            + ", ".join(bad.index)
+                            + ". Treat the rate for these as unconfirmed until "
+                              "checked by hand — the panel does not pick a winner."
+                        )
+                    else:
+                        st.caption(
+                            "A gap inside "
+                            f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points is "
+                            "a convention difference, not a conflict: the BIS "
+                            "reports the Fed at the midpoint of its target range, "
+                            "so a source quoting the upper bound sits 12.5bp away "
+                            "and both are right."
+                        )
+
+                st.markdown("##### The path of each rate")
+                pick = st.multiselect(
+                    "Banks to plot", list(board.index),
+                    default=[c for c in ("USD", "EUR", "JPY", "GBP") if c in board.index],
+                    key="cb_path_pick")
+                if pick:
+                    fig = go.Figure()
+                    for ccy in pick:
+                        if ccy not in hist.columns:
+                            continue
+                        fig.add_trace(go.Scatter(
+                            x=hist.index, y=hist[ccy], name=ccy,
+                            line=dict(width=2, shape="hv"),
+                            hovertemplate=f"{ccy} %{{y:.2f}}%<br>%{{x|%d %b %Y}}<extra></extra>"))
+                    fig.update_layout(
+                        height=380, template="plotly_dark",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        yaxis_title="Policy rate (%)",
+                        legend=dict(orientation="h", y=1.12, x=0))
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        "Drawn as steps, because that is what a policy rate is — "
+                        "it holds its level between decisions rather than drifting "
+                        "between them."
+                    )
+
+            # ---------------- real rates ----------------
+            with cbt2:
+                real = board[board["real_rate"].notna()].sort_values("real_rate")
+                if real.empty:
+                    st.info("Inflation data unavailable, so no real rates.")
+                else:
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=real["real_rate"], y=real.index, orientation="h",
+                        marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                           for v in real["real_rate"]]),
+                        text=[f"{v:+.2f}%" for v in real["real_rate"]],
+                        textposition="outside",
+                        hovertemplate="%{y}: %{x:+.2f}% real<extra></extra>"))
+                    fig.update_layout(
+                        height=520, template="plotly_dark",
+                        margin=dict(l=10, r=40, t=30, b=10),
+                        xaxis_title="Policy rate less year-on-year inflation (%)",
+                        showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("""
+**Why this ranking and not the nominal one.** A currency is not attractive
+because its rate is high; it is attractive because its rate is high *relative
+to what inflation is taking away*. Those two rankings come apart constantly.
+A bank running the highest nominal rate in the table can still be running
+looser policy than one at a fraction of it, and the carry that looks most
+generous is often the carry being inflated away fastest.
+
+Negative real rates are the row to read twice. A central bank holding its rate
+below inflation is subsidising borrowers and taxing savers, and if it is doing
+so deliberately it usually has a reason it has not said out loud.
+                    """)
+
+                    detail = real.copy()
+                    detail["Policy"] = detail["rate"].map(lambda v: f"{v:.2f}%")
+                    detail["Inflation"] = detail["cpi_yoy"].map(lambda v: f"{v:.2f}%")
+                    detail["Real"] = detail["real_rate"].map(lambda v: f"{v:+.2f}%")
+                    detail["CPI as of"] = detail["cpi_as_of"]
+                    detail["Cross-check"] = detail["cpi_check"]
+                    st.dataframe(
+                        detail[["bank", "Policy", "Inflation", "Real",
+                                "CPI as of", "Cross-check"]]
+                        .rename(columns={"bank": "Central bank"}),
+                        use_container_width=True, height=560)
+
+                    mismatched = detail[detail["cpi_check"] == "mismatch"]
+                    if not mismatched.empty:
+                        st.warning(
+                            "Published inflation and the rate derived from the "
+                            "price index disagree for: "
+                            + ", ".join(mismatched.index)
+                            + ". Usually a rebasing or a revision. The published "
+                              "figure is the one shown."
+                        )
+                    else:
+                        st.caption(
+                            "**Cross-check** recomputes each inflation rate from "
+                            "the underlying price index and compares it to the "
+                            "published rate. `ok` means the two agree — which "
+                            "turns an assumption about the feed into a test of it."
+                        )
+
+            # ---------------- what's priced ----------------
+            with cbt3:
+                curve = cb_load_fed_curve(15)
+                usd_rate = (float(board.loc["USD", "rate"])
+                            if "USD" in board.index and pd.notna(board.loc["USD", "rate"])
+                            else None)
+                path = cbk.implied_path(curve, usd_rate)
+
+                if not path.get("available"):
+                    st.info(
+                        "Fed funds futures were unavailable this run, so there is "
+                        "nothing priced to show. Nothing else on this panel "
+                        "depends on them."
+                    )
+                else:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Fed funds now", f"{path['current']:.2f}%",
+                              help="BIS midpoint of the target range.")
+                    if "bp_6m" in path:
+                        m2.metric(f"Priced by {path['label_6m']}",
+                                  f"{path['implied_6m']:.2f}%",
+                                  f"{path['bp_6m']:+.0f}bp")
+                    if "bp_12m" in path:
+                        m3.metric(f"Priced by {path['label_12m']}",
+                                  f"{path['implied_12m']:.2f}%",
+                                  f"{path['bp_12m']:+.0f}bp")
+                    m4.metric("Market reading", path["reading"].replace("priced ", ""),
+                              help="Derived from the 12-month point, not a forecast.")
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=curve["label"], y=curve["implied"],
+                        mode="lines+markers", name="Implied by futures",
+                        line=dict(width=3, color="#42a5f5"),
+                        hovertemplate="%{x}: %{y:.3f}%<extra></extra>"))
+                    fig.add_hline(
+                        y=path["current"], line_dash="dash", line_color="#888",
+                        annotation_text=f"today {path['current']:.3f}%",
+                        annotation_position="top left")
+                    fig.update_layout(
+                        height=400, template="plotly_dark",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        yaxis_title="Implied average fed funds rate (%)",
+                        showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown(f"""
+**What this is.** A fed funds future settles to the average effective rate over
+its contract month, so `100 − price` is the rate the market is paying to lock
+in. The curve above runs {len(curve)} months out and currently prices the rate
+**{abs(path['terminal_bp']):.0f}bp {'higher' if path['terminal_bp'] > 0 else 'lower'}**
+by {path['terminal_label']}.
+
+**What it is not.** It is not a forecast, and the difference matters. The price
+contains a risk premium — what someone will pay to *not* be exposed to rates
+moving against them — so a curve pricing hikes partly reflects demand for
+protection rather than conviction that hikes are coming. It is the market's
+position, which is a different and more useful thing than the market's opinion.
+
+**Why there is no "72% chance of a cut" here.** That number is manufactured by
+assuming the move size and assuming the meeting is the only thing that moves
+the monthly average. Those assumptions do the work; the percentage takes the
+credit and hides them. Basis points are what the curve actually says.
+
+**Dollar only.** €STR and SONIA futures are not carried by any free feed, so
+the other banks on this panel have no priced path here — an absence, not a
+judgement that their rates are settled.
+                    """)
+
+            # ---------------- gold ----------------
+            with cbt4:
+                gold = cb_load_gold()
+                if "error" in gold:
+                    st.warning(
+                        f"Gold holdings unavailable: {gold['error']}. "
+                        "The file ships with the app from the World Gold "
+                        "Council; see the note below on refreshing it."
+                    )
+                else:
+                    latest = cb_gold_latest()
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("World official holdings",
+                              f"{gold['world_tonnes']:,.0f} t")
+                    if gold.get("euro_area"):
+                        g2.metric("Euro area (incl. ECB)",
+                                  f"{gold['euro_area']['tonnes']:,.0f} t")
+                    rng = gold.get("as_of_range")
+                    if rng:
+                        g3.metric("Countries reporting to", rng[1],
+                                  help="Each country reports on its own schedule; "
+                                       "this is the most recent date in the table.")
+
+                    joined = cbk.gold_vs_reserves(gold, board)
+                    if not joined.empty:
+                        held = joined[joined["tonnes"].notna()].copy()
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(
+                            x=held.index, y=held["pct_reserves"],
+                            marker=dict(color="#ffb300"),
+                            text=[f"{v:.0f}%" for v in held["pct_reserves"]],
+                            textposition="outside",
+                            customdata=held["tonnes"],
+                            hovertemplate="%{x}: %{y:.1f}% of reserves"
+                                          "<br>%{customdata:,.0f} tonnes<extra></extra>"))
+                        fig.update_layout(
+                            height=380, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="Gold as % of total reserves",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption(
+                            "The share, not the tonnage, is the informative "
+                            "number. A large economy can hold a large absolute "
+                            "amount and still hold very little of it relative to "
+                            "its dollars — and it is that ratio, not the weight, "
+                            "that says something about how a bank thinks about "
+                            "the dollar."
+                        )
+
+                        gshow = joined.copy()
+                        gshow["Tonnes"] = gshow["tonnes"].map(
+                            lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+                        gshow["% of reserves"] = gshow["pct_reserves"].map(
+                            lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+                        gshow["Rank"] = gshow["rank"].map(
+                            lambda v: f"#{int(v)}" if pd.notna(v) else "—")
+                        gshow["Reported"] = gshow["gold_as_of"].fillna("—")
+                        st.dataframe(
+                            gshow[["bank", "Rank", "Tonnes", "% of reserves",
+                                   "Reported", "status"]]
+                            .rename(columns={"bank": "Central bank",
+                                             "status": "Basis"}),
+                            use_container_width=True, height=640)
+
+                        nil = joined[joined["status"] == "below listing threshold"]
+                        if not nil.empty:
+                            st.info(
+                                "**"
+                                + ", ".join(f"{c} ({board.loc[c, 'bank']})"
+                                            for c in nil.index)
+                                + "** do not appear in the table at all. It runs "
+                                  f"to a hundred holders and stops at "
+                                  f"{gold['cutoff_tonnes']:.1f} tonnes, so each of "
+                                  "them holds less than that — all three sold their "
+                                  "reserves down. Shown rather than dropped, "
+                                  "because a central bank choosing to hold no gold "
+                                  "is a policy, not a gap in the data."
+                            )
+
+                    st.markdown("##### Where this comes from, and when it goes stale")
+                    vintage = gold.get("vintage", "unknown vintage")
+                    note = (
+                        f"The file shipped with the app is **{vintage}**. "
+                        "The World Gold Council compiles it from the IMF's "
+                        "reserve statistics and publishes a new one in the first "
+                        "ten days of each month, with the underlying data about "
+                        "two months behind."
+                    )
+                    if latest.get("published"):
+                        note += f" The current file on their site is **{latest['published']}**."
+                    st.markdown(note)
+
+                    if latest.get("filename") and gold.get("vintage"):
+                        shipped_month = gold["vintage"].split(",")[-1].strip()
+                        if latest.get("published") and \
+                                latest["published"].lower()[:3] not in shipped_month.lower():
+                            st.warning(
+                                f"A newer file is available ({latest['published']}). "
+                                "The download needs a free Goldhub account, so the "
+                                "app cannot fetch it — replace "
+                                "`refdata/wgc_official_gold_holdings.xlsx` to update."
+                            )
+                    st.caption(
+                        "Holdings move by a few tonnes a month, so a file a "
+                        "quarter old barely differs from a current one. It is "
+                        "shown with its vintage regardless, because the reader "
+                        "should not have to assume."
+                    )
+
+            # ---------------- desk read ----------------
+            with cbt5:
+                st.caption(
+                    "Reads the measured figures above. It has no meeting "
+                    "minutes, no speeches and no positioning data — say so if "
+                    "the question needs them."
+                )
+                if st.button("▶ Read the policy picture", type="primary",
+                             key="cb_ai_read"):
+                    _err = ai_unavailable()
+                    if _err:
+                        st.error(f"AI read unavailable: {_err}.")
+                    else:
+                        with st.spinner("Reading…"):
+                            try:
+                                _fpath = cbk.implied_path(
+                                    cb_load_fed_curve(15),
+                                    float(board.loc["USD", "rate"])
+                                    if "USD" in board.index
+                                    and pd.notna(board.loc["USD", "rate"]) else None)
+                                ctx = {
+                                    "banks": [
+                                        {k: (None if pd.isna(v) else v)
+                                         for k, v in row.items()
+                                         if not isinstance(v, (pd.Series, pd.DataFrame))}
+                                        | {"ccy": c}
+                                        for c, row in board.iterrows()],
+                                    "fed_futures_path": {
+                                        k: v for k, v in _fpath.items()
+                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                    "gold": (
+                                        cbk.gold_vs_reserves(cb_load_gold(), board)
+                                        [["tonnes", "pct_reserves", "status"]]
+                                        .reset_index().to_dict("records")
+                                        if "error" not in cb_load_gold() else []),
+                                    "caveats": [
+                                        "Real rates are ex-post: the policy rate less "
+                                        "realised year-on-year inflation, not inflation "
+                                        "expectations.",
+                                        "Inflation lags two to five months depending on "
+                                        "the country; the policy rate is current.",
+                                        "The futures curve carries a risk premium and is "
+                                        "not a forecast. It exists for the dollar only.",
+                                        "No meeting calendar, minutes, speeches or "
+                                        "positioning data are in this payload.",
+                                    ],
+                                }
+                                sysmsg = (
+                                    "You are writing the policy section of a morning note "
+                                    "for a macro desk. You are given every covered central "
+                                    "bank's policy rate, its inflation rate and the real "
+                                    "rate that follows, the direction and date of its last "
+                                    "move, how far it sits from its own cycle peak, the fed "
+                                    "funds futures path, and official gold holdings.\n\n"
+                                    "Write 250-350 words covering:\n"
+                                    "1. Where policy is genuinely divergent, and where the "
+                                    "divergence is only nominal once inflation is netted "
+                                    "off. These give different answers and the difference "
+                                    "is the point.\n"
+                                    "2. Which banks sit furthest from their own cycle peak, "
+                                    "and which have not moved at all.\n"
+                                    "3. What the fed funds curve implies, and what would "
+                                    "have to be true for it to be wrong.\n\n"
+                                    "Quote the numbers you rely on. Do not predict any "
+                                    "decision and do not attach a probability to one. If "
+                                    "something the argument needs is absent from the "
+                                    "payload, say so rather than supplying it from memory."
+                                )
+                                st.markdown(ai_agent.complete(
+                                    sysmsg, json.dumps(ctx, indent=1, default=str),
+                                    max_tokens=3000, effort="medium"))
+                            except Exception as _e:
+                                st.error(f"Model call failed: {_e}")
+
 with tab_crypto:
     st.subheader("🪙 Crypto — Institutional Digital Asset Dashboard")
 

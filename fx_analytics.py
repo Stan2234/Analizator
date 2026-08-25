@@ -106,45 +106,58 @@ FRED_POLICY_SERIES: Dict[str, str] = {
 # anything without a recent confirmation is published as unverified and kept
 # out of the rankings rather than quietly averaged into them.
 #
-# Verified 2026-08-16. Re-confirm before relying on any of these.
-SEED_VERIFIED_ON = "2026-08-16"
+# These are now a fallback, not the source. The BIS publishes what central
+# banks themselves report and `central_banks.policy_rate_history` reads it
+# live, so this table is only consulted when that fetch fails.
+#
+# It is kept because a dashboard that shows nothing when a feed is down is
+# worse than one that shows a rate a few weeks old and says so. It is not kept
+# as a maintenance burden anyone should rely on: when these values were
+# checked against the BIS on 2026-08-25, twelve of the seventeen were wrong —
+# the dollar by 87bp, the zloty by 200bp — and every one of them had been
+# feeding the carry arithmetic. That is what a hand-maintained rate table
+# decays into, which is the argument for fetching it.
+#
+# Values below are the BIS figures as at 2026-08-25, cross-confirmed for the
+# dollar, euro and pound against the Federal Reserve Bank of New York, the ECB
+# and the Bank of England respectively.
+SEED_VERIFIED_ON = "2026-08-25"
 
 POLICY_RATE_SEED: Dict[str, Dict[str, Any]] = {
     # code:  rate,  effective from,  confirmed on,      what the number is
-    "USD": {"rate": 4.50,  "effective": "2026-03-18", "verified": SEED_VERIFIED_ON,
-            "note": "Fed target range upper bound"},
-    "EUR": {"rate": 2.25,  "effective": "2026-07-23", "verified": SEED_VERIFIED_ON,
+    "USD": {"rate": 3.625, "effective": "2025-12-11", "verified": SEED_VERIFIED_ON,
+            "note": "Fed funds target midpoint"},
+    "EUR": {"rate": 2.25,  "effective": "2026-06-17", "verified": SEED_VERIFIED_ON,
             "note": "ECB deposit facility rate"},
-    "JPY": {"rate": 1.00,  "effective": "2026-06-16", "verified": SEED_VERIFIED_ON,
+    "JPY": {"rate": 1.00,  "effective": "2026-06-17", "verified": SEED_VERIFIED_ON,
             "note": "BoJ short-term policy rate"},
-    "TRY": {"rate": 37.00, "effective": "2026-08-01", "verified": SEED_VERIFIED_ON,
+    "TRY": {"rate": 37.00, "effective": "2026-01-23", "verified": SEED_VERIFIED_ON,
             "note": "CBRT one-week repo"},
-    "BRL": {"rate": 14.25, "effective": "2026-06-18", "verified": SEED_VERIFIED_ON,
+    "BRL": {"rate": 14.00, "effective": "2026-08-06", "verified": SEED_VERIFIED_ON,
             "note": "Selic target"},
-    "MXN": {"rate": 6.50,  "effective": "2026-06-26", "verified": SEED_VERIFIED_ON,
-            "note": "Banxico overnight"},
-    # Not confirmed at the last review — shown, but excluded from rankings.
-    "GBP": {"rate": 4.50,  "effective": "2026-03-19", "verified": None,
+    "MXN": {"rate": 6.50,  "effective": "2026-05-08", "verified": SEED_VERIFIED_ON,
+            "note": "Banxico overnight target"},
+    "GBP": {"rate": 3.75,  "effective": "2025-12-18", "verified": SEED_VERIFIED_ON,
             "note": "BoE Bank Rate"},
-    "CHF": {"rate": 0.25,  "effective": "2026-03-20", "verified": None,
+    "CHF": {"rate": 0.00,  "effective": "2025-06-20", "verified": SEED_VERIFIED_ON,
             "note": "SNB policy rate"},
-    "AUD": {"rate": 4.10,  "effective": "2026-04-01", "verified": None,
-            "note": "RBA cash rate"},
-    "CAD": {"rate": 2.75,  "effective": "2026-03-12", "verified": None,
-            "note": "BoC overnight target"},
-    "NZD": {"rate": 3.50,  "effective": "2026-04-09", "verified": None,
+    "AUD": {"rate": 4.35,  "effective": "2026-05-06", "verified": SEED_VERIFIED_ON,
+            "note": "RBA cash rate target"},
+    "CAD": {"rate": 2.25,  "effective": "2025-10-30", "verified": SEED_VERIFIED_ON,
+            "note": "BoC overnight rate target"},
+    "NZD": {"rate": 2.50,  "effective": "2026-07-09", "verified": SEED_VERIFIED_ON,
             "note": "RBNZ official cash rate"},
-    "SEK": {"rate": 2.25,  "effective": "2026-03-20", "verified": None,
+    "SEK": {"rate": 1.75,  "effective": "2025-10-01", "verified": SEED_VERIFIED_ON,
             "note": "Riksbank policy rate"},
-    "NOK": {"rate": 4.25,  "effective": "2026-03-27", "verified": None,
+    "NOK": {"rate": 4.25,  "effective": "2026-05-08", "verified": SEED_VERIFIED_ON,
             "note": "Norges Bank policy rate"},
-    "CNY": {"rate": 3.10,  "effective": "2026-03-20", "verified": None,
-            "note": "PBoC 1y LPR"},
-    "ZAR": {"rate": 7.25,  "effective": "2026-03-20", "verified": None,
+    "CNY": {"rate": 3.00,  "effective": "2025-05-20", "verified": SEED_VERIFIED_ON,
+            "note": "PBoC 1y loan prime rate"},
+    "ZAR": {"rate": 7.00,  "effective": "2026-05-29", "verified": SEED_VERIFIED_ON,
             "note": "SARB repo rate"},
-    "INR": {"rate": 6.00,  "effective": "2026-04-09", "verified": None,
+    "INR": {"rate": 5.25,  "effective": "2025-12-05", "verified": SEED_VERIFIED_ON,
             "note": "RBI repo rate"},
-    "PLN": {"rate": 5.75,  "effective": "2026-03-05", "verified": None,
+    "PLN": {"rate": 3.75,  "effective": "2026-03-05", "verified": SEED_VERIFIED_ON,
             "note": "NBP reference rate"},
 }
 
@@ -160,16 +173,20 @@ def policy_rates(fred_key: str = "",
     Columns: rate, as_of, source, stale_days, note, status.
 
     `status` is what callers should gate on:
-      live       — pulled from FRED this run
-      verified   — hand-seeded and confirmed within VERIFICATION_MAX_AGE_DAYS
+      live       — fetched this run from the BIS or FRED
+      verified   — fell back to the seed, confirmed within
+                   VERIFICATION_MAX_AGE_DAYS
       override   — supplied by the caller, e.g. corrected in the UI
       unverified — seeded but not recently confirmed; display, do not rank on
       missing    — no rate at all
 
+    Sources are tried in order of authority: the BIS first, since it carries
+    every currency here in one call and is where the central banks themselves
+    report; then FRED for anything the BIS did not return; then the seed.
+
     `overrides` maps a currency code to a rate the user has entered, which
-    always wins. Rates change a handful of times a year at unpredictable
-    moments; letting someone correct one in place beats shipping a stale
-    constant and hoping nobody checks.
+    always wins — a decision can land between a fetch and a reader noticing,
+    and correcting it in place beats waiting for a feed.
     """
     import sources as src  # lazy; the module must stay importable offline
 
@@ -177,12 +194,38 @@ def policy_rates(fred_key: str = "",
     overrides = overrides or {}
     rows = []
 
+    # One BIS call covers every currency; failure is not fatal, it just leaves
+    # the later sources to fill in.
+    bis_rates: Dict[str, float] = {}
+    bis_dates: Dict[str, str] = {}
+    bis_notes: Dict[str, str] = {}
+    try:
+        import central_banks as cbk
+        hist, observed = cbk.policy_rate_history(years=1)
+        if not hist.empty:
+            latest = hist.ffill().iloc[-1]
+            for code in CURRENCIES:
+                if code in latest.index and pd.notna(latest[code]):
+                    bis_rates[code] = float(latest[code])
+                    bis_dates[code] = observed.get(code) or ""
+                    bank = cbk.CENTRAL_BANKS.get(code)
+                    if bank:
+                        bis_notes[code] = bank.instrument
+    except Exception:
+        log.exception("BIS policy rates unavailable; falling back")
+
     for code in CURRENCIES:
         rate = as_of = source = note = None
         status = "missing"
 
+        if code in bis_rates:
+            rate = bis_rates[code]
+            as_of = bis_dates.get(code) or None
+            note = bis_notes.get(code)
+            source, status = "BIS", "live"
+
         series = FRED_POLICY_SERIES.get(code)
-        if series and fred_key:
+        if rate is None and series and fred_key:
             try:
                 obs = src.fetch_fred_observations(fred_key, series, limit=10)
                 for o in obs:  # newest first; FRED writes "." for missing

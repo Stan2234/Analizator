@@ -595,6 +595,190 @@ for _r in SP500_COMPANIES:
     _seen.add(_r["symbol"])
     _unique.append(_r)
 SP500_COMPANIES = _unique
+_SHIPPED_SNAPSHOT: List[Dict[str, str]] = list(_unique)
+
+
+# ---------------- keeping the list current ----------------
+# The block above is a snapshot, and a snapshot of an index that reconstitutes
+# every quarter goes wrong in two directions at once. Checked against the live
+# index on 2026-08-25, the shipped list was missing 63 members — Palantir,
+# Coinbase, GE Vernova, Reddit, and 3M among them — while still carrying 49
+# names that had left, six of which were fully delisted and returned an error
+# on every fetch the scheduler attempted.
+#
+# So it is fetched. The snapshot stays as the fallback, because a universe that
+# is a quarter stale is worth far more than an empty one, and every replacement
+# has to get past the guards below before it is allowed to take effect.
+
+SP500_SOURCE = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+# A parse that returns a plausible-looking but wrong table is the failure worth
+# defending against — a silent one. The index has held between 490 and 510
+# constituents for decades, and any correct list must mostly agree with the one
+# already shipped. A layout change on the source page fails both tests.
+_MIN_CONSTITUENTS = 450
+_MAX_CONSTITUENTS = 560
+_MIN_OVERLAP = 0.70
+
+
+def _normalise_symbol(raw: str) -> str:
+    """Wikipedia writes class shares as BRK.B; Yahoo wants BRK-B."""
+    return str(raw).strip().upper().replace(".", "-")
+
+
+def fetch_live_constituents(timeout: int = 30) -> Dict[str, object]:
+    """The current S&P 500 from the published constituent list.
+
+    Returns {"ok": bool, "records": [...], "error": str, "n": int}. Never
+    raises and never mutates anything — deciding whether to adopt the result is
+    a separate step, so a caller can inspect a rejected fetch instead of
+    discovering it as a missing panel.
+    """
+    out: Dict[str, object] = {"ok": False, "records": [], "error": "", "n": 0}
+    try:
+        import requests
+        import pandas as pd
+    except Exception as exc:                       # pragma: no cover
+        out["error"] = f"missing dependency: {exc}"
+        return out
+
+    try:
+        r = requests.get(SP500_SOURCE, headers={"User-Agent": "Analizator/1.0"},
+                         timeout=timeout)
+        if r.status_code != 200:
+            out["error"] = f"HTTP {r.status_code}"
+            return out
+        tables = pd.read_html(r.text)
+    except Exception as exc:
+        out["error"] = f"fetch/parse failed: {str(exc)[:120]}"
+        return out
+
+    table = None
+    for t in tables:
+        cols = [str(c).lower() for c in t.columns]
+        if any("symbol" in c for c in cols) and any(
+                ("security" in c or "company" in c) for c in cols):
+            table = t
+            break
+    if table is None:
+        out["error"] = "no constituents table on the page"
+        return out
+
+    def _col(*needles: str) -> Optional[str]:
+        for c in table.columns:
+            lc = str(c).lower()
+            if any(n in lc for n in needles):
+                return c
+        return None
+
+    c_sym = _col("symbol")
+    c_name = _col("security", "company")
+    c_sector = _col("gics sector")
+    c_industry = _col("gics sub", "sub-industry", "sub industry")
+    if not c_sym or not c_name:
+        out["error"] = "constituents table is missing symbol or name"
+        return out
+
+    records: List[Dict[str, str]] = []
+    seen = set()
+    for _, row in table.iterrows():
+        sym = _normalise_symbol(row[c_sym])
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        records.append({
+            "symbol": sym,
+            "name": str(row[c_name]).strip(),
+            "sector": (str(row[c_sector]).strip() if c_sector else "Unknown"),
+            "industry": (str(row[c_industry]).strip() if c_industry else ""),
+        })
+
+    out["records"] = records
+    out["n"] = len(records)
+    out["ok"] = True
+    return out
+
+
+def validate_constituents(records: List[Dict[str, str]]) -> Dict[str, object]:
+    """Decide whether a fetched list is safe to adopt.
+
+    Two independent checks, because either alone is fooled by a different
+    failure. Count catches a truncated or exploded parse; overlap with the
+    shipped snapshot catches a well-formed table that happens to be a
+    different table.
+    """
+    out: Dict[str, object] = {"ok": False, "reason": ""}
+    n = len(records or [])
+    if not (_MIN_CONSTITUENTS <= n <= _MAX_CONSTITUENTS):
+        out["reason"] = (f"{n} constituents is outside the plausible range "
+                         f"{_MIN_CONSTITUENTS}-{_MAX_CONSTITUENTS}")
+        return out
+
+    fetched = {r["symbol"] for r in records}
+    # Against the immutable shipped snapshot, never against whatever is
+    # currently loaded. Comparing to the live list would let one bad adoption
+    # become the baseline that validates the next one.
+    shipped = {r["symbol"] for r in _SHIPPED_SNAPSHOT}
+    overlap = len(fetched & shipped) / max(len(shipped), 1)
+    if overlap < _MIN_OVERLAP:
+        out["reason"] = (f"only {overlap:.0%} of the shipped list appears in the "
+                         f"fetched one — probably not the same table")
+        return out
+
+    if not all(r.get("symbol") and r.get("name") for r in records):
+        out["reason"] = "some rows have no symbol or no name"
+        return out
+
+    out.update({"ok": True, "n": n, "overlap": overlap,
+                "added": sorted(fetched - shipped),
+                "removed": sorted(shipped - fetched)})
+    return out
+
+
+#: Set once a live fetch has been adopted, so panels can say which list they
+#: are showing rather than leaving the reader to assume it is current.
+UNIVERSE_SOURCE: Dict[str, object] = {
+    "source": "shipped snapshot",
+    "as_of": "2026-05",
+    "n": len(SP500_COMPANIES),
+}
+
+
+def refresh_from_web(timeout: int = 30) -> Dict[str, object]:
+    """Fetch the live constituents and adopt them if they pass validation.
+
+    On success `SP500_COMPANIES` is replaced in place, which is enough for the
+    whole app: every consumer reaches it through the module rather than binding
+    the list at import.
+
+    Returns a report — adopted or not, and why not — so a caller can log or
+    display the outcome instead of silently continuing on stale data.
+    """
+    global SP500_COMPANIES, UNIVERSE_SOURCE
+
+    fetched = fetch_live_constituents(timeout=timeout)
+    if not fetched.get("ok"):
+        return {"adopted": False, "reason": fetched.get("error", "fetch failed")}
+
+    records = fetched["records"]                      # type: ignore[index]
+    verdict = validate_constituents(records)          # type: ignore[arg-type]
+    if not verdict.get("ok"):
+        return {"adopted": False, "reason": verdict.get("reason", "failed validation")}
+
+    import datetime as _dt
+    SP500_COMPANIES = records                         # type: ignore[assignment]
+    UNIVERSE_SOURCE = {
+        "source": SP500_SOURCE,
+        "as_of": _dt.date.today().isoformat(),
+        "n": len(records),
+    }
+    return {
+        "adopted": True,
+        "n": len(records),
+        "added": verdict.get("added"),
+        "removed": verdict.get("removed"),
+        "as_of": UNIVERSE_SOURCE["as_of"],
+    }
 
 
 # ---------------- core watchlist (always auto-refreshed) ----------------

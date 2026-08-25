@@ -278,7 +278,6 @@ LIVE_TICKER_SYMBOLS = [
     ("ETHUSDT", "ETH"),
     ("BNBUSDT", "BNB"),
     ("SOLUSDT", "SOL"),
-    ("ADAUSDT", "ADA"),
     ("XRPUSDT", "XRP"),
 
     # Major global indices, rates, DXY, WTI (added 2026-05)
@@ -6938,8 +6937,31 @@ than tuned.
         placeholder="e.g. PLTR  ·  Palantir  ·  ASML.AS  ·  RHM.DE",
     )
 
+    # Say which constituent list is loaded. The index reconstitutes quarterly
+    # and the shipped snapshot goes stale in both directions, so a reader who
+    # cannot find a name deserves to know whether the list is current before
+    # concluding the app cannot see it.
+    try:
+        import symbol_universe as _su
+        _uni_src = _su.UNIVERSE_SOURCE
+        if str(_uni_src.get("source", "")).startswith("http"):
+            st.caption(
+                f"Universe: **{_uni_src.get('n')} S&P 500 constituents**, "
+                f"fetched {_uni_src.get('as_of')}. Anything outside it is "
+                "looked up directly on Yahoo."
+            )
+        else:
+            st.caption(
+                f"Universe: **{_uni_src.get('n')} S&P 500 constituents** from "
+                f"the built-in snapshot ({_uni_src.get('as_of')}) — the live "
+                "list could not be fetched, so recent index changes are "
+                "missing. Anything outside it is looked up directly on Yahoo."
+            )
+    except Exception:
+        pass
+
     # Resolve the custom query → symbol.
-    #   Step 1: search our universe (covers ~489 S&P 500 + indices + ETFs)
+    #   Step 1: search our universe (the current S&P 500 + indices + ETFs)
     #   Step 2: try the literal input as a Yahoo ticker (broader coverage)
     #   Step 3: give up with a clear "no data" message
     custom_symbol_resolved: Optional[str] = None
@@ -7675,6 +7697,14 @@ with tab_brief:
             if cached:
                 st.session_state["last_deep_brief"] = cached
 
+        # Whether anything will refresh this on its own, said on the face of
+        # the panel rather than inside a collapsed expander. An age alone reads
+        # as a staleness warning, which implies something is due to clear it —
+        # and when nothing is scheduled, that implication is the misleading part.
+        _brief_jobs = bg_scheduler.scheduler_status().get("jobs", [])
+        _brief_scheduled = next((j for j in _brief_jobs
+                                 if j.get("id") == "deep_brief"), None)
+
         cache_age_min = orch.cached_brief_age_minutes()
         if cache_age_min is not None:
             age_label = (f"{cache_age_min:.0f} min ago" if cache_age_min < 60
@@ -7683,14 +7713,30 @@ with tab_brief:
             st.caption(f"{freshness_emoji} Last cached brief: **{age_label}** "
                        f"(persisted in SQLite, survives reloads)")
 
+        if _brief_scheduled:
+            st.caption(
+                "🔁 Refreshes on a schedule — next run "
+                f"`{_brief_scheduled.get('next_run')}` UTC."
+            )
+        else:
+            st.caption(
+                "⏸ **This does not refresh on its own.** No brief is scheduled, "
+                "so the cached one above stays as it is until you press "
+                "**Run Fresh Brief**. See ⏰ Scheduled brief below to turn "
+                "scheduling on."
+            )
+
         # Scheduled brief status
         with st.expander("⏰ Scheduled brief", expanded=False):
             sched_status = bg_scheduler.scheduler_status()
             jobs = sched_status.get("jobs", [])
             brief_job = next((j for j in jobs if j.get("id") == "deep_brief"), None)
-            scheduling_enabled = (os.environ.get("ENABLE_SCHEDULED_BRIEF", "").lower()
+            # Read the same way the scheduler does. Reading only os.environ
+            # here meant a value set in st.secrets showed as disabled while the
+            # job was in fact registered, so the panel contradicted itself.
+            scheduling_enabled = ((get_secret("ENABLE_SCHEDULED_BRIEF") or "").lower()
                                   in ("1", "true", "yes", "on"))
-            cron_setting = os.environ.get("DEEP_BRIEF_CRON", "0 7 * * 1-5 (default)")
+            cron_setting = get_secret("DEEP_BRIEF_CRON") or "0 7 * * 1-5 (default)"
 
             colA, colB = st.columns(2)
             colA.markdown(f"**Enabled:** {'✅ yes' if scheduling_enabled else '❌ no'}")

@@ -592,8 +592,17 @@ def seed_universe(force: bool = False) -> int:
     with _DB_LOCK:
         if not force:
             existing = conn.execute("SELECT COUNT(*) c FROM symbols_universe").fetchone()["c"]
-            if existing >= len(su.SP500_COMPANIES) + len(su.MAJOR_INDICES) - 5:
-                return 0  # already seeded
+            # Compare against the symbols we actually hold, not just how many.
+            # A count-only check passes as soon as the table is big enough,
+            # which meant a refreshed constituent list — sixty new names in
+            # this index's case — was never written because the old rows had
+            # already met the quota.
+            known = {r["symbol"] for r in su.SP500_COMPANIES}
+            known |= {r["symbol"] for r in su.MAJOR_INDICES}
+            have = {r["symbol"] for r in conn.execute(
+                "SELECT symbol FROM symbols_universe").fetchall()}
+            if existing and not (known - have):
+                return 0  # every symbol we know about is already registered
         now = now_utc_iso()
         core_set = set(su.CORE_WATCHLIST)
         rows = []

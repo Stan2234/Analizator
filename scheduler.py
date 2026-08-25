@@ -268,6 +268,37 @@ def job_generate_deep_brief() -> None:
         log.exception("job_generate_deep_brief failed: %s", e)
 
 
+def job_refresh_sp500_universe() -> None:
+    """Pull the current S&P 500 constituent list and reseed from it.
+
+    The index reconstitutes quarterly, so a list compiled by hand drifts in
+    both directions: it loses the names that were added and keeps the ones
+    that were removed, and the removed ones are worse — a delisted ticker
+    errors on every quote fetch for as long as it stays in the table.
+
+    The fetch validates before it is adopted and falls back to the shipped
+    snapshot, so a bad parse leaves a quarter-stale universe rather than an
+    empty one.
+    """
+    try:
+        import symbol_universe as su
+        report = su.refresh_from_web()
+        if not report.get("adopted"):
+            log.warning("sp500 universe refresh not adopted: %s",
+                        report.get("reason"))
+            return
+        added, removed = report.get("added") or [], report.get("removed") or []
+        log.info("sp500 universe refreshed: %d constituents (+%d/-%d)",
+                 report.get("n", 0), len(added), len(removed))
+        if added:
+            log.info("  added: %s", ", ".join(added[:20]))
+        if removed:
+            log.info("  removed: %s", ", ".join(removed[:20]))
+        dl.seed_universe(force=True)
+    except Exception as e:
+        log.exception("job_refresh_sp500_universe failed: %s", e)
+
+
 def _parse_brief_cron() -> Optional[CronTrigger]:
     """Read DEEP_BRIEF_CRON from env. Returns None on parse failure.
 
@@ -317,6 +348,8 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_fred, IntervalTrigger(hours=6), id="fred", replace_existing=True)
         sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True)
         sched.add_job(job_prune, CronTrigger(hour=3, minute=0), id="prune", replace_existing=True)
+        sched.add_job(job_refresh_sp500_universe, CronTrigger(hour=2, minute=30),
+                      id="sp500_universe", replace_existing=True)
 
         # Optional: scheduled deep brief generation (opt-in via env var)
         if _get_secret("ENABLE_SCHEDULED_BRIEF", "").lower() in ("1", "true", "yes", "on"):
@@ -334,7 +367,11 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
 
         if run_now:
             # Kick off the cheap ones immediately so the UI has data on first load
-            for fn in (job_refresh_quotes, job_refresh_rss, job_refresh_crypto_market):
+            # The constituent refresh goes first: everything else fetches
+            # against the universe, so a stale one means a round of quotes
+            # spent on delisted tickers.
+            for fn in (job_refresh_sp500_universe, job_refresh_quotes,
+                       job_refresh_rss, job_refresh_crypto_market):
                 try:
                     threading.Thread(target=fn, daemon=True).start()
                 except Exception:

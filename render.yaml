@@ -22,10 +22,6 @@ services:
         sync: false
       - key: NEWSAPI_KEY
         sync: false
-      - key: BINANCE_API_KEY
-        sync: false
-      - key: BINANCE_API_SECRET
-        sync: false
       - key: FRED_API_KEY
         sync: false
       - key: FINNHUB_API_KEY

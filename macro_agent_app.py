@@ -12,7 +12,6 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dotenv import load_dotenv
-from binance.client import Client
 from bs4 import BeautifulSoup
 import streamlit.components.v1 as components
 import pdfplumber
@@ -54,6 +53,13 @@ try:
 except Exception as _me:
     _HAS_MTL = False
     _MTL_IMPORT_ERROR = str(_me)
+
+try:
+    import crypto_analytics as cra
+    _HAS_CRA = True
+except Exception as _cae:
+    _HAS_CRA = False
+    _CRA_IMPORT_ERROR = str(_cae)
 
 try:
     import data_layer as dl
@@ -116,8 +122,6 @@ password_gate()
 def inject_secrets_to_env():
     keys = [
         "NEWSAPI_KEY",
-        "BINANCE_API_KEY",
-        "BINANCE_API_SECRET",
         "ANTHROPIC_API_KEY",
         "FRED_API_KEY",
         "FINNHUB_API_KEY",
@@ -150,8 +154,10 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 NEWSAPI_KEY = get_secret("NEWSAPI_KEY")
-BINANCE_API_KEY = get_secret("BINANCE_API_KEY")
-BINANCE_API_SECRET = get_secret("BINANCE_API_SECRET")
+
+# No Binance key anywhere in the app. Everything it reads from Binance —
+# candles, tickers, funding, open interest — is on the public endpoints, and
+# a key would only add a credential to leak in exchange for nothing.
 
 # ------------------------------------
 # CONFIG
@@ -247,22 +253,11 @@ ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Binance spot symbols (за таба Crypto)
-BINANCE_SYMBOLS: Dict[str, Dict[str, str]] = {
-    "BTCUSDT": {"display": "BTC", "class": "crypto_spot"},
-    "ETHUSDT": {"display": "ETH", "class": "crypto_spot"},
-    "BNBUSDT": {"display": "BNB", "class": "crypto_spot"},
-    "SOLUSDT": {"display": "SOL", "class": "crypto_spot"},
-    "ADAUSDT": {"display": "ADA", "class": "crypto_spot"},
-    "XRPUSDT": {"display": "XRP", "class": "crypto_spot"},
-}
+# The six-coin list, the private client and the signal board that used
+# them were removed with the old Crypto tab. The universe is built from
+# market capitalisation now, and every Binance call the app makes is a
+# public one, so no key is needed for any of it.
 
-BINANCE_TIMEFRAMES = {
-    "1d": "1d",
-    "4h": "4h",
-    "1h": "1h",
-    "15m": "15m",
-}
 
 # Live ticker – кои символи да показваме хоризонтално (Binance crypto)
 LIVE_TICKER_SYMBOLS = [
@@ -1265,22 +1260,6 @@ def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
 # BINANCE LAYER
 # ------------------------------------
 
-@st.cache_resource(show_spinner=False)
-def get_binance_client(api_key: str, api_secret: str):
-    try:
-        api_key = (api_key or "").strip()
-        api_secret = (api_secret or "").strip()
-
-        # Дори без ключове, python-binance пак прави ping() и може да гръмне,
-        # затова го пазим в try/except
-        if not api_key or not api_secret:
-            return None
-
-        return Client(api_key=api_key, api_secret=api_secret)
-
-    except Exception as e:
-        st.session_state["binance_client_error"] = str(e)
-        return None
 
 
 
@@ -1330,39 +1309,6 @@ def fetch_binance_klines(symbol: str, interval: str = "1d", limit: int = 500) ->
 
 
 
-def run_analysis_binance(timeframe: str) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    bpy = bars_per_year_for_timeframe("Binance", timeframe)
-
-    for symbol, meta in BINANCE_SYMBOLS.items():
-        try:
-            df = fetch_binance_klines(symbol, interval=timeframe, limit=500)
-            sig = basic_signal_from_series(df["close"], df["high"], df["low"])
-
-            jm = compute_jump_diffusion_metrics(
-                df["close"],
-                bars_per_year=bpy,
-                jump_z=3.0
-            )
-
-            row = {
-                "symbol": symbol,
-                "name": meta["display"],
-                "asset_class": meta["class"],
-                "timeframe": timeframe,
-                **sig,
-                **jm,
-            }
-            rows.append(row)
-        except Exception as e:
-            errors.append(f"{symbol} ({timeframe}): {type(e).__name__}: {e}")
-
-    if errors:
-        st.warning("Some Binance symbols failed:\n" + "\n".join(errors))
-
-    return pd.DataFrame(rows)
 
 
 
@@ -6054,222 +6000,593 @@ look at the equity at all.
                             except Exception as _e:
                                 st.error(f"Model call failed: {_e}")
 
+# ============================== CRYPTO ==============================
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cr_load_market(top_n: int = 100):
+    """Market caps and drawdowns for the largest coins, plus the aggregate."""
+    return cra.market_table(top_n), cra.global_stats()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cr_load_tradable():
+    return cra.binance_usdt_symbols()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cr_load_closes(symbols: Tuple[str, ...], interval: str = "1d",
+                   limit: int = 500):
+    """Daily closes for the universe, through the app's Binance client.
+
+    The symbol list arrives as a tuple because Streamlit hashes the arguments
+    to build a cache key and will not hash a list.
+    """
+    return cra.closes_matrix(list(symbols), fetch_binance_klines,
+                             interval=interval, limit=limit)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cr_load_funding(symbols: Tuple[str, ...]):
+    return cra.funding_rates(list(symbols))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cr_load_oi(symbols: Tuple[str, ...], marks: Tuple[Tuple[str, float], ...]):
+    return cra.open_interest(list(symbols), dict(marks))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cr_load_funding_history(symbol: str, limit: int = 200):
+    return cra.funding_history(symbol, limit)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cr_load_macro():
+    """The reference assets bitcoin is argued about against."""
+    frames: Dict[str, pd.Series] = {}
+    for ticker in cra.MACRO_REFERENCES.values():
+        try:
+            h = fetch_yahoo_history(ticker, years=3, max_points=2000)
+            col = next((c for c in h.columns if str(c).lower() == "close"), None)
+            if col is None or h.empty:
+                continue
+            s = pd.to_numeric(h[col], errors="coerce").dropna()
+            s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+            frames[ticker] = s[~s.index.duplicated(keep="last")]
+        except Exception:
+            continue
+    return pd.DataFrame(frames).sort_index() if frames else pd.DataFrame()
+
+
 with tab_crypto:
-    st.subheader("🪙 Crypto — Institutional Digital Asset Dashboard")
+    if not _HAS_CRA:
+        st.error(f"Crypto module failed to load: {_CRA_IMPORT_ERROR}")
+    else:
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CRYPTO</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">The complex · how much of it is bitcoin · who is already positioned</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-    crypto_tab_overview, crypto_tab_analysis = st.tabs(["📊 Crypto Overview", "🔍 Deep Analysis"])
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Two facts shape almost everything a crypto book does, and neither is visible
+on a page of prices.
 
-    with crypto_tab_overview:
-        client_binance = get_binance_client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        if client_binance is None:
-            err = st.session_state.get("binance_client_error", "")
-            st.warning("Binance private client not available. Using public endpoints.")
-            if err:
-                st.caption(f"Client init error: {err}")
+**The asset class is mostly one asset.** Coins are marketed on their
+differences and traded on their similarities, and a portfolio of twelve of
+them is usually bitcoin held twelve times — with the resemblance strongest
+exactly when it matters, because whatever moves them together is what moves
+them down. So the second panel measures each coin's beta to bitcoin and how
+much of its movement bitcoin accounts for at all.
 
-        col_ctrl, col_data = st.columns([1, 4])
+**Positioning is observable here.** A perpetual future never expires, so
+nothing pins it to spot except a payment one side makes the other every eight
+hours. That payment is a live, public price for holding a leveraged long. The
+FX and metals panels in this app both have to state that positioning data is
+unavailable to them; in crypto it is free, and it is the third panel.
 
-        with col_ctrl:
-            timeframe_label = st.selectbox(
-                "Timeframe",
-                options=list(BINANCE_TIMEFRAMES.keys()),
-                index=0,
-                key="crypto_timeframe_label",
+- **The board** — every coin in the universe, with the distance from its
+  all-time high. Crypto is better described by that than by a one-year
+  return: the peaks are enormous and the recoveries take cycles.
+- **How much is bitcoin?** — beta, correlation, and the clusters that move as
+  one.
+- **Positioning** — funding rates and open interest across the complex.
+- **Risk asset or hedge?** — whether bitcoin has lately been tracking the
+  Nasdaq or gold. The argument is old; the answer is measurable and changes.
+
+**What is not here.** No composite crypto score, and no price forecast. A beta
+of 1.4 and funding at 30% annualised are facts about different things, and
+averaging them answers no question. Funding in particular is a measure of who
+is positioned, **not a signal** — it has stayed expensive through entire
+trends and flipped negative at the bottom of them.
+
+**Stablecoins and tokenised gold are excluded.** A stablecoin's return is zero
+by construction, and PAXG is gold wearing a ticker; both would misreport what
+the asset class did. For deep single-coin work — regime, tail risk, Monte
+Carlo — the Quant Lab takes any Binance symbol directly.
+            """)
+
+        cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+        with cc1:
+            cr_size = st.selectbox("Universe size", [20, 30, 40, 60],
+                                   index=2, key="cr_size",
+                                   label_visibility="collapsed")
+        with cc2:
+            cr_win_label = st.radio("Window", ["90 days", "180 days", "1 year"],
+                                    index=1, horizontal=True, key="cr_win",
+                                    label_visibility="collapsed")
+        with cc3:
+            if st.button("🔄 Refresh", key="cr_refresh", use_container_width=True):
+                cr_load_market.clear()
+                cr_load_closes.clear()
+                cr_load_funding.clear()
+                st.rerun()
+
+        _CR_WIN = {"90 days": 90, "180 days": 180, "1 year": 365}
+        cr_win = _CR_WIN[cr_win_label]
+
+        market, glob = cr_load_market(100)
+        tradable = cr_load_tradable()
+
+        if market.empty:
+            st.error(
+                "CoinGecko returned no market data this run, so the universe "
+                "cannot be built. Nothing here is cached long enough to fall "
+                "back on — try Refresh in a minute."
             )
-            refresh_crypto = st.button("🔄 Refresh", key="refresh_crypto_btn")
-
-        with col_data:
-            if "df_signals_binance" not in st.session_state or refresh_crypto:
-                tf = BINANCE_TIMEFRAMES[timeframe_label]
-                df_crypto = run_analysis_binance(tf)
-                st.session_state["df_signals_binance"] = df_crypto
-                st.session_state["df_signals_binance_tf"] = tf
-            else:
-                df_crypto = st.session_state["df_signals_binance"]
-
-            if df_crypto is None or df_crypto.empty:
-                st.error("No Binance crypto results.")
-            else:
-                def color_crypto_row(row):
-                    return ["color: #00ff00; background-color: #000000;" for _ in row]
-
-                styled_crypto = df_crypto.style.apply(color_crypto_row, axis=1)
-                st.dataframe(styled_crypto, use_container_width=True)
-                st.caption(ALIGNMENT_NOTE)
-
-        # Signal cards
-        if df_crypto is not None and not df_crypto.empty:
-            st.markdown("---")
-            st.subheader("Crypto Signal Board")
-            crypto_cols = st.columns(min(6, len(df_crypto)))
-            for i, col in enumerate(crypto_cols):
-                if i < len(df_crypto):
-                    row = df_crypto.iloc[i]
-                    sig = row["signal"]
-                    if "bullish" in sig.lower():
-                        sig_icon = "🟢"
-                    elif "bearish" in sig.lower():
-                        sig_icon = "🔴"
-                    else:
-                        sig_icon = "⚪"
-                    score_val = row.get("score", "N/A")
-                    with col:
-                        st.markdown(
-                            f"**{row['name']}**\n\n"
-                            f"{sig_icon} **{sig}**\n\n"
-                            f"Score: `{score_val}` | RSI: `{row['rsi14']}`\n\n"
-                            f"Price: `${float(row['close']):,.2f}`"
-                        )
-
-    with crypto_tab_analysis:
-        st.markdown("### 🔍 Deep Crypto Analysis — Select a Coin")
-
-        crypto_options = {v["display"]: k for k, v in BINANCE_SYMBOLS.items()}
-        crypto_names = list(crypto_options.keys())
-
-        if not crypto_names:
-            st.warning("No crypto symbols configured.")
+        elif not tradable:
+            st.error(
+                "Binance returned no tradable symbols this run. The board "
+                "needs them to know which coins it can price."
+            )
         else:
-            col_sel, col_tf = st.columns([2, 1])
-            with col_sel:
-                selected_crypto = st.selectbox("Select cryptocurrency:", crypto_names, key="crypto_deep_select")
-            with col_tf:
-                crypto_analysis_tf = st.selectbox(
-                    "Analysis timeframe:",
-                    options=["1d", "4h", "1h", "15m"],
-                    index=0,
-                    key="crypto_analysis_tf",
+            universe = cra.build_universe(market, tradable, limit=int(cr_size))
+            syms = tuple(universe["binance_symbol"])
+            closes = cr_load_closes(syms, "1d", 500)
+
+            crt1, crt2, crt3, crt4, crt5 = st.tabs([
+                "📊 The board", "₿ How much is bitcoin?", "🎢 Positioning",
+                "🌐 Risk asset or hedge?", "🤖 Desk read"])
+
+            # ---------------- the board ----------------
+            with crt1:
+                if glob:
+                    g1, g2, g3, g4 = st.columns(4)
+                    g1.metric("Total market cap",
+                              f"${glob['total_mcap_usd']/1e9:,.0f}bn",
+                              f"{glob['mcap_chg_24h_pct']:+.1f}% 24h")
+                    g2.metric("24h volume",
+                              f"${glob['total_volume_usd']/1e9:,.0f}bn")
+                    btc_dom = glob.get("dominance", {}).get("BTC")
+                    if btc_dom is not None:
+                        g3.metric("Bitcoin dominance", f"{btc_dom:.1f}%",
+                                  help="Bitcoin's share of total crypto market "
+                                       "capitalisation. Rising dominance means "
+                                       "money concentrating in bitcoin, which "
+                                       "usually means the rest is bleeding.")
+                    eth_dom = glob.get("dominance", {}).get("ETH")
+                    if eth_dom is not None:
+                        g4.metric("Ethereum dominance", f"{eth_dom:.1f}%")
+
+                show = universe.copy()
+                show["Price"] = [
+                    (f"${p:,.2f}" if p and p >= 1 else f"${p:,.6f}".rstrip("0"))
+                    for p in show["price"]]
+                show["Mkt cap"] = show["market_cap"].map(
+                    lambda v: f"${v/1e9:,.1f}bn" if pd.notna(v) else "—")
+                for col, label in (("chg_24h", "24h"), ("chg_7d", "7d"),
+                                   ("chg_30d", "30d"), ("chg_1y", "1y")):
+                    show[label] = show[col].map(
+                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                show["From ATH"] = show["from_ath_pct"].map(
+                    lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                show["ATH set"] = show["ath_date"].fillna("—")
+
+                st.dataframe(
+                    show[["name", "rank", "Price", "Mkt cap", "24h", "7d",
+                          "30d", "1y", "From ATH", "ATH set"]]
+                    .rename(columns={"name": "Coin", "rank": "#"}),
+                    use_container_width=True, height=680)
+
+                st.caption(
+                    f"{len(universe)} coins — the largest by market "
+                    "capitalisation that Binance quotes in USDT, so every "
+                    "figure downstream comes from one venue. Stablecoins and "
+                    "tokenised gold are excluded. **From ATH** is the distance "
+                    "from the all-time high, which for most of this list is a "
+                    "different cycle rather than a different year."
                 )
 
-            crypto_symbol = crypto_options[selected_crypto]
+                deep = universe[universe["from_ath_pct"].notna()]
+                if not deep.empty:
+                    worst = deep.nsmallest(3, "from_ath_pct")
+                    near = deep.nlargest(3, "from_ath_pct")
+                    st.markdown(
+                        "**Furthest from their highs:** "
+                        + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
+                                     for i, r in worst.iterrows())
+                        + "  \n**Closest to them:** "
+                        + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
+                                     for i, r in near.iterrows())
+                    )
 
-            if st.button("🚀 Run Deep Crypto Analysis", key="crypto_deep_run", type="primary"):
-                with st.spinner(f"Analyzing {selected_crypto} ({crypto_symbol})..."):
-                    try:
-                        df_klines = fetch_binance_klines(crypto_symbol, interval=crypto_analysis_tf, limit=500)
-                        close_s = df_klines["close"].dropna().astype(float)
-                        high_s = df_klines["high"].dropna().astype(float) if "high" in df_klines.columns else None
-                        low_s = df_klines["low"].dropna().astype(float) if "low" in df_klines.columns else None
+            # ---------------- how much is bitcoin ----------------
+            with crt2:
+                if closes.empty or "BTC" not in closes.columns:
+                    st.warning(
+                        "Binance returned no usable price history this run, so "
+                        "beta and correlation cannot be computed. The board "
+                        "above is unaffected — it comes from a different source."
+                    )
+                else:
+                    rel = cra.btc_relationship(closes, window=cr_win)
+                    if rel.empty:
+                        st.info(
+                            f"Not enough overlapping history over "
+                            f"{cr_win_label.lower()} to measure beta."
+                        )
+                    else:
+                        b1, b2, b3 = st.columns(3)
+                        b1.metric("Median beta to bitcoin",
+                                  f"{rel['beta'].median():.2f}",
+                                  help="How far the typical coin travels for a "
+                                       "given bitcoin move.")
+                        b2.metric("Median variance explained",
+                                  f"{rel['r2'].median()*100:.0f}%",
+                                  help="Share of the typical coin's movement "
+                                       "that bitcoin accounts for.")
+                        b3.metric("Coins over 50% explained",
+                                  f"{int((rel['r2'] > 0.5).sum())} of {len(rel)}")
 
-                        sig = basic_signal_from_series(close_s, high_s, low_s)
-                        returns = np.log(close_s).diff().dropna()
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=rel["beta"], y=rel["r2"] * 100,
+                            mode="markers+text", text=rel.index,
+                            textposition="top center",
+                            textfont=dict(size=9, color="#888"),
+                            marker=dict(size=11, color=rel["corr"],
+                                        colorscale="RdBu", reversescale=True,
+                                        cmin=-1, cmax=1,
+                                        colorbar=dict(title="ρ", thickness=12)),
+                            hovertemplate="%{text}<br>beta %{x:.2f}"
+                                          "<br>%{y:.0f}% explained<extra></extra>"))
+                        fig.add_vline(x=1.0, line_dash="dot", line_color="#666",
+                                      annotation_text="moves 1:1 with bitcoin",
+                                      annotation_position="top right",
+                                      annotation_font=dict(size=10, color="#999"))
+                        fig.update_layout(
+                            height=460, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            xaxis_title="Beta to bitcoin",
+                            yaxis_title="% of the coin's movement bitcoin explains",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
 
-                        bpy = bars_per_year_for_timeframe("Binance", crypto_analysis_tf)
-                        horizon_bars = 7 * bars_per_day_for_tf("Binance", crypto_analysis_tf)
+                        st.markdown("""
+**Read the vertical axis first.** Beta says how far a coin travels; the
+variance explained says whether anything other than bitcoin is happening to
+it at all. A coin high on this axis is a bitcoin position with a different
+name, whatever its beta — and one low on it is genuinely doing something of
+its own, which may be better or worse but is at least separate.
 
-                        qm = compute_quant_metrics(close_s, bars_per_year=bpy, jump_z=3.0, horizon_bars=horizon_bars)
-                        regime = compute_regime_hmm_simple(returns, window=min(63, max(20, len(returns)//3)), bars_per_year=bpy)
-                        mean_rev = compute_mean_reversion_signals(close_s)
-                        mom = compute_momentum_features(close_s)
-                        tail = compute_tail_risk_metrics(returns, bars_per_year=bpy)
+**Excess** in the table below is what a coin returned beyond bitcoin over the
+window: the only part of owning it that owning bitcoin did not already
+provide. A high beta with negative excess is the worst of the arrangement —
+the full ride down, less of the ride up.
+                        """)
 
-                        # Signal header
-                        sig_val = sig.get("signal", "Mixed")
-                        if "bullish" in sig_val.lower():
-                            sig_color = "🟢"
-                        elif "bearish" in sig_val.lower():
-                            sig_color = "🔴"
-                        else:
-                            sig_color = "⚪"
+                        rshow = rel.copy()
+                        rshow["Beta"] = rshow["beta"].map(lambda v: f"{v:.2f}")
+                        rshow["Correlation"] = rshow["corr"].map(lambda v: f"{v:.2f}")
+                        rshow["Explained"] = rshow["r2"].map(lambda v: f"{v*100:.0f}%")
+                        rshow["Excess"] = rshow["excess_pct"].map(
+                            lambda v: f"{v:+.0f}%" if pd.notna(v) else "—")
+                        st.dataframe(
+                            rshow[["Beta", "Correlation", "Explained", "Excess"]],
+                            use_container_width=True, height=420)
 
-                        st.markdown(f"## {sig_color} {selected_crypto} ({crypto_symbol}) — {sig_val}")
-                        st.caption(f"Timeframe: {crypto_analysis_tf} | Data: Binance")
-
-                        # Key metrics
-                        m1, m2, m3, m4, m5, m6 = st.columns(6)
-                        m1.metric("Price", f"${float(sig['close']):,.2f}")
-                        m2.metric("Score", sig.get("score", "N/A"))
-                        m3.metric("RSI", sig["rsi14"])
-                        m4.metric("Trend", sig["trend"].title())
-                        m5.metric("Vol Regime", regime.get("current_regime", "?"))
-                        m6.metric("Hurst", f"{qm.get('hurst', 'N/A')}")
-
-                        # Momentum
-                        st.markdown("#### Momentum")
-                        if mom:
-                            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                            mc1.metric("5D", f"{mom.get('return_5d_pct', 'N/A')}%")
-                            mc2.metric("1M", f"{mom.get('return_21d_pct', 'N/A')}%")
-                            mc3.metric("3M", f"{mom.get('return_63d_pct', 'N/A')}%")
-                            mc4.metric("6M", f"{mom.get('return_126d_pct', 'N/A')}%")
-                            mc5.metric("12M", f"{mom.get('return_252d_pct', 'N/A')}%")
-                        else:
-                            st.info("Not enough data for full momentum (need 252+ bars). Try 1d timeframe.")
-
-                        # Mean Reversion
-                        st.markdown("#### Mean Reversion Signals")
-                        mr1, mr2, mr3 = st.columns(3)
-                        mr1.metric("Z-Score (20d)", mean_rev.get("z_score_20", "N/A"))
-                        mr2.metric("Z-Score (50d)", mean_rev.get("z_score_50", "N/A"))
-                        hl = mean_rev.get("ou_half_life")
-                        mr3.metric("O-U Half-Life", f"{hl:.0f} bars" if hl else "N/A (trending)")
-
-                        z20 = mean_rev.get("z_score_20")
-                        hl20 = mean_rev.get("ou_half_life")
-                        if z20 is not None and abs(z20) > 2.0:
-                            side = "above" if z20 > 0 else "below"
-                            # Whether a stretched z-score reverts depends on
-                            # whether this series reverts at all, which the
-                            # half-life answers and the z-score alone does not.
-                            if hl20:
-                                tail = (f"This series has historically decayed half of a "
-                                        f"deviation in about {hl20:.0f} bars, so the "
-                                        f"distance has tended to close.")
-                            else:
-                                tail = ("No Ornstein-Uhlenbeck half-life could be fitted, "
-                                        "which means this series has been trending rather "
-                                        "than reverting — a stretched reading here is not "
-                                        "evidence that it snaps back.")
-                            st.info(f"Price is {abs(z20):.1f} standard deviations {side} its "
-                                    f"20-bar mean. {tail}")
-
-                        # Risk Profile
-                        st.markdown("#### Risk Profile")
-                        if tail:
-                            r1, r2, r3, r4 = st.columns(4)
-                            r1.metric("Sortino", tail.get("sortino_ratio", "N/A"))
-                            r2.metric("Max DD", f"{tail.get('max_drawdown_pct', 'N/A')}%")
-                            r3.metric("Win Rate", f"{tail.get('win_rate_pct', 'N/A')}%")
-                            r4.metric("Tail Ratio", tail.get("tail_ratio", "N/A"))
-
-                        # Jump Diffusion
-                        st.markdown("#### Jump Risk")
-                        j1, j2, j3, j4 = st.columns(4)
-                        j1.metric("Jumps/Year", qm.get("lambda_year", "N/A"))
-                        j2.metric("Avg Jump", f"{qm.get('avg_jump_pct', 'N/A')}%")
-                        j3.metric("Jump Vol", f"{qm.get('jump_vol_pct', 'N/A')}%")
-                        j4.metric("Jump Risk Score", qm.get("jump_risk_score", "N/A"))
-
-                        # Monte Carlo
-                        st.markdown("#### Monte Carlo Scenarios (1 week ahead)")
-                        mc_p10 = qm.get("mc_p10")
-                        mc_p50 = qm.get("mc_p50")
-                        mc_p90 = qm.get("mc_p90")
-                        last_p = qm.get("last_price", 0)
-                        if mc_p10 and last_p:
-                            s1, s2, s3 = st.columns(3)
-                            s1.metric("🔴 Bear (P10)", f"${mc_p10:,.2f}", f"{((mc_p10/last_p)-1)*100:+.1f}%")
-                            s2.metric("⚪ Base (P50)", f"${mc_p50:,.2f}", f"{((mc_p50/last_p)-1)*100:+.1f}%")
-                            s3.metric("🟢 Bull (P90)", f"${mc_p90:,.2f}", f"{((mc_p90/last_p)-1)*100:+.1f}%")
-
-                        # AI Analysis
-                        st.markdown("---")
-                        st.subheader("🧠 AI Deep Analysis")
-                        with st.spinner(f"Generating institutional crypto analysis for {selected_crypto}..."):
-                            ai_text = run_asset_deep_analysis(
-                                asset_name=f"{selected_crypto} ({crypto_symbol})",
-                                asset_type="crypto",
-                                signal_data=sig,
-                                quant_data=qm,
-                                momentum_data=mom,
-                                regime_data=regime,
-                                tail_data=tail,
-                                mean_rev_data=mean_rev,
+                        groups = cra.clusters(closes, 0.8, cr_win)
+                        if groups:
+                            st.warning(
+                                "Moving as one at |ρ| ≥ 0.8:\n\n"
+                                + "\n\n".join(" · ".join(g) for g in groups)
+                                + "\n\nHeld separately these look like "
+                                  "diversification and behave like size. The "
+                                  "threshold here is 0.8 rather than the 0.7 "
+                                  "used elsewhere in the app, because crypto "
+                                  "correlations sit high as a matter of course "
+                                  "and a lower bar would return the whole list."
                             )
-                        st.markdown(ai_text)
+                        else:
+                            st.info(
+                                f"No pair is correlated above 0.8 over "
+                                f"{cr_win_label.lower()} — unusual for this "
+                                "asset class, and worth a second look at "
+                                "whether the window is capturing a regime break."
+                            )
 
-                    except Exception as e:
-                        st.error(f"Crypto analysis error: {type(e).__name__}: {e}")
+                        alt = cra.alt_index(closes, window=cr_win)
+                        if not alt.empty:
+                            st.markdown("##### Bitcoin against the rest")
+                            fig2 = go.Figure()
+                            for col, colour, width in (
+                                    (alt.columns[0], "#f7931a", 2.6),
+                                    (alt.columns[1], "#42a5f5", 2.0)):
+                                fig2.add_trace(go.Scatter(
+                                    x=alt.index, y=alt[col], name=col,
+                                    line=dict(color=colour, width=width),
+                                    hovertemplate=f"{col} %{{y:.0f}}<extra></extra>"))
+                            fig2.update_layout(
+                                height=340, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title=f"Rebased to 100 at {alt.index[0].date()}",
+                                legend=dict(orientation="h", y=1.14, x=0),
+                                hovermode="x unified")
+                            st.plotly_chart(fig2, use_container_width=True)
+                            st.caption(
+                                "The median of the rest, not the average. One "
+                                "coin up twentyfold — there is usually one — "
+                                "carries a mean of thirty on its own and turns "
+                                "the chart into a report on that single "
+                                "position. The median is the typical coin, "
+                                "which is what the question is about."
+                            )
+
+            # ---------------- positioning ----------------
+            with crt3:
+                funding = cr_load_funding(syms)
+                if funding.empty:
+                    st.warning(
+                        "Binance futures did not respond this run, so funding "
+                        "and open interest are unavailable. This is the one "
+                        "panel in the app with real positioning data, and "
+                        "there is no substitute for it — the rest of the tab "
+                        "is unaffected."
+                    )
+                else:
+                    f1, f2, f3 = st.columns(3)
+                    f1.metric("Median funding, annualised",
+                              f"{funding['funding_annual_pct'].median():+.1f}%")
+                    f2.metric("Paying to be long",
+                              f"{int((funding['funding_annual_pct'] > 0).sum())} "
+                              f"of {len(funding)}")
+                    f3.metric("Paying to be short",
+                              f"{int((funding['funding_annual_pct'] < 0).sum())} "
+                              f"of {len(funding)}")
+
+                    fs = funding.sort_values("funding_annual_pct")
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=fs["funding_annual_pct"], y=fs.index, orientation="h",
+                        marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                           for v in fs["funding_annual_pct"]]),
+                        hovertemplate="%{y}: %{x:+.1f}% annualised<extra></extra>"))
+                    fig.update_layout(
+                        height=max(360, 16 * len(fs)), template="plotly_dark",
+                        margin=dict(l=10, r=30, t=30, b=10),
+                        xaxis_title="Perpetual funding, annualised (%)",
+                        showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("""
+**What this is.** A perpetual future has no expiry, so nothing drags it back
+to spot except a payment made every eight hours by whichever side is pushing
+the price away from it. Positive means longs pay shorts — the market is paying
+for leveraged upside. Negative means the reverse.
+
+**The annualised figure is for comparison, not for earning.** It multiplies an
+eight-hour payment by three a day and 365 days. Nobody collects that for a
+year: the rate resets every eight hours and spends much of its life near zero.
+A cluster of coins sitting at exactly the same figure is the exchange's
+baseline rate showing through, not agreement between them.
+
+**It is positioning, not a signal.** Funding has stayed expensive through
+entire trends and turned negative at the bottom of them. What it tells you is
+who is already in and what a reversal would have to unwind — which is a
+different and more durable thing than a direction.
+                    """)
+
+                    st.markdown("##### One coin's funding through time")
+                    fh_pick = st.selectbox(
+                        "Coin", list(universe.index), key="cr_funding_pick")
+                    fh = cr_load_funding_history(f"{fh_pick}USDT", 200)
+                    if fh.empty:
+                        st.info(f"No funding history returned for {fh_pick}.")
+                    else:
+                        fig3 = go.Figure()
+                        fig3.add_trace(go.Scatter(
+                            x=fh.index, y=fh.values, mode="lines",
+                            line=dict(color="#42a5f5", width=1.4),
+                            hovertemplate="%{x|%d %b}<br>%{y:+.1f}%<extra></extra>"))
+                        fig3.add_hline(y=0, line_dash="dot", line_color="#666")
+                        fig3.update_layout(
+                            height=300, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="Annualised funding (%)",
+                            showlegend=False)
+                        st.plotly_chart(fig3, use_container_width=True)
+                        st.caption(
+                            f"{len(fh)} payments, {fh.index.min().date()} to "
+                            f"{fh.index.max().date()} — mean {fh.mean():+.1f}%, "
+                            f"highest {fh.max():+.1f}%, lowest {fh.min():+.1f}%. "
+                            "A single elevated print is noise; the same print "
+                            "held for weeks is a crowd."
+                        )
+
+                    marks = tuple(funding["mark_price"].dropna().items())
+                    oi = cr_load_oi(syms[:15], marks)
+                    if not oi.empty and oi["open_interest_usd"].notna().any():
+                        st.markdown("##### Open interest")
+                        oshow = oi[oi["open_interest_usd"].notna()].copy()
+                        oshow["Notional"] = oshow["open_interest_usd"].map(
+                            lambda v: f"${v/1e9:,.2f}bn" if v >= 1e9
+                            else f"${v/1e6:,.0f}m")
+                        oshow["Contracts"] = oshow["open_interest_coins"].map(
+                            lambda v: f"{v:,.0f}")
+                        st.dataframe(oshow[["Notional", "Contracts"]],
+                                     use_container_width=True, height=300)
+                        st.caption(
+                            "Ranked on notional, because contracts are not "
+                            "comparable across coins — a hundred thousand "
+                            "bitcoin and three hundred million XRP differ by a "
+                            "factor of three thousand in coins and about two "
+                            "in dollars. Open interest counts positions still "
+                            "open, so it measures committed capital rather "
+                            "than turnover: rising with price is new money, "
+                            "falling with a rising price is shorts closing, "
+                            "and the two imply opposite things about what "
+                            "happens when the move stalls."
+                        )
+
+            # ---------------- risk asset or hedge ----------------
+            with crt4:
+                macro = cr_load_macro()
+                if closes.empty or "BTC" not in closes.columns or macro.empty:
+                    st.info(
+                        "Either the bitcoin history or the reference assets "
+                        "were unavailable this run, so the comparison cannot "
+                        "be drawn."
+                    )
+                else:
+                    mc = cra.macro_correlation(closes["BTC"], macro, window=90)
+                    if not mc.get("available"):
+                        st.info(
+                            "Not enough overlapping history between bitcoin "
+                            "and the reference assets to compute a rolling "
+                            "correlation."
+                        )
+                    else:
+                        latest = mc["latest"]
+                        cols = st.columns(len(latest) + (1 if "reading" in mc else 0))
+                        for col, (label, val) in zip(cols, latest.items()):
+                            col.metric(f"vs {label}", f"{val:+.2f}")
+                        if "reading" in mc:
+                            cols[-1].metric("Reading", mc["reading"].replace(
+                                "trading as ", ""))
+
+                        fig = go.Figure()
+                        palette = {"NASDAQ 100": "#42a5f5", "Gold": "#ffb300",
+                                   "Dollar index": "#26a69a", "S&P 500": "#ab47bc"}
+                        for col in mc["series"].columns:
+                            fig.add_trace(go.Scatter(
+                                x=mc["series"].index, y=mc["series"][col],
+                                name=col, line=dict(width=1.8,
+                                                    color=palette.get(col))))
+                        fig.add_hline(y=0, line_dash="dot", line_color="#666")
+                        fig.update_layout(
+                            height=420, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="90-day rolling correlation with bitcoin",
+                            legend=dict(orientation="h", y=1.14, x=0),
+                            hovermode="x unified")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("""
+**The oldest argument about bitcoin, measured.** It is described as two
+incompatible things — a long-duration risk asset that trades with the Nasdaq,
+and a monetary hedge that trades with gold. Both camps can point at periods
+that prove them right, because the answer genuinely changes. What this shows
+is which one it has been behaving like lately.
+
+**Correlation of returns, not of levels.** Two assets that both rose over a
+year correlate near one on levels no matter how unrelated their reasons, which
+measures the direction of the decade and nothing else.
+
+**Crypto trades every day and the references do not.** The series are joined
+on the days both were open rather than filling the weekend forward, which
+would insert two artificially flat days a week into the reference and drag
+every correlation toward zero.
+                        """)
+
+            # ---------------- desk read ----------------
+            with crt5:
+                st.caption(
+                    "Reads the measured figures above. It has no on-chain "
+                    "data, no exchange flows and no order book — say so if the "
+                    "question needs them."
+                )
+                if st.button("▶ Read the crypto complex", type="primary",
+                             key="cr_ai"):
+                    _err = ai_unavailable()
+                    if _err:
+                        st.error(f"AI read unavailable: {_err}.")
+                    else:
+                        with st.spinner("Reading…"):
+                            try:
+                                rel = (cra.btc_relationship(closes, window=cr_win)
+                                       if not closes.empty else pd.DataFrame())
+                                funding = cr_load_funding(syms)
+                                macro = cr_load_macro()
+                                mc = (cra.macro_correlation(closes["BTC"], macro, 90)
+                                      if (not closes.empty and "BTC" in closes.columns
+                                          and not macro.empty) else {})
+                                ctx = {
+                                    "window": cr_win_label,
+                                    "global": glob,
+                                    "board": universe.drop(
+                                        columns=["binance_symbol",
+                                                 "tokenised_commodity"],
+                                        errors="ignore").reset_index().to_dict("records"),
+                                    "vs_bitcoin": (rel.reset_index().to_dict("records")
+                                                   if not rel.empty else []),
+                                    "clusters": cra.clusters(closes, 0.8, cr_win)
+                                                if not closes.empty else [],
+                                    "funding_annualised": (
+                                        funding[["funding_annual_pct"]]
+                                        .reset_index().to_dict("records")
+                                        if not funding.empty else []),
+                                    "macro_correlation": {
+                                        k: v for k, v in mc.items()
+                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                    "caveats": [
+                                        "Funding is positioning, not a signal. It has "
+                                        "stayed expensive through whole trends and "
+                                        "turned negative at the bottom of them.",
+                                        "Annualised funding multiplies an eight-hour "
+                                        "payment out to a year; nobody earns it for a "
+                                        "year. Coins sharing an identical figure are "
+                                        "showing the exchange's baseline rate.",
+                                        "Stablecoins and tokenised gold are excluded "
+                                        "from the universe.",
+                                        "No on-chain data, exchange flows, order book "
+                                        "or liquidation data is in this payload.",
+                                    ],
+                                }
+                                sysmsg = (
+                                    "You are a crypto strategist writing the digital "
+                                    "assets section of a morning note for a macro "
+                                    "desk. You are given the market board with each "
+                                    "coin's distance from its all-time high, each "
+                                    "coin's beta and variance explained against "
+                                    "bitcoin, the correlation clusters, perpetual "
+                                    "funding rates, and bitcoin's rolling correlation "
+                                    "to equities and gold.\n\n"
+                                    "Write 250-350 words covering:\n"
+                                    "1. What moved, and how much of it was simply "
+                                    "bitcoin. Use the variance-explained figures "
+                                    "rather than assuming.\n"
+                                    "2. Where the complex is concentrated — name the "
+                                    "clusters plainly, since holding them separately "
+                                    "looks like diversification and behaves like "
+                                    "size.\n"
+                                    "3. What funding says about who is already "
+                                    "positioned, and what a reversal would have to "
+                                    "unwind. Do not treat it as a direction.\n"
+                                    "4. Whether bitcoin is currently trading as a risk "
+                                    "asset or as a hedge, quoting both correlations.\n\n"
+                                    "Quote the numbers you rely on. Do not forecast a "
+                                    "price. If the argument needs something absent "
+                                    "from the payload — flows, on-chain, "
+                                    "liquidations — say so rather than supplying it "
+                                    "from memory."
+                                )
+                                st.markdown(ai_agent.complete(
+                                    sysmsg, json.dumps(ctx, indent=1, default=str),
+                                    max_tokens=3000, effort="medium"))
+                            except Exception as _e:
+                                st.error(f"Model call failed: {_e}")
 
 
 # -------- FUNDAMENTALS TAB --------

@@ -22,7 +22,7 @@ import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 
-from agent import TOOLS, TOOL_DISPATCH, get_anthropic_client, OPUS_MODEL
+from agent import TOOLS, TOOL_DISPATCH, get_anthropic_client, OPUS_MODEL, create_message
 
 try:
     import data_layer as dl
@@ -291,7 +291,8 @@ def _run_subagent(spec: Dict[str, Any], user_query: str) -> Dict[str, Any]:
 
     for _ in range(SUBAGENT_MAX_ITER):
         try:
-            resp = client.messages.create(
+            resp = create_message(
+                client, route="brief-subagent",
                 model=OPUS_MODEL,
                 max_tokens=SUBAGENT_MAX_TOKENS,
                 output_config={"effort": SUBAGENT_EFFORT},
@@ -422,7 +423,8 @@ def _synthesize(subagent_results: Dict[str, Any], user_query: str) -> str:
         + json.dumps(payload, default=str, indent=2)
     )
     try:
-        resp = client.messages.create(
+        resp = create_message(
+            client, route="brief-synth",
             model=OPUS_MODEL,
             max_tokens=SYNTH_MAX_TOKENS,
             output_config={"effort": SYNTH_EFFORT},

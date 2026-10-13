@@ -243,7 +243,8 @@ def job_refresh_universe_full() -> None:
 def job_prune() -> None:
     try:
         n = dl.prune_news(retention_days=90)
-        log.info("prune job: removed %d old news rows", n)
+        m = dl.prune_market_snapshots(keep_days=2)
+        log.info("prune job: removed %d old news rows, %d old quote rows", n, m)
     except Exception as e:
         log.exception("job_prune failed: %s", e)
 
@@ -364,6 +365,9 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.start()
         _SCHED = sched
         log.info("scheduler started, db=%s", dl.get_db_path())
+
+        # Prune before anything writes: a full disk makes every job fail.
+        job_prune()
 
         if run_now:
             # Kick off the cheap ones immediately so the UI has data on first load

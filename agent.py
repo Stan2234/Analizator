@@ -6,7 +6,7 @@ It uses Anthropic's tool-use protocol so the model decides which tools to
 call based on the user's question. No fixed answer templates.
 
 Model routing:
-  - 'claude-opus-5'    for complex / analytical questions
+  - 'claude-opus-5-5'  for complex / analytical questions
   - 'claude-haiku-4-5' for short factual questions
 
 Set ANTHROPIC_API_KEY in env or Streamlit secrets.
@@ -24,13 +24,14 @@ import sources as src
 
 log = logging.getLogger("analizator.agent")
 
-OPUS_MODEL  = "claude-opus-5"     # current Opus
+OPUS_MODEL  = "claude-opus-5-5"   # current Opus: same tokenizer as Opus 5, 20% cheaper
 HAIKU_MODEL = "claude-haiku-4-5"  # current Haiku — still the cheap/fast tier
 
 # Opus 5 thinks by default, and max_tokens caps thinking AND response text
 # together. The old 2048 was sized for Opus 4.5, which did not think unless
 # asked — leaving it would truncate answers mid-sentence.
 DEFAULT_MAX_TOKENS = 8000
+AGENT_EFFORT = "high"
 
 
 # ---------------- secrets ----------------
@@ -46,6 +47,48 @@ def _get_secret(name: str, default: str = "") -> str:
     except Exception:
         pass
     return default
+
+
+# USD per million tokens: input, output, 5-minute cache write, cache read.
+PRICES = {
+    "claude-opus-5-5": (4.00, 20.00, 5.00, 0.20),
+    "claude-opus-5": (5.00, 25.00, 6.25, 0.50),
+    "claude-haiku-4-5": (1.00, 5.00, 1.25, 0.10),
+}
+# Where every call's tokens and cost are appended (JSON lines). The credit
+# system and the plan prices are sized from this log, so keep it on the disk.
+USAGE_LOG = os.environ.get(
+    "ANALIZATOR_USAGE_LOG",
+    os.path.join(os.path.dirname(os.environ.get("ANALIZATOR_DB_PATH", "") or "."), "ai_usage.jsonl"))
+
+
+def call_cost(model: str, usage: Any) -> float:
+    """Dollar cost of one response, from its usage block (thinking is billed as output)."""
+    p_in, p_out, p_cw, p_cr = PRICES.get(model, PRICES[OPUS_MODEL])
+    g = lambda k: getattr(usage, k, 0) or 0
+    return (g("input_tokens") * p_in + g("output_tokens") * p_out
+            + g("cache_creation_input_tokens") * p_cw + g("cache_read_input_tokens") * p_cr) / 1e6
+
+
+def create_message(client: Any, *, route: str, **kwargs: Any) -> Any:
+    """client.messages.create plus a usage record: one place that knows what AI costs."""
+    resp = client.messages.create(**kwargs)
+    usage = getattr(resp, "usage", None)
+    rec = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "route": route, "model": kwargs.get("model"),
+        "effort": (kwargs.get("output_config") or {}).get("effort"),
+        "input": getattr(usage, "input_tokens", 0), "output": getattr(usage, "output_tokens", 0),
+        "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "usd": round(call_cost(kwargs.get("model"), usage), 5),
+    }
+    try:
+        with open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        log.warning("could not write usage log %s", USAGE_LOG)
+    return resp
 
 
 def get_anthropic_client():
@@ -75,7 +118,8 @@ def complete(system: str, user: str, *, max_tokens: int = 4000,
     model returns nothing. Both beat silently rendering an empty panel.
     """
     client = get_anthropic_client()
-    resp = client.messages.create(
+    resp = create_message(
+        client, route="panel",
         model=model or OPUS_MODEL,
         max_tokens=max_tokens,
         output_config={"effort": effort},
@@ -690,12 +734,18 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
     while safety_iter < 8:
         safety_iter += 1
         try:
-            resp = client.messages.create(
+            # Opus 5.5 defaults to effort "medium" where Opus 5 defaulted to
+            # "high"; state it so the analyst keeps the depth it had. Haiku 4.5
+            # rejects the effort parameter, so it only goes to Opus.
+            extra = {"output_config": {"effort": AGENT_EFFORT}} if model == OPUS_MODEL else {}
+            resp = create_message(
+                client, route="agent",
                 model=model,
                 max_tokens=max_tokens,
                 system=_build_system_prompt(),
                 tools=TOOLS,
                 messages=convo,
+                **extra,
             )
         except Exception as e:
             log.exception("anthropic call failed")

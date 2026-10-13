@@ -10,6 +10,7 @@ DB path resolution:
 """
 from __future__ import annotations
 
+import logging
 import os
 import json
 import sqlite3
@@ -275,6 +276,31 @@ def prune_news(retention_days: int = 90) -> int:
         cur = conn.execute("DELETE FROM news WHERE published_at < ?", (cutoff,))
         conn.commit()
         return cur.rowcount
+
+
+def prune_market_snapshots(keep_days: int = 2) -> int:
+    """Drop old quote rows. Only the latest snapshot per symbol is ever read,
+    but every refresh (every 5 and 30 minutes, ~580 symbols) inserts a new row,
+    so without this the table filled the 1 GB Render disk ("database or disk
+    is full"). The newest row of each symbol is kept even if it is older."""
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = get_conn()
+    with _DB_LOCK:
+        cur = conn.execute(
+            """DELETE FROM market_snapshots
+               WHERE snapshot_at < ?
+                 AND id NOT IN (SELECT MAX(id) FROM market_snapshots GROUP BY symbol)""",
+            (cutoff,))
+        conn.commit()
+        removed = cur.rowcount
+        # Fold the write-ahead log back into the file and truncate it; the freed
+        # pages are reused by new inserts, so the database stops growing.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        try:
+            conn.execute("VACUUM;")   # shrinks the file when there is room to do it
+        except Exception as e:
+            logging.getLogger(__name__).warning("VACUUM skipped: %s", e)
+        return removed
 
 
 # ---------------- MARKET ----------------

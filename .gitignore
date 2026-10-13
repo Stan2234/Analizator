@@ -9,3 +9,4 @@ data/
 .streamlit/secrets.toml
 news_history.csv
 news_last_fetch.json
+ai_usage*.jsonl

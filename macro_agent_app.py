@@ -5410,7 +5410,7 @@ judgement that their rates are settled.
                                 )
                                 st.markdown(ai_agent.complete(
                                     sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=3000, effort="medium"))
+                                    max_tokens=8000, effort="medium"))
                             except Exception as _e:
                                 st.error(f"Model call failed: {_e}")
 
@@ -5996,7 +5996,7 @@ look at the equity at all.
                                 )
                                 st.markdown(ai_agent.complete(
                                     sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=3000, effort="medium"))
+                                    max_tokens=8000, effort="medium"))
                             except Exception as _e:
                                 st.error(f"Model call failed: {_e}")
 
@@ -6584,7 +6584,7 @@ every correlation toward zero.
                                 )
                                 st.markdown(ai_agent.complete(
                                     sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=3000, effort="medium"))
+                                    max_tokens=8000, effort="medium"))
                             except Exception as _e:
                                 st.error(f"Model call failed: {_e}")
 

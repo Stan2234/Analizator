@@ -293,6 +293,7 @@ def _run_subagent(spec: Dict[str, Any], user_query: str) -> Dict[str, Any]:
         try:
             resp = create_message(
                 client, route="brief-subagent",
+                cache_control={"type": "ephemeral"},   # same prefix every tool round
                 model=OPUS_MODEL,
                 max_tokens=SUBAGENT_MAX_TOKENS,
                 output_config={"effort": SUBAGENT_EFFORT},

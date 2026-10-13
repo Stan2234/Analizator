@@ -740,6 +740,9 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
             extra = {"output_config": {"effort": AGENT_EFFORT}} if model == OPUS_MODEL else {}
             resp = create_message(
                 client, route="agent",
+                # The loop resends system + tools + the growing transcript on
+                # every tool round; caching the prefix bills repeats at 5%.
+                cache_control={"type": "ephemeral"},
                 model=model,
                 max_tokens=max_tokens,
                 system=_build_system_prompt(),

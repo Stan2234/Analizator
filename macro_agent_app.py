@@ -70,6 +70,8 @@ except Exception as _e:
     _HAS_AGENT = False
     _AGENT_IMPORT_ERROR = str(_e)
 
+import access
+
 try:
     import orchestrator as orch
     _HAS_ORCH = True
@@ -89,13 +91,32 @@ if _HAS_AGENT and "scheduler_started" not in st.session_state:
         st.session_state["scheduler_error"] = str(_e)
 if "yahoo_live_errors" not in st.session_state:
     st.session_state["yahoo_live_errors"] = {}
+def current_user():
+    return st.session_state.get("user")
+
+
 def password_gate():
     if "auth" not in st.session_state:
         st.session_state.auth = False
 
+    # Subscribers arrive from AI Bubble Tracker with a signed pass in the URL.
+    # It stays in the address bar, so a refresh keeps them signed in until it expires.
+    token = st.query_params.get("sso")
+    if token and not st.session_state.auth:
+        u = access.verify_pass(token)
+        if u:
+            st.session_state.user = u
+            st.session_state.auth = True
+            return
+
     if not st.session_state.auth:
-        st.title("Login")
-        pwd = st.text_input("Password", type="password")
+        st.title("Macro Analyzer")
+        if token:
+            st.warning("This sign-in link has expired or is not valid. Open Macro Analyzer again from AI Bubble Tracker.")
+        st.markdown(f"**Subscribers:** open Macro Analyzer from your account on "
+                    f"[AI Bubble Tracker]({access.AI_BUBBLE_URL}/#account).")
+        st.markdown("---")
+        pwd = st.text_input("Owner password", type="password")
 
         # Read APP_PASSWORD from env first (Render), then Streamlit secrets (Streamlit Cloud)
         expected = os.environ.get("APP_PASSWORD", "")
@@ -108,6 +129,7 @@ def password_gate():
 
         if pwd and expected and pwd == expected:
             st.session_state.auth = True
+            st.session_state.user = access.owner()
             st.rerun()
         elif pwd:
             st.error("Wrong password")
@@ -117,6 +139,25 @@ def password_gate():
         st.stop()
 
 password_gate()
+if st.session_state.get("auth") and not current_user():
+    st.session_state.user = access.owner()   # signed in before plans existed
+
+def locked_tab(tab: str) -> None:
+    need = access.TIER_NAMES[access.TAB_TIER[tab]]
+    st.info(f"🔒 This tab is part of the {need} plan" + (" and above." if need != "Pro" else "."))
+    st.markdown(f"[See the plans on AI Bubble Tracker]({access.upgrade_url()})")
+
+
+with st.sidebar:
+    _u = current_user()
+    st.markdown(f"[← AI Bubble Tracker]({access.AI_BUBBLE_URL})")
+    st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}")
+    _left = access.credits_left(_u)
+    if _left is not None:
+        st.markdown(f"**AI credits:** {_left} of {access.CREDITS[_u['tier']]} left · reset {access.next_reset():%d %b}")
+        st.caption("AI read 1 · news forecast 1 · analyst question 3 · FOMC read 3 · Deep Brief up to 10")
+        if _u["tier"] != "pro":
+            st.markdown(f"[Upgrade for more tabs and credits]({access.upgrade_url()})")
 
 
 def inject_secrets_to_env():
@@ -1672,7 +1713,7 @@ def ordinal(n: Optional[float]) -> str:
     return f"{i}{suffix}"
 
 
-def ai_unavailable() -> Optional[str]:
+def ai_unavailable(action: Optional[str] = None) -> Optional[str]:
     """None when the analysis panels can call the model, else why not.
 
     These panels used to run on a second provider with its own key. They are
@@ -1682,6 +1723,8 @@ def ai_unavailable() -> Optional[str]:
         return f"AI module failed to load ({_AGENT_IMPORT_ERROR})"
     if not get_secret("ANTHROPIC_API_KEY"):
         return "ANTHROPIC_API_KEY is not configured"
+    if action:
+        return access.charge(current_user(), action)   # spends the credits when allowed
     return None
 
 
@@ -2155,7 +2198,7 @@ def run_news_forecast(
     df_global, df_crypto, latest_news_items: List[Dict[str, Any]], focus_asset: str
 ):
     try:
-        _err = ai_unavailable()
+        _err = ai_unavailable("news")
         if _err:
             return f"AI news-forecast unavailable: {_err}."
 
@@ -2461,7 +2504,7 @@ def analyze_fomc_with_gpt(
     previous_text: str = "",
     pressconf_text: str = "",
 ) -> Dict[str, Any]:
-    _err = ai_unavailable()
+    _err = ai_unavailable("fomc")
     if _err:
         return {"error": f"AI unavailable: {_err}."}
 
@@ -3590,56 +3633,57 @@ st.markdown("---")
 
 # -------- GLOBAL TAB (Bloomberg-style dashboard) --------
 with tab_global:
-    # ensure universe is loaded before any query
-    try:
-        dl.seed_universe()
-    except Exception as _seed_e:
-        st.warning(f"Universe seed failed: {_seed_e}")
-
-    # (Indices ticker tape is now rendered globally in the page header,
-    # right under the GOLD/SILVER/FX/crypto cards.)
-
-    # ============== Two-column: Sector heatmap | Top movers ==============
-    col_heat, col_movers = st.columns([3, 2])
-
-    with col_heat:
-        st.markdown("### 🔥 Sector heatmap — average move since the previous close")
-        st.caption(
-            "Equal-weighted average across the S&P 500 constituents in each GICS "
-            "sector, measured against the previous session's close. Equal-weighted, "
-            "so a sector carried by one mega-cap looks the same as one moving "
-            "together — the up/down counts beside each figure are what separate "
-            "the two."
-        )
+    if access.tab_open(current_user(), "global"):
+        # ensure universe is loaded before any query
         try:
-            perf = dl.sector_performance()
-            perf_with_data = [r for r in perf if r.get("avg_change") is not None]
-            if not perf_with_data:
-                st.info(
-                    "No sector data yet — the universe is being populated "
-                    "by the background scheduler. Refresh in 2-3 minutes."
-                )
-            else:
-                # Render 4-per-row grid of colored cards
-                cols_per_row = 4
-                for i in range(0, len(perf_with_data), cols_per_row):
-                    row = perf_with_data[i:i + cols_per_row]
-                    rcols = st.columns(cols_per_row)
-                    for c, item in zip(rcols, row):
-                        avg = float(item["avg_change"]) if item["avg_change"] is not None else 0.0
-                        # Color: clamp to [-3, +3]% for color intensity
-                        intensity = min(abs(avg) / 3.0, 1.0)
-                        if avg >= 0:
-                            bg = f"rgba(0, 217, 126, {0.15 + intensity * 0.5:.2f})"
-                            border = "#00d97e"
-                        else:
-                            bg = f"rgba(255, 77, 109, {0.15 + intensity * 0.5:.2f})"
-                            border = "#ff4d6d"
-                        n_up = item.get("n_up", 0) or 0
-                        n_down = item.get("n_down", 0) or 0
-                        with c:
-                            st.markdown(
-                                f'''<div style="background:{bg};
+            dl.seed_universe()
+        except Exception as _seed_e:
+            st.warning(f"Universe seed failed: {_seed_e}")
+
+        # (Indices ticker tape is now rendered globally in the page header,
+        # right under the GOLD/SILVER/FX/crypto cards.)
+
+        # ============== Two-column: Sector heatmap | Top movers ==============
+        col_heat, col_movers = st.columns([3, 2])
+
+        with col_heat:
+            st.markdown("### 🔥 Sector heatmap — average move since the previous close")
+            st.caption(
+                "Equal-weighted average across the S&P 500 constituents in each GICS "
+                "sector, measured against the previous session's close. Equal-weighted, "
+                "so a sector carried by one mega-cap looks the same as one moving "
+                "together — the up/down counts beside each figure are what separate "
+                "the two."
+            )
+            try:
+                perf = dl.sector_performance()
+                perf_with_data = [r for r in perf if r.get("avg_change") is not None]
+                if not perf_with_data:
+                    st.info(
+                        "No sector data yet — the universe is being populated "
+                        "by the background scheduler. Refresh in 2-3 minutes."
+                    )
+                else:
+                    # Render 4-per-row grid of colored cards
+                    cols_per_row = 4
+                    for i in range(0, len(perf_with_data), cols_per_row):
+                        row = perf_with_data[i:i + cols_per_row]
+                        rcols = st.columns(cols_per_row)
+                        for c, item in zip(rcols, row):
+                            avg = float(item["avg_change"]) if item["avg_change"] is not None else 0.0
+                            # Color: clamp to [-3, +3]% for color intensity
+                            intensity = min(abs(avg) / 3.0, 1.0)
+                            if avg >= 0:
+                                bg = f"rgba(0, 217, 126, {0.15 + intensity * 0.5:.2f})"
+                                border = "#00d97e"
+                            else:
+                                bg = f"rgba(255, 77, 109, {0.15 + intensity * 0.5:.2f})"
+                                border = "#ff4d6d"
+                            n_up = item.get("n_up", 0) or 0
+                            n_down = item.get("n_down", 0) or 0
+                            with c:
+                                st.markdown(
+                                    f'''<div style="background:{bg};
                                     border-left:4px solid {border};
                                     padding:10px 12px; border-radius:6px;
                                     margin-bottom:8px;">
@@ -3651,34 +3695,34 @@ with tab_global:
                                 <div style="color:#9aa0a6; font-size:11px;">
                                     🟢 {n_up} &nbsp; 🔴 {n_down}</div>
                                 </div>''',
-                                unsafe_allow_html=True,
-                            )
-        except Exception as _e:
-            st.error(f"Heatmap failed: {_e}")
+                                    unsafe_allow_html=True,
+                                )
+            except Exception as _e:
+                st.error(f"Heatmap failed: {_e}")
 
-    with col_movers:
-        st.markdown("### 🚀 Biggest movers since the previous close")
-        st.caption(
-            "S&P 500 equities only, ranked on the move since the previous close. "
-            "Moves beyond ±50% are excluded as probable splits or bad prints."
-        )
-        try:
-            gainers = dl.top_movers(8, "up",  asset_types=["equity"])
-            losers  = dl.top_movers(8, "down", asset_types=["equity"])
+        with col_movers:
+            st.markdown("### 🚀 Biggest movers since the previous close")
+            st.caption(
+                "S&P 500 equities only, ranked on the move since the previous close. "
+                "Moves beyond ±50% are excluded as probable splits or bad prints."
+            )
+            try:
+                gainers = dl.top_movers(8, "up",  asset_types=["equity"])
+                losers  = dl.top_movers(8, "down", asset_types=["equity"])
 
-            mv_tab1, mv_tab2 = st.tabs(["📈 Gainers", "📉 Losers"])
-            for tab_holder, rows in [(mv_tab1, gainers), (mv_tab2, losers)]:
-                with tab_holder:
-                    if not rows:
-                        st.caption("No data yet — refresh in a few minutes.")
-                    else:
-                        for r in rows:
-                            chg = float(r.get("change_pct") or 0)
-                            color = "#00d97e" if chg >= 0 else "#ff4d6d"
-                            price = r.get("price")
-                            price_s = f"${float(price):,.2f}" if price else "—"
-                            st.markdown(
-                                f'''<div style="display:flex;
+                mv_tab1, mv_tab2 = st.tabs(["📈 Gainers", "📉 Losers"])
+                for tab_holder, rows in [(mv_tab1, gainers), (mv_tab2, losers)]:
+                    with tab_holder:
+                        if not rows:
+                            st.caption("No data yet — refresh in a few minutes.")
+                        else:
+                            for r in rows:
+                                chg = float(r.get("change_pct") or 0)
+                                color = "#00d97e" if chg >= 0 else "#ff4d6d"
+                                price = r.get("price")
+                                price_s = f"${float(price):,.2f}" if price else "—"
+                                st.markdown(
+                                    f'''<div style="display:flex;
                                     justify-content:space-between;
                                     padding:6px 8px; border-bottom:1px solid #1f1f1f;">
                                 <div>
@@ -3693,109 +3737,111 @@ with tab_global:
                                         margin-left:10px;">{chg:+.2f}%</span>
                                 </div>
                                 </div>''',
-                                unsafe_allow_html=True,
-                            )
-        except Exception as _e:
-            st.error(f"Top movers failed: {_e}")
+                                    unsafe_allow_html=True,
+                                )
+            except Exception as _e:
+                st.error(f"Top movers failed: {_e}")
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # ============== Searchable Universe Browser ==============
-    st.markdown("### 🔍 S&P 500 Universe Browser")
-    try:
-        stats = dl.universe_sector_counts()
-        total_equities = sum(v for s, v in stats.items()
-                              if s not in ("Index/Commodity", "ETF/Other"))
-        st.caption(
-            f"**{total_equities}** S&P 500 companies + **{stats.get('Index/Commodity', 0)}** "
-            f"indices/commodities + **{stats.get('ETF/Other', 0)}** ETFs available. "
-            f"Search by ticker or company name, or filter by sector."
-        )
-
-        bcol1, bcol2 = st.columns([2, 3])
-        sector_options = ["All sectors"] + sorted(
-            [s for s in stats.keys() if s not in ("Index/Commodity", "ETF/Other")]
-        )
-        sel_sector = bcol1.selectbox("GICS sector", sector_options, key="universe_sector")
-        search_q = bcol2.text_input("Search ticker or company name",
-                                     key="universe_search",
-                                     placeholder="e.g. NVDA, Tesla, oil…")
-
-        sector_filter = None if sel_sector == "All sectors" else sel_sector
-        rows = dl.universe_with_quotes(
-            asset_types=["equity"],
-            sector=sector_filter,
-            query=search_q if search_q else None,
-            limit=200,
-        )
-
-        if not rows:
-            st.info("No matches.")
-        else:
-            # Render as a table
-            import pandas as pd
-            df_view = pd.DataFrame([{
-                "Symbol":   r["symbol"],
-                "Company":  r["company_name"],
-                "Sector":   r["sector"],
-                "Industry": r["industry"],
-                "Price":    f"${float(r['price']):,.2f}" if r.get("price") else "—",
-                "Change %": (f"{float(r['change_pct']):+.2f}%"
-                              if r.get("change_pct") is not None else "—"),
-            } for r in rows])
-
-            def _row_color(row):
-                ch = row.get("Change %", "")
-                if isinstance(ch, str) and ch != "—":
-                    try:
-                        v = float(ch.replace("%", "").replace("+", ""))
-                        if v > 0:
-                            return ["color: #00d97e"] * len(row)
-                        if v < 0:
-                            return ["color: #ff4d6d"] * len(row)
-                    except Exception:
-                        pass
-                return [""] * len(row)
-
-            st.dataframe(
-                df_view.style.apply(_row_color, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                height=min(600, 40 + 35 * len(df_view)),
+        # ============== Searchable Universe Browser ==============
+        st.markdown("### 🔍 S&P 500 Universe Browser")
+        try:
+            stats = dl.universe_sector_counts()
+            total_equities = sum(v for s, v in stats.items()
+                                  if s not in ("Index/Commodity", "ETF/Other"))
+            st.caption(
+                f"**{total_equities}** S&P 500 companies + **{stats.get('Index/Commodity', 0)}** "
+                f"indices/commodities + **{stats.get('ETF/Other', 0)}** ETFs available. "
+                f"Search by ticker or company name, or filter by sector."
             )
-            st.caption(f"Showing {len(df_view)} of up to 200 matches.")
-    except Exception as _e:
-        st.error(f"Universe browser failed: {_e}")
 
-    # ============== Legacy multi-indicator analysis (collapsed) ==============
-    with st.expander("📊 Legacy multi-indicator signal table (original Global Signals)",
-                      expanded=False):
-        st.caption(
-            "The original SMA+RSI+MACD+Bollinger+Stochastic+ADX scoring "
-            "table. Slower (re-pulls history). Kept for power-user use."
-        )
-        all_classes_legacy = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
-        selected_classes = st.multiselect(
-            "Asset classes to show:",
-            options=all_classes_legacy,
-            default=all_classes_legacy,
-            key="legacy_global_classes",
-        )
-        refresh = st.button("🔄 Refresh legacy signals", key="legacy_global_refresh")
-        if "df_signals_global" not in st.session_state or refresh:
-            df_global = run_analysis_global(selected_classes)
-            st.session_state["df_signals_global"] = df_global
-        else:
-            df_global = st.session_state["df_signals_global"]
+            bcol1, bcol2 = st.columns([2, 3])
+            sector_options = ["All sectors"] + sorted(
+                [s for s in stats.keys() if s not in ("Index/Commodity", "ETF/Other")]
+            )
+            sel_sector = bcol1.selectbox("GICS sector", sector_options, key="universe_sector")
+            search_q = bcol2.text_input("Search ticker or company name",
+                                         key="universe_search",
+                                         placeholder="e.g. NVDA, Tesla, oil…")
 
-        if df_global.empty:
-            st.warning("No legacy results yet.")
-        else:
-            def color_terminal(row):
-                return ["color: #00ff00; background-color: #000000;" for _ in row]
-            styled_df = df_global.style.apply(color_terminal, axis=1)
-            st.dataframe(styled_df, use_container_width=True)
-            st.caption(ALIGNMENT_NOTE)
+            sector_filter = None if sel_sector == "All sectors" else sel_sector
+            rows = dl.universe_with_quotes(
+                asset_types=["equity"],
+                sector=sector_filter,
+                query=search_q if search_q else None,
+                limit=200,
+            )
+
+            if not rows:
+                st.info("No matches.")
+            else:
+                # Render as a table
+                import pandas as pd
+                df_view = pd.DataFrame([{
+                    "Symbol":   r["symbol"],
+                    "Company":  r["company_name"],
+                    "Sector":   r["sector"],
+                    "Industry": r["industry"],
+                    "Price":    f"${float(r['price']):,.2f}" if r.get("price") else "—",
+                    "Change %": (f"{float(r['change_pct']):+.2f}%"
+                                  if r.get("change_pct") is not None else "—"),
+                } for r in rows])
+
+                def _row_color(row):
+                    ch = row.get("Change %", "")
+                    if isinstance(ch, str) and ch != "—":
+                        try:
+                            v = float(ch.replace("%", "").replace("+", ""))
+                            if v > 0:
+                                return ["color: #00d97e"] * len(row)
+                            if v < 0:
+                                return ["color: #ff4d6d"] * len(row)
+                        except Exception:
+                            pass
+                    return [""] * len(row)
+
+                st.dataframe(
+                    df_view.style.apply(_row_color, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(600, 40 + 35 * len(df_view)),
+                )
+                st.caption(f"Showing {len(df_view)} of up to 200 matches.")
+        except Exception as _e:
+            st.error(f"Universe browser failed: {_e}")
+
+        # ============== Legacy multi-indicator analysis (collapsed) ==============
+        with st.expander("📊 Legacy multi-indicator signal table (original Global Signals)",
+                          expanded=False):
+            st.caption(
+                "The original SMA+RSI+MACD+Bollinger+Stochastic+ADX scoring "
+                "table. Slower (re-pulls history). Kept for power-user use."
+            )
+            all_classes_legacy = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
+            selected_classes = st.multiselect(
+                "Asset classes to show:",
+                options=all_classes_legacy,
+                default=all_classes_legacy,
+                key="legacy_global_classes",
+            )
+            refresh = st.button("🔄 Refresh legacy signals", key="legacy_global_refresh")
+            if "df_signals_global" not in st.session_state or refresh:
+                df_global = run_analysis_global(selected_classes)
+                st.session_state["df_signals_global"] = df_global
+            else:
+                df_global = st.session_state["df_signals_global"]
+
+            if df_global.empty:
+                st.warning("No legacy results yet.")
+            else:
+                def color_terminal(row):
+                    return ["color: #00ff00; background-color: #000000;" for _ in row]
+                styled_df = df_global.style.apply(color_terminal, axis=1)
+                st.dataframe(styled_df, use_container_width=True)
+                st.caption(ALIGNMENT_NOTE)
+    else:
+        locked_tab("global")
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fx_econ_events() -> List[Dict[str, Any]]:
@@ -3892,612 +3938,615 @@ def fx_heat_col(s: pd.Series, invert: bool = False) -> List[str]:
 
 
 with tab_fx:
-    if not _HAS_FXA:
-        st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "fx"):
+        if not _HAS_FXA:
+            st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">FX DESK</span>
         <span style="font-size:14px;color:#888;margin-left:12px">Relative strength · Carry · Volatility · Empirical drivers</span>
         </div>
         """, unsafe_allow_html=True)
 
-        fxc1, fxc2, fxc3 = st.columns([1.4, 1.4, 1])
-        with fxc1:
-            fx_scope = st.radio("Universe", ["G10", "G10 + EM"], horizontal=True,
-                                key="fx_scope", label_visibility="collapsed")
-        with fxc2:
-            fx_horizon = st.select_slider(
-                "Horizon", options=list(fxa.HORIZON_BARS.keys()), value="1M",
-                key="fx_horizon", label_visibility="collapsed")
-        with fxc3:
-            if st.button("🔄 Refresh", key="fx_refresh", use_container_width=True):
-                fx_load_prices.clear()
+            fxc1, fxc2, fxc3 = st.columns([1.4, 1.4, 1])
+            with fxc1:
+                fx_scope = st.radio("Universe", ["G10", "G10 + EM"], horizontal=True,
+                                    key="fx_scope", label_visibility="collapsed")
+            with fxc2:
+                fx_horizon = st.select_slider(
+                    "Horizon", options=list(fxa.HORIZON_BARS.keys()), value="1M",
+                    key="fx_horizon", label_visibility="collapsed")
+            with fxc3:
+                if st.button("🔄 Refresh", key="fx_refresh", use_container_width=True):
+                    fx_load_prices.clear()
 
-        fx_codes = fxa.G10 if fx_scope == "G10" else fxa.G10 + fxa.EM
-        fx_bars = fxa.HORIZON_BARS[fx_horizon]
+            fx_codes = fxa.G10 if fx_scope == "G10" else fxa.G10 + fxa.EM
+            fx_bars = fxa.HORIZON_BARS[fx_horizon]
 
-        with st.spinner("Loading FX universe…"):
-            fx_prices, fx_failed = fx_load_prices()
+            with st.spinner("Loading FX universe…"):
+                fx_prices, fx_failed = fx_load_prices()
 
-        if fx_prices.empty:
-            st.error("No FX data available — Yahoo did not return any series.")
-        else:
-            uv = fxa.usd_values(fx_prices)
-            if fx_failed:
-                st.caption(f"⚠️ No data for: {', '.join(fx_failed)} — those rows are omitted.")
+            if fx_prices.empty:
+                st.error("No FX data available — Yahoo did not return any series.")
+            else:
+                uv = fxa.usd_values(fx_prices)
+                if fx_failed:
+                    st.caption(f"⚠️ No data for: {', '.join(fx_failed)} — those rows are omitted.")
 
-            # Rate corrections entered in the Carry tab survive reruns.
-            fx_rate_overrides = st.session_state.setdefault("fx_rate_overrides", {})
-            fx_rates = fxa.policy_rates(get_secret("FRED_API_KEY"), fx_rate_overrides)
+                # Rate corrections entered in the Carry tab survive reruns.
+                fx_rate_overrides = st.session_state.setdefault("fx_rate_overrides", {})
+                fx_rates = fxa.policy_rates(get_secret("FRED_API_KEY"), fx_rate_overrides)
 
-            fxt1, fxt2, fxt3, fxt4, fxt5 = st.tabs([
-                "🌐 Strength Board", "💰 Carry", "📉 Vol & Correlation",
-                "🧲 Drivers", "🔬 Pair Deep Dive",
-            ])
+                fxt1, fxt2, fxt3, fxt4, fxt5 = st.tabs([
+                    "🌐 Strength Board", "💰 Carry", "📉 Vol & Correlation",
+                    "🧲 Drivers", "🔬 Pair Deep Dive",
+                ])
 
-            # ═══════════════════════════════════════════════════════
-            # 1. STRENGTH BOARD
-            # ═══════════════════════════════════════════════════════
-            with fxt1:
-                strength = fxa.currency_strength(uv, fx_codes, fx_bars)
+                # ═══════════════════════════════════════════════════════
+                # 1. STRENGTH BOARD
+                # ═══════════════════════════════════════════════════════
+                with fxt1:
+                    strength = fxa.currency_strength(uv, fx_codes, fx_bars)
 
-                if strength.empty:
-                    st.warning("Not enough overlapping history for a strength ranking.")
-                else:
-                    st.markdown(f"##### Currency strength — average move vs every other currency, {fx_horizon}")
-                    st.caption(
-                        "A pair cannot tell you whether the base rose or the quote fell. "
-                        "This measures each currency against all the others, so a currency "
-                        "that is bid everywhere is separated from one that merely gained "
-                        "against a weak dollar."
-                    )
-
-                    s_vals = strength["strength"]
-                    fig_str = go.Figure(go.Bar(
-                        x=s_vals.values,
-                        y=[f"{strength['flag'].iloc[i]} {strength.index[i]}" for i in range(len(strength))],
-                        orientation="h",
-                        marker_color=["#00cc66" if v > 0 else "#ff4444" for v in s_vals.values],
-                        text=[f"{v:+.2f}%" for v in s_vals.values],
-                        textposition="outside",
-                    ))
-                    fig_str.update_layout(
-                        template="plotly_dark", height=max(280, 30 * len(strength)),
-                        margin=dict(l=0, r=40, t=10, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                        xaxis_title=f"Average % vs peers ({fx_horizon})",
-                        yaxis=dict(autorange="reversed"),
-                    )
-                    fig_str.update_xaxes(gridcolor="#1a1a1a", zerolinecolor="#444")
-                    fig_str.update_yaxes(gridcolor="#1a1a1a")
-                    st.plotly_chart(fig_str, use_container_width=True)
-
-                    top, bot = strength.index[0], strength.index[-1]
-                    lead = fxa.cross(uv, top, bot)
-                    lead_move = fxa._pct_change_over(lead, fx_bars)
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric(f"Strongest — {strength['flag'].iloc[0]} {top}",
-                              fx_pct(float(s_vals.iloc[0])))
-                    c2.metric(f"Weakest — {strength['flag'].iloc[-1]} {bot}",
-                              fx_pct(float(s_vals.iloc[-1])))
-                    c3.metric(f"The {fx_horizon} trend pair — {top}/{bot}",
-                              f"{float(lead.iloc[-1]):.4f}" if not lead.empty else "—",
-                              fx_pct(lead_move))
-
-                st.markdown("---")
-                st.markdown(f"##### Cross-rate matrix — row currency vs column currency, {fx_horizon}")
-                st.caption("Read across a row for how that currency fared against everything; "
-                           "read down a column for what everything did to it.")
-
-                m = fxa.cross_matrix(uv, fx_codes, fx_bars)
-                if m.empty:
-                    st.info("Matrix unavailable for this universe.")
-                else:
-                    fig_m = go.Figure(go.Heatmap(
-                        z=m.values,
-                        x=[f"{fxa.CURRENCIES[c].flag} {c}" for c in m.columns],
-                        y=[f"{fxa.CURRENCIES[c].flag} {c}" for c in m.index],
-                        colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
-                        zmid=0,
-                        text=[[f"{v:+.1f}" for v in row] for row in m.values],
-                        texttemplate="%{text}",
-                        textfont=dict(size=10),
-                        colorbar=dict(title="%"),
-                        hovertemplate="%{y} vs %{x}: %{z:+.2f}%<extra></extra>",
-                    ))
-                    fig_m.update_layout(
-                        template="plotly_dark", height=max(360, 34 * len(m)),
-                        margin=dict(l=0, r=0, t=10, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#000",
-                    )
-                    st.plotly_chart(fig_m, use_container_width=True)
-
-                st.markdown("---")
-                st.markdown("##### Performance vs USD — all horizons")
-                perf = fxa.performance_table(uv, fx_codes)
-                if perf.empty:
-                    st.info("No performance data.")
-                else:
-                    show = perf.copy()
-                    show.insert(0, "Currency", show["flag"] + " " + show.index + " — " + show["name"])
-                    cols = ["Currency"] + [c for c in ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD"]
-                                           if c in show.columns]
-                    st.dataframe(
-                        show[cols].style
-                        .apply(fx_heat_col, subset=[c for c in cols if c != "Currency"])
-                        .format({c: "{:+.2f}%" for c in cols if c != "Currency"}, na_rep="—"),
-                        use_container_width=True, hide_index=True,
-                    )
-                    st.caption("Positive = the currency appreciated against the dollar, for every "
-                               "row — including those the market quotes the other way up.")
-
-            # ═══════════════════════════════════════════════════════
-            # 2. CARRY
-            # ═══════════════════════════════════════════════════════
-            with fxt2:
-                st.markdown("##### Carry vs USD — and what it actually paid")
-                st.caption(
-                    "Carry is the rate differential you earn holding the currency. "
-                    "Ranked here by **total return** — carry plus the realised spot move — "
-                    "because the spot leg is what decides whether the carry was ever yours to keep."
-                )
-
-                ct = fxa.carry_table(uv, fx_rates, fx_codes, vs="USD")
-                if ct.empty:
-                    st.warning("No carry data — policy rates unavailable.")
-                else:
-                    managed = ct[ct["regime"] == "managed / crawling peg"]
-                    if not managed.empty:
-                        st.warning(
-                            "**Carry-to-vol is unreliable for "
-                            + ", ".join(f"{r['flag']} {i}" for i, r in managed.iterrows())
-                            + ".** These currencies are steered rather than traded: they drift "
-                            "steadily and barely wobble, so realised volatility understates the "
-                            "risk and the ratio flatters them. Read the spot and total columns."
+                    if strength.empty:
+                        st.warning("Not enough overlapping history for a strength ranking.")
+                    else:
+                        st.markdown(f"##### Currency strength — average move vs every other currency, {fx_horizon}")
+                        st.caption(
+                            "A pair cannot tell you whether the base rose or the quote fell. "
+                            "This measures each currency against all the others, so a currency "
+                            "that is bid everywhere is separated from one that merely gained "
+                            "against a weak dollar."
                         )
 
-                    disp = ct.copy()
-                    disp.insert(0, "Currency", disp["flag"] + " " + disp.index)
-                    disp["Rate"] = disp["rate_status"].map(
-                        {"live": "🟢", "verified": "🟢", "override": "✏️",
-                         "unverified": "🟠", "missing": "⚪"}).fillna("") + " " +                         disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
-                    view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
-                                 "spot_1y", "total_1y", "regime", "as_of"]].rename(columns={
-                        "carry": "Carry vs USD", "vol_3m": "Vol (3m)",
-                        "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
-                        "total_1y": "Total (1y)", "regime": "Regime", "as_of": "Rate as of",
-                    })
-                    st.dataframe(
-                        view.style
-                        .apply(fx_heat_col, subset=["Total (1y)"])
-                        .format({"Carry vs USD": "{:+.2f}%",
-                                 "Vol (3m)": "{:.1f}%", "Carry / vol": "{:.2f}",
-                                 "Spot (1y ann.)": "{:+.1f}%", "Total (1y)": "{:+.1f}%"},
-                                na_rep="—"),
-                        use_container_width=True, hide_index=True,
-                    )
+                        s_vals = strength["strength"]
+                        fig_str = go.Figure(go.Bar(
+                            x=s_vals.values,
+                            y=[f"{strength['flag'].iloc[i]} {strength.index[i]}" for i in range(len(strength))],
+                            orientation="h",
+                            marker_color=["#00cc66" if v > 0 else "#ff4444" for v in s_vals.values],
+                            text=[f"{v:+.2f}%" for v in s_vals.values],
+                            textposition="outside",
+                        ))
+                        fig_str.update_layout(
+                            template="plotly_dark", height=max(280, 30 * len(strength)),
+                            margin=dict(l=0, r=40, t=10, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            xaxis_title=f"Average % vs peers ({fx_horizon})",
+                            yaxis=dict(autorange="reversed"),
+                        )
+                        fig_str.update_xaxes(gridcolor="#1a1a1a", zerolinecolor="#444")
+                        fig_str.update_yaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_str, use_container_width=True)
+
+                        top, bot = strength.index[0], strength.index[-1]
+                        lead = fxa.cross(uv, top, bot)
+                        lead_move = fxa._pct_change_over(lead, fx_bars)
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric(f"Strongest — {strength['flag'].iloc[0]} {top}",
+                                  fx_pct(float(s_vals.iloc[0])))
+                        c2.metric(f"Weakest — {strength['flag'].iloc[-1]} {bot}",
+                                  fx_pct(float(s_vals.iloc[-1])))
+                        c3.metric(f"The {fx_horizon} trend pair — {top}/{bot}",
+                                  f"{float(lead.iloc[-1]):.4f}" if not lead.empty else "—",
+                                  fx_pct(lead_move))
 
                     st.markdown("---")
-                    st.markdown("##### Carry against risk")
-                    plot = ct.dropna(subset=["vol_3m", "carry"])
-                    if not plot.empty:
-                        fig_c = go.Figure()
-                        for regime, colour in [("floating", "#4488ff"),
-                                               ("heavily trending", "#ffaa00"),
-                                               ("managed / crawling peg", "#ff4444")]:
-                            grp = plot[plot["regime"] == regime]
-                            if grp.empty:
-                                continue
-                            fig_c.add_trace(go.Scatter(
-                                x=grp["vol_3m"], y=grp["carry"], mode="markers+text",
-                                text=[f"{grp['flag'].iloc[i]} {grp.index[i]}" for i in range(len(grp))],
-                                textposition="top center", name=regime,
-                                marker=dict(size=13, color=colour,
-                                            line=dict(width=1, color="#000")),
-                                hovertemplate="%{text}<br>vol %{x:.1f}%<br>carry %{y:+.2f}%<extra></extra>",
-                            ))
-                        fig_c.add_hline(y=0, line_dash="dash", line_color="#444")
-                        fig_c.update_layout(
-                            template="plotly_dark", height=440,
-                            margin=dict(l=0, r=0, t=44, b=0),
-                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                            xaxis_title="Realised volatility, 3 months (% annualised)",
-                            yaxis_title="Carry vs USD (% per year)",
-                            legend=dict(orientation="h", y=1.12, x=0, xanchor="left"),
-                        )
-                        fig_c.update_xaxes(gridcolor="#1a1a1a")
-                        fig_c.update_yaxes(gridcolor="#1a1a1a")
-                        st.plotly_chart(fig_c, use_container_width=True)
-                        st.caption("Up and to the left is the attractive quadrant — paid to wait, "
-                                   "without much to endure. Red points sit there for the wrong reason.")
+                    st.markdown(f"##### Cross-rate matrix — row currency vs column currency, {fx_horizon}")
+                    st.caption("Read across a row for how that currency fared against everything; "
+                               "read down a column for what everything did to it.")
 
-                    n_unver = int((ct["rate_status"] == "unverified").sum()) if "rate_status" in ct else 0
-                    if n_unver:
-                        st.info(
-                            f"{n_unver} of these rest on a policy rate that has not been "
-                            "confirmed recently. They are shown but ranked last, and are not "
-                            "used to draw conclusions. Correct any of them below and every "
-                            "carry number on this page recomputes."
-                        )
-
-                    with st.expander("Policy rates — source, vintage, and corrections",
-                                     expanded=bool(n_unver)):
-                        st.caption(
-                            "FRED supplies the dollar and euro legs daily. It has no clean "
-                            "series for the rest — its other policy-rate entries are monthly "
-                            "interbank proxies, not the rate a desk funds at — so those are "
-                            "seeded by hand and carry the date they were last confirmed "
-                            "against the central bank. Anything unconfirmed for more than "
-                            f"{fxa.VERIFICATION_MAX_AGE_DAYS} days is marked **unverified**: "
-                            "most central banks meet eight times a year, so a quarter is "
-                            "already a meeting or two of drift."
-                        )
-
-                        prov = fx_rates.loc[[c for c in fx_codes if c in fx_rates.index]].copy()
-                        badge = {"live": "🟢 live (FRED)", "verified": "🟢 confirmed",
-                                 "override": "✏️ entered here", "unverified": "🟠 unverified",
-                                 "missing": "⚪ none"}
-                        edit = pd.DataFrame({
-                            "Currency": [f"{fxa.CURRENCIES[c].flag} {c}" for c in prov.index],
-                            "Rate %": prov["rate"],
-                            "Status": prov["status"].map(badge).fillna(prov["status"]),
-                            "Effective from": prov["as_of"],
-                            "What it is": prov["note"].fillna(""),
-                            "Source": prov["source"].fillna(""),
-                        })
-                        edited = st.data_editor(
-                            edit, use_container_width=True, hide_index=True,
-                            key="fx_rate_editor",
-                            disabled=["Currency", "Status", "Effective from",
-                                      "What it is", "Source"],
-                            column_config={"Rate %": st.column_config.NumberColumn(
-                                "Rate %", help="Type the current policy rate to override it",
-                                format="%.2f", step=0.05)},
-                        )
-
-                        changed = {}
-                        for code, new_rate in zip(prov.index, edited["Rate %"]):
-                            old = prov["rate"].get(code)
-                            if pd.isna(new_rate):
-                                continue
-                            if old is None or pd.isna(old) or abs(float(new_rate) - float(old)) > 1e-9:
-                                changed[code] = float(new_rate)
-
-                        bc1, bc2 = st.columns([1, 3])
-                        with bc1:
-                            if st.button("Apply corrections", key="fx_rate_apply",
-                                         type="primary", use_container_width=True,
-                                         disabled=not changed):
-                                fx_rate_overrides.update(changed)
-                                st.rerun()
-                        with bc2:
-                            if fx_rate_overrides:
-                                st.caption("Overridden: " + ", ".join(
-                                    f"{c} {v:.2f}%" for c, v in sorted(fx_rate_overrides.items())))
-                                if st.button("Clear overrides", key="fx_rate_clear"):
-                                    fx_rate_overrides.clear()
-                                    st.rerun()
-
-            # ═══════════════════════════════════════════════════════
-            # 3. VOL & CORRELATION
-            # ═══════════════════════════════════════════════════════
-            with fxt3:
-                vs_ccy = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
-                                      key="fx_vol_vs")
-                vol_rows = []
-                for code in fx_codes:
-                    if code == vs_ccy:
-                        continue
-                    vp = fxa.vol_profile(uv, code, vs_ccy)
-                    if not vp:
-                        continue
-                    vol_rows.append({
-                        "Pair": f"{fxa.CURRENCIES[code].flag} {code}/{vs_ccy}",
-                        "Vol 1m": vp.get("vol_1m"), "Vol 3m": vp.get("vol_3m"),
-                        "Vol 1y": vp.get("vol_1y"),
-                        "Percentile": vp.get("vol_percentile"),
-                        "1m − 3m": vp.get("term_structure"),
-                    })
-                if vol_rows:
-                    vdf = pd.DataFrame(vol_rows)
-                    st.markdown("##### Realised volatility")
-                    st.dataframe(
-                        vdf.style
-                        .apply(fx_heat_col, invert=True, subset=["Vol 1m", "Percentile"])
-                        .format({"Vol 1m": "{:.1f}%", "Vol 3m": "{:.1f}%", "Vol 1y": "{:.1f}%",
-                                 "Percentile": "{:.0f}", "1m − 3m": "{:+.1f}"}, na_rep="—"),
-                        use_container_width=True, hide_index=True,
-                    )
-                    st.caption(
-                        "**Percentile** places current 1m vol against the pair's own history — the "
-                        "level alone means nothing across pairs. **1m − 3m** above zero says the "
-                        "market is pricing near-term stress rather than a calm trend."
-                    )
-
-                st.markdown("---")
-                st.markdown("##### Correlation — which positions are the same trade")
-                corr_pairs = [(c, vs_ccy) for c in fx_codes if c != vs_ccy]
-                corr = fxa.correlation_matrix(uv, corr_pairs, window=63)
-                if corr.empty:
-                    st.info("Not enough overlapping history for a correlation matrix.")
-                else:
-                    fig_corr = go.Figure(go.Heatmap(
-                        z=corr.values, x=list(corr.columns), y=list(corr.index),
-                        colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
-                        zmid=0, zmin=-1, zmax=1,
-                        text=[[f"{v:.2f}" for v in row] for row in corr.values],
-                        texttemplate="%{text}", textfont=dict(size=9),
-                        hovertemplate="%{y} / %{x}: %{z:.2f}<extra></extra>",
-                    ))
-                    fig_corr.update_layout(
-                        template="plotly_dark", height=max(380, 32 * len(corr)),
-                        margin=dict(l=0, r=0, t=10, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#000",
-                    )
-                    st.plotly_chart(fig_corr, use_container_width=True)
-
-                    clusters = fxa.crowded_clusters(corr, 0.7)
-                    if clusters:
-                        st.warning(
-                            "**Effectively one position** at |ρ| ≥ 0.7:\n\n"
-                            + "\n".join(f"- {' · '.join(g)}" for g in clusters)
-                            + "\n\nSizing these as separate trades multiplies the exposure "
-                            "without diversifying it — they lose together."
-                        )
+                    m = fxa.cross_matrix(uv, fx_codes, fx_bars)
+                    if m.empty:
+                        st.info("Matrix unavailable for this universe.")
                     else:
-                        st.success("No cluster above |ρ| ≥ 0.7 — these pairs are behaving independently.")
+                        fig_m = go.Figure(go.Heatmap(
+                            z=m.values,
+                            x=[f"{fxa.CURRENCIES[c].flag} {c}" for c in m.columns],
+                            y=[f"{fxa.CURRENCIES[c].flag} {c}" for c in m.index],
+                            colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
+                            zmid=0,
+                            text=[[f"{v:+.1f}" for v in row] for row in m.values],
+                            texttemplate="%{text}",
+                            textfont=dict(size=10),
+                            colorbar=dict(title="%"),
+                            hovertemplate="%{y} vs %{x}: %{z:+.2f}%<extra></extra>",
+                        ))
+                        fig_m.update_layout(
+                            template="plotly_dark", height=max(360, 34 * len(m)),
+                            margin=dict(l=0, r=0, t=10, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#000",
+                        )
+                        st.plotly_chart(fig_m, use_container_width=True)
 
-            # ═══════════════════════════════════════════════════════
-            # 4. DRIVERS
-            # ═══════════════════════════════════════════════════════
-            with fxt4:
-                st.markdown("##### What is actually moving each pair")
-                st.caption(
-                    "Correlation of daily returns against each macro driver over the last 63 "
-                    "sessions. Textbook FX relationships lapse for quarters at a time, so this "
-                    "measures the link rather than assuming it."
-                )
-                drv_vs = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
-                                      key="fx_drv_vs")
+                    st.markdown("---")
+                    st.markdown("##### Performance vs USD — all horizons")
+                    perf = fxa.performance_table(uv, fx_codes)
+                    if perf.empty:
+                        st.info("No performance data.")
+                    else:
+                        show = perf.copy()
+                        show.insert(0, "Currency", show["flag"] + " " + show.index + " — " + show["name"])
+                        cols = ["Currency"] + [c for c in ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD"]
+                                               if c in show.columns]
+                        st.dataframe(
+                            show[cols].style
+                            .apply(fx_heat_col, subset=[c for c in cols if c != "Currency"])
+                            .format({c: "{:+.2f}%" for c in cols if c != "Currency"}, na_rep="—"),
+                            use_container_width=True, hide_index=True,
+                        )
+                        st.caption("Positive = the currency appreciated against the dollar, for every "
+                                   "row — including those the market quotes the other way up.")
 
-                rows, labels = [], []
-                for code in fx_codes:
-                    if code == drv_vs:
-                        continue
-                    dc = fxa.driver_correlations(uv, code, drv_vs, fx_prices, window=63)
-                    if dc.empty:
-                        continue
-                    labels.append(f"{fxa.CURRENCIES[code].flag} {code}/{drv_vs}")
-                    rows.append({d: dc.loc[d, "corr"] for d in dc.index})
-
-                if not rows:
-                    st.info("Driver data unavailable.")
-                else:
-                    dmat = pd.DataFrame(rows, index=labels)
-                    dmat = dmat[[c for c in fxa.DRIVERS if c in dmat.columns]]
-                    fig_d = go.Figure(go.Heatmap(
-                        z=dmat.values, x=list(dmat.columns), y=list(dmat.index),
-                        colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
-                        zmid=0, zmin=-1, zmax=1,
-                        text=[[f"{v:+.2f}" for v in row] for row in dmat.values],
-                        texttemplate="%{text}", textfont=dict(size=9),
-                        hovertemplate="%{y} vs %{x}: %{z:+.2f}<extra></extra>",
-                    ))
-                    fig_d.update_layout(
-                        template="plotly_dark", height=max(340, 32 * len(dmat)),
-                        margin=dict(l=0, r=0, t=10, b=60),
-                        paper_bgcolor="#000", plot_bgcolor="#000",
-                    )
-                    st.plotly_chart(fig_d, use_container_width=True)
-
-                    st.markdown("###### Dominant driver per pair")
-                    dom_rows = []
-                    for lbl, row in dmat.iterrows():
-                        if row.dropna().empty:
-                            continue
-                        top_drv = row.abs().idxmax()
-                        dom_rows.append({
-                            "Pair": lbl, "Driver": top_drv,
-                            "ρ": row[top_drv],
-                            "Channel": fxa.DRIVERS[top_drv]["why"],
-                        })
-                    if dom_rows:
-                        st.dataframe(pd.DataFrame(dom_rows).style.format({"ρ": "{:+.2f}"}),
-                                     use_container_width=True, hide_index=True)
-                        st.caption("A |ρ| below roughly 0.3 means no driver is in control — the pair "
-                                   "is trading on its own idiosyncratic flow.")
-
-            # ═══════════════════════════════════════════════════════
-            # 5. PAIR DEEP DIVE
-            # ═══════════════════════════════════════════════════════
-            with fxt5:
-                pc1, pc2, pc3 = st.columns([1, 1, 1])
-                avail = [c for c in fx_codes if c in uv.columns]
-                with pc1:
-                    dd_base = st.selectbox("Base", avail,
-                                           index=avail.index("EUR") if "EUR" in avail else 0,
-                                           key="fx_dd_base")
-                with pc2:
-                    dd_quote = st.selectbox("Quote", [c for c in avail if c != dd_base],
-                                            index=0, key="fx_dd_quote")
-                with pc3:
-                    run_dd = st.button("▶ Analyse", type="primary", key="fx_dd_run",
-                                       use_container_width=True)
-
-                snap = fxa.pair_snapshot(uv, dd_base, dd_quote, fx_rates, fx_prices)
-                if not snap:
-                    st.warning("No data for this pair.")
-                else:
-                    st.markdown(f"### {fxa.CURRENCIES[dd_base].flag} {dd_base} / "
-                                f"{fxa.CURRENCIES[dd_quote].flag} {dd_quote}")
-
-                    k1, k2, k3, k4, k5, k6 = st.columns(6)
-                    k1.metric("Spot", f"{snap['spot']:.4f}", fx_pct(snap.get("chg_1D")))
-                    k2.metric("1M", fx_pct(snap.get("chg_1M")))
-                    k3.metric("YTD", fx_pct(snap.get("chg_YTD")))
-                    k4.metric("Vol 1m", f"{snap['vol_1m']:.1f}%" if snap.get("vol_1m") else "—",
-                              f"{ordinal(snap.get('vol_percentile'))} pct"
-                              if snap.get("vol_percentile") is not None else None)
-                    k5.metric("Carry p.a.", fx_pct(snap.get("carry")) if snap.get("carry") is not None else "—")
-                    k6.metric("52w range", f"{snap.get('range_pct', 0):.0f}%"
-                              if snap.get("range_pct") is not None else "—")
-
-                    series = fxa.cross(uv, dd_base, dd_quote)
-                    # Each row is labelled on its own axis rather than by a shared
-                    # legend and a figure title, which collided with each other and
-                    # with the header above the chart.
-                    st.markdown(f"##### {dd_base}/{dd_quote} — spot and realised volatility")
-                    fig_p = make_subplots(
-                        rows=2, cols=1, shared_xaxes=True,
-                        row_heights=[0.7, 0.3], vertical_spacing=0.08,
-                        subplot_titles=("Spot rate", "Realised volatility, 21-day (% annualised)"))
-                    fig_p.add_trace(go.Scatter(x=series.index, y=series.values, name="Spot",
-                                               line=dict(color="#00cc66", width=1.4),
-                                               hovertemplate="%{x|%d %b %Y}<br>%{y:.4f}<extra></extra>"),
-                                    row=1, col=1)
-                    if snap.get("range_low"):
-                        fig_p.add_hline(y=snap["range_low"], line_dash="dot", line_color="#777",
-                                        annotation_text="52w low",
-                                        annotation_position="bottom right",
-                                        annotation_font=dict(size=10, color="#999"),
-                                        row=1, col=1)
-                        fig_p.add_hline(y=snap["range_high"], line_dash="dot", line_color="#777",
-                                        annotation_text="52w high",
-                                        annotation_position="top right",
-                                        annotation_font=dict(size=10, color="#999"),
-                                        row=1, col=1)
-                    r_ = np.log(series.astype(float)).diff()
-                    rv = (r_.rolling(21).std() * np.sqrt(fxa.FX_BARS_PER_YEAR) * 100).dropna()
-                    fig_p.add_trace(go.Scatter(x=rv.index, y=rv.values, name="21d vol",
-                                               line=dict(color="#ffaa00", width=1.2),
-                                               hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"),
-                                    row=2, col=1)
-                    fig_p.update_layout(
-                        template="plotly_dark", height=480,
-                        margin=dict(l=0, r=0, t=34, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                        showlegend=False, hovermode="x unified",
-                    )
-                    for ann in fig_p.layout.annotations[:2]:
-                        ann.font.size = 12
-                        ann.font.color = "#bbb"
-                        ann.xanchor, ann.x = "left", 0
-                    fig_p.update_yaxes(gridcolor="#1a1a1a",
-                                       title_text=f"{dd_quote} per {dd_base}", row=1, col=1)
-                    fig_p.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=2, col=1)
-                    fig_p.update_xaxes(gridcolor="#1a1a1a")
-                    st.plotly_chart(fig_p, use_container_width=True)
+                # ═══════════════════════════════════════════════════════
+                # 2. CARRY
+                # ═══════════════════════════════════════════════════════
+                with fxt2:
+                    st.markdown("##### Carry vs USD — and what it actually paid")
                     st.caption(
-                        f"Top: the {dd_base}/{dd_quote} rate — how many {dd_quote} one "
-                        f"{dd_base} buys — with the 52-week extremes marked. Bottom: "
-                        "volatility of the last 21 sessions, annualised, so it reads on "
-                        "the same scale as a quoted vol."
+                        "Carry is the rate differential you earn holding the currency. "
+                        "Ranked here by **total return** — carry plus the realised spot move — "
+                        "because the spot leg is what decides whether the carry was ever yours to keep."
                     )
 
-                    dcol1, dcol2 = st.columns([1, 1])
-                    with dcol1:
-                        st.markdown("##### Driver ranking")
-                        dc = fxa.driver_correlations(uv, dd_base, dd_quote, fx_prices, window=63)
-                        if dc.empty:
-                            st.info("No driver data.")
-                        else:
-                            st.dataframe(
-                                dc.reset_index().rename(columns={"driver": "Driver", "corr": "ρ",
-                                                                 "channel": "Channel", "n": "obs"})
-                                .style.format({"ρ": "{:+.2f}"}),
-                                use_container_width=True, hide_index=True,
+                    ct = fxa.carry_table(uv, fx_rates, fx_codes, vs="USD")
+                    if ct.empty:
+                        st.warning("No carry data — policy rates unavailable.")
+                    else:
+                        managed = ct[ct["regime"] == "managed / crawling peg"]
+                        if not managed.empty:
+                            st.warning(
+                                "**Carry-to-vol is unreliable for "
+                                + ", ".join(f"{r['flag']} {i}" for i, r in managed.iterrows())
+                                + ".** These currencies are steered rather than traded: they drift "
+                                "steadily and barely wobble, so realised volatility understates the "
+                                "risk and the ratio flatters them. Read the spot and total columns."
                             )
-                    with dcol2:
-                        st.markdown("##### Carry detail")
-                        if snap.get("carry") is not None:
-                            cd = pd.DataFrame([
-                                {"Metric": f"{dd_base} policy rate", "Value": f"{snap['rate_base']:.2f}%",
-                                 "As of": snap.get("rate_base_as_of")},
-                                {"Metric": f"{dd_quote} policy rate", "Value": f"{snap['rate_quote']:.2f}%",
-                                 "As of": snap.get("rate_quote_as_of")},
-                                {"Metric": "Carry (annual)", "Value": f"{snap['carry']:+.2f}%", "As of": ""},
-                                {"Metric": "Carry / vol", "Value":
-                                    f"{snap['carry_to_vol']:.2f}" if snap.get("carry_to_vol") else "—",
-                                 "As of": ""},
-                                {"Metric": "Spot drift (1y ann.)", "Value":
-                                    f"{snap['spot_1y']:+.1f}%" if snap.get("spot_1y") is not None else "—",
-                                 "As of": ""},
-                                {"Metric": "Total return (1y)", "Value":
-                                    f"{snap['total_1y']:+.1f}%" if snap.get("total_1y") is not None else "—",
-                                 "As of": ""},
-                            ])
-                            st.dataframe(cd, use_container_width=True, hide_index=True)
-                            if snap.get("drift_to_vol") and snap["drift_to_vol"] >= 2.0:
-                                st.warning("Spot drift is more than twice realised volatility — this "
-                                           "pair trends rather than oscillates, and carry / vol "
-                                           "overstates how safe the carry is.")
-                        else:
-                            st.info("Policy rates unavailable for this pair.")
 
-                    ev = fxa.fx_event_risk(fx_econ_events(), [dd_base, dd_quote], 14)
-                    st.markdown("##### Event risk — next 14 days")
-                    if ev.empty:
-                        st.caption("No tier-1 releases scheduled for either currency.")
+                        disp = ct.copy()
+                        disp.insert(0, "Currency", disp["flag"] + " " + disp.index)
+                        disp["Rate"] = disp["rate_status"].map(
+                            {"live": "🟢", "verified": "🟢", "override": "✏️",
+                             "unverified": "🟠", "missing": "⚪"}).fillna("") + " " +                         disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                        view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
+                                     "spot_1y", "total_1y", "regime", "as_of"]].rename(columns={
+                            "carry": "Carry vs USD", "vol_3m": "Vol (3m)",
+                            "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
+                            "total_1y": "Total (1y)", "regime": "Regime", "as_of": "Rate as of",
+                        })
+                        st.dataframe(
+                            view.style
+                            .apply(fx_heat_col, subset=["Total (1y)"])
+                            .format({"Carry vs USD": "{:+.2f}%",
+                                     "Vol (3m)": "{:.1f}%", "Carry / vol": "{:.2f}",
+                                     "Spot (1y ann.)": "{:+.1f}%", "Total (1y)": "{:+.1f}%"},
+                                    na_rep="—"),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                        st.markdown("---")
+                        st.markdown("##### Carry against risk")
+                        plot = ct.dropna(subset=["vol_3m", "carry"])
+                        if not plot.empty:
+                            fig_c = go.Figure()
+                            for regime, colour in [("floating", "#4488ff"),
+                                                   ("heavily trending", "#ffaa00"),
+                                                   ("managed / crawling peg", "#ff4444")]:
+                                grp = plot[plot["regime"] == regime]
+                                if grp.empty:
+                                    continue
+                                fig_c.add_trace(go.Scatter(
+                                    x=grp["vol_3m"], y=grp["carry"], mode="markers+text",
+                                    text=[f"{grp['flag'].iloc[i]} {grp.index[i]}" for i in range(len(grp))],
+                                    textposition="top center", name=regime,
+                                    marker=dict(size=13, color=colour,
+                                                line=dict(width=1, color="#000")),
+                                    hovertemplate="%{text}<br>vol %{x:.1f}%<br>carry %{y:+.2f}%<extra></extra>",
+                                ))
+                            fig_c.add_hline(y=0, line_dash="dash", line_color="#444")
+                            fig_c.update_layout(
+                                template="plotly_dark", height=440,
+                                margin=dict(l=0, r=0, t=44, b=0),
+                                paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                xaxis_title="Realised volatility, 3 months (% annualised)",
+                                yaxis_title="Carry vs USD (% per year)",
+                                legend=dict(orientation="h", y=1.12, x=0, xanchor="left"),
+                            )
+                            fig_c.update_xaxes(gridcolor="#1a1a1a")
+                            fig_c.update_yaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_c, use_container_width=True)
+                            st.caption("Up and to the left is the attractive quadrant — paid to wait, "
+                                       "without much to endure. Red points sit there for the wrong reason.")
+
+                        n_unver = int((ct["rate_status"] == "unverified").sum()) if "rate_status" in ct else 0
+                        if n_unver:
+                            st.info(
+                                f"{n_unver} of these rest on a policy rate that has not been "
+                                "confirmed recently. They are shown but ranked last, and are not "
+                                "used to draw conclusions. Correct any of them below and every "
+                                "carry number on this page recomputes."
+                            )
+
+                        with st.expander("Policy rates — source, vintage, and corrections",
+                                         expanded=bool(n_unver)):
+                            st.caption(
+                                "FRED supplies the dollar and euro legs daily. It has no clean "
+                                "series for the rest — its other policy-rate entries are monthly "
+                                "interbank proxies, not the rate a desk funds at — so those are "
+                                "seeded by hand and carry the date they were last confirmed "
+                                "against the central bank. Anything unconfirmed for more than "
+                                f"{fxa.VERIFICATION_MAX_AGE_DAYS} days is marked **unverified**: "
+                                "most central banks meet eight times a year, so a quarter is "
+                                "already a meeting or two of drift."
+                            )
+
+                            prov = fx_rates.loc[[c for c in fx_codes if c in fx_rates.index]].copy()
+                            badge = {"live": "🟢 live (FRED)", "verified": "🟢 confirmed",
+                                     "override": "✏️ entered here", "unverified": "🟠 unverified",
+                                     "missing": "⚪ none"}
+                            edit = pd.DataFrame({
+                                "Currency": [f"{fxa.CURRENCIES[c].flag} {c}" for c in prov.index],
+                                "Rate %": prov["rate"],
+                                "Status": prov["status"].map(badge).fillna(prov["status"]),
+                                "Effective from": prov["as_of"],
+                                "What it is": prov["note"].fillna(""),
+                                "Source": prov["source"].fillna(""),
+                            })
+                            edited = st.data_editor(
+                                edit, use_container_width=True, hide_index=True,
+                                key="fx_rate_editor",
+                                disabled=["Currency", "Status", "Effective from",
+                                          "What it is", "Source"],
+                                column_config={"Rate %": st.column_config.NumberColumn(
+                                    "Rate %", help="Type the current policy rate to override it",
+                                    format="%.2f", step=0.05)},
+                            )
+
+                            changed = {}
+                            for code, new_rate in zip(prov.index, edited["Rate %"]):
+                                old = prov["rate"].get(code)
+                                if pd.isna(new_rate):
+                                    continue
+                                if old is None or pd.isna(old) or abs(float(new_rate) - float(old)) > 1e-9:
+                                    changed[code] = float(new_rate)
+
+                            bc1, bc2 = st.columns([1, 3])
+                            with bc1:
+                                if st.button("Apply corrections", key="fx_rate_apply",
+                                             type="primary", use_container_width=True,
+                                             disabled=not changed):
+                                    fx_rate_overrides.update(changed)
+                                    st.rerun()
+                            with bc2:
+                                if fx_rate_overrides:
+                                    st.caption("Overridden: " + ", ".join(
+                                        f"{c} {v:.2f}%" for c, v in sorted(fx_rate_overrides.items())))
+                                    if st.button("Clear overrides", key="fx_rate_clear"):
+                                        fx_rate_overrides.clear()
+                                        st.rerun()
+
+                # ═══════════════════════════════════════════════════════
+                # 3. VOL & CORRELATION
+                # ═══════════════════════════════════════════════════════
+                with fxt3:
+                    vs_ccy = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
+                                          key="fx_vol_vs")
+                    vol_rows = []
+                    for code in fx_codes:
+                        if code == vs_ccy:
+                            continue
+                        vp = fxa.vol_profile(uv, code, vs_ccy)
+                        if not vp:
+                            continue
+                        vol_rows.append({
+                            "Pair": f"{fxa.CURRENCIES[code].flag} {code}/{vs_ccy}",
+                            "Vol 1m": vp.get("vol_1m"), "Vol 3m": vp.get("vol_3m"),
+                            "Vol 1y": vp.get("vol_1y"),
+                            "Percentile": vp.get("vol_percentile"),
+                            "1m − 3m": vp.get("term_structure"),
+                        })
+                    if vol_rows:
+                        vdf = pd.DataFrame(vol_rows)
+                        st.markdown("##### Realised volatility")
+                        st.dataframe(
+                            vdf.style
+                            .apply(fx_heat_col, invert=True, subset=["Vol 1m", "Percentile"])
+                            .format({"Vol 1m": "{:.1f}%", "Vol 3m": "{:.1f}%", "Vol 1y": "{:.1f}%",
+                                     "Percentile": "{:.0f}", "1m − 3m": "{:+.1f}"}, na_rep="—"),
+                            use_container_width=True, hide_index=True,
+                        )
+                        st.caption(
+                            "**Percentile** places current 1m vol against the pair's own history — the "
+                            "level alone means nothing across pairs. **1m − 3m** above zero says the "
+                            "market is pricing near-term stress rather than a calm trend."
+                        )
+
+                    st.markdown("---")
+                    st.markdown("##### Correlation — which positions are the same trade")
+                    corr_pairs = [(c, vs_ccy) for c in fx_codes if c != vs_ccy]
+                    corr = fxa.correlation_matrix(uv, corr_pairs, window=63)
+                    if corr.empty:
+                        st.info("Not enough overlapping history for a correlation matrix.")
                     else:
-                        ev_show = ev.copy()
-                        ev_show["Event"] = ev_show["flag"] + " " + ev_show["event"]
-                        ev_show["Type"] = ev_show["is_cb"].map({True: "🏛 Central bank", False: "📊 Data"})
-                        st.dataframe(ev_show[["date", "ccy", "Event", "Type"]].rename(
-                            columns={"date": "Date", "ccy": "Ccy"}),
-                            use_container_width=True, hide_index=True)
-                        st.caption("Carry and momentum both stop working across a policy decision.")
+                        fig_corr = go.Figure(go.Heatmap(
+                            z=corr.values, x=list(corr.columns), y=list(corr.index),
+                            colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
+                            zmid=0, zmin=-1, zmax=1,
+                            text=[[f"{v:.2f}" for v in row] for row in corr.values],
+                            texttemplate="%{text}", textfont=dict(size=9),
+                            hovertemplate="%{y} / %{x}: %{z:.2f}<extra></extra>",
+                        ))
+                        fig_corr.update_layout(
+                            template="plotly_dark", height=max(380, 32 * len(corr)),
+                            margin=dict(l=0, r=0, t=10, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#000",
+                        )
+                        st.plotly_chart(fig_corr, use_container_width=True)
 
-                    if run_dd:
-                        _err = ai_unavailable()
-                        if _err:
-                            st.error(f"AI read unavailable: {_err}.")
+                        clusters = fxa.crowded_clusters(corr, 0.7)
+                        if clusters:
+                            st.warning(
+                                "**Effectively one position** at |ρ| ≥ 0.7:\n\n"
+                                + "\n".join(f"- {' · '.join(g)}" for g in clusters)
+                                + "\n\nSizing these as separate trades multiplies the exposure "
+                                "without diversifying it — they lose together."
+                            )
                         else:
-                            with st.spinner("Reading the tape…"):
-                                try:
-                                    ctx = {
-                                        "pair": snap["pair"],
-                                        "snapshot": {k: v for k, v in snap.items()
-                                                     if not isinstance(v, dict)},
-                                        "dominant_driver": snap.get("dominant_driver"),
-                                        "driver_ranking": (
-                                            fxa.driver_correlations(uv, dd_base, dd_quote,
-                                                                    fx_prices).reset_index()
-                                            .to_dict("records")),
-                                        "strength_ranking": (
-                                            fxa.currency_strength(uv, fx_codes, fx_bars)
-                                            ["strength"].round(2).to_dict()),
-                                        "events": ev.to_dict("records") if not ev.empty else [],
-                                    }
-                                    fx_system = (
-                                        "You are an FX strategist on an institutional desk. You are "
-                                        "given measured data for one currency pair: spot changes, "
-                                        "realised volatility and its percentile, carry and the "
-                                        "realised spot drift, the empirical correlation of the pair "
-                                        "to each macro driver, the cross-sectional strength ranking, "
-                                        "and scheduled events.\n\n"
-                                        "Write the read a portfolio manager needs before taking risk:\n"
-                                        "1. What the pair is doing and whether it is a base-currency "
-                                        "or quote-currency story — use the strength ranking to settle it.\n"
-                                        "2. Which driver is in control and what would break that link.\n"
-                                        "3. What the carry is worth once the spot drift is netted off.\n"
-                                        "4. Where volatility sits versus its own history and what that "
-                                        "implies for sizing and for option structures.\n"
-                                        "5. The specific events that could invalidate the setup.\n\n"
-                                        "Rules: use only the supplied numbers and cite them. Do not "
-                                        "invent levels, positioning data, or forecasts. Correlation is "
-                                        "not causation — say when a relationship is weak. State what "
-                                        "would make you wrong. No position sizing, no investment advice. "
-                                        "Be concise and specific; a desk reads this in ninety seconds."
-                                    )
-                                    read = ai_agent.complete(
-                                        fx_system, json.dumps(ctx, default=str, indent=2),
-                                        max_tokens=9000, effort="high")
-                                    st.markdown("---")
-                                    st.markdown("### 🤖 Desk read")
-                                    st.markdown(read)
-                                except Exception as e:
-                                    st.error(f"AI read failed: {type(e).__name__}: {e}")
+                            st.success("No cluster above |ρ| ≥ 0.7 — these pairs are behaving independently.")
+
+                # ═══════════════════════════════════════════════════════
+                # 4. DRIVERS
+                # ═══════════════════════════════════════════════════════
+                with fxt4:
+                    st.markdown("##### What is actually moving each pair")
+                    st.caption(
+                        "Correlation of daily returns against each macro driver over the last 63 "
+                        "sessions. Textbook FX relationships lapse for quarters at a time, so this "
+                        "measures the link rather than assuming it."
+                    )
+                    drv_vs = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
+                                          key="fx_drv_vs")
+
+                    rows, labels = [], []
+                    for code in fx_codes:
+                        if code == drv_vs:
+                            continue
+                        dc = fxa.driver_correlations(uv, code, drv_vs, fx_prices, window=63)
+                        if dc.empty:
+                            continue
+                        labels.append(f"{fxa.CURRENCIES[code].flag} {code}/{drv_vs}")
+                        rows.append({d: dc.loc[d, "corr"] for d in dc.index})
+
+                    if not rows:
+                        st.info("Driver data unavailable.")
+                    else:
+                        dmat = pd.DataFrame(rows, index=labels)
+                        dmat = dmat[[c for c in fxa.DRIVERS if c in dmat.columns]]
+                        fig_d = go.Figure(go.Heatmap(
+                            z=dmat.values, x=list(dmat.columns), y=list(dmat.index),
+                            colorscale=[[0, "#aa1111"], [0.5, "#111111"], [1, "#11aa44"]],
+                            zmid=0, zmin=-1, zmax=1,
+                            text=[[f"{v:+.2f}" for v in row] for row in dmat.values],
+                            texttemplate="%{text}", textfont=dict(size=9),
+                            hovertemplate="%{y} vs %{x}: %{z:+.2f}<extra></extra>",
+                        ))
+                        fig_d.update_layout(
+                            template="plotly_dark", height=max(340, 32 * len(dmat)),
+                            margin=dict(l=0, r=0, t=10, b=60),
+                            paper_bgcolor="#000", plot_bgcolor="#000",
+                        )
+                        st.plotly_chart(fig_d, use_container_width=True)
+
+                        st.markdown("###### Dominant driver per pair")
+                        dom_rows = []
+                        for lbl, row in dmat.iterrows():
+                            if row.dropna().empty:
+                                continue
+                            top_drv = row.abs().idxmax()
+                            dom_rows.append({
+                                "Pair": lbl, "Driver": top_drv,
+                                "ρ": row[top_drv],
+                                "Channel": fxa.DRIVERS[top_drv]["why"],
+                            })
+                        if dom_rows:
+                            st.dataframe(pd.DataFrame(dom_rows).style.format({"ρ": "{:+.2f}"}),
+                                         use_container_width=True, hide_index=True)
+                            st.caption("A |ρ| below roughly 0.3 means no driver is in control — the pair "
+                                       "is trading on its own idiosyncratic flow.")
+
+                # ═══════════════════════════════════════════════════════
+                # 5. PAIR DEEP DIVE
+                # ═══════════════════════════════════════════════════════
+                with fxt5:
+                    pc1, pc2, pc3 = st.columns([1, 1, 1])
+                    avail = [c for c in fx_codes if c in uv.columns]
+                    with pc1:
+                        dd_base = st.selectbox("Base", avail,
+                                               index=avail.index("EUR") if "EUR" in avail else 0,
+                                               key="fx_dd_base")
+                    with pc2:
+                        dd_quote = st.selectbox("Quote", [c for c in avail if c != dd_base],
+                                                index=0, key="fx_dd_quote")
+                    with pc3:
+                        run_dd = st.button("▶ Analyse", type="primary", key="fx_dd_run",
+                                           use_container_width=True)
+
+                    snap = fxa.pair_snapshot(uv, dd_base, dd_quote, fx_rates, fx_prices)
+                    if not snap:
+                        st.warning("No data for this pair.")
+                    else:
+                        st.markdown(f"### {fxa.CURRENCIES[dd_base].flag} {dd_base} / "
+                                    f"{fxa.CURRENCIES[dd_quote].flag} {dd_quote}")
+
+                        k1, k2, k3, k4, k5, k6 = st.columns(6)
+                        k1.metric("Spot", f"{snap['spot']:.4f}", fx_pct(snap.get("chg_1D")))
+                        k2.metric("1M", fx_pct(snap.get("chg_1M")))
+                        k3.metric("YTD", fx_pct(snap.get("chg_YTD")))
+                        k4.metric("Vol 1m", f"{snap['vol_1m']:.1f}%" if snap.get("vol_1m") else "—",
+                                  f"{ordinal(snap.get('vol_percentile'))} pct"
+                                  if snap.get("vol_percentile") is not None else None)
+                        k5.metric("Carry p.a.", fx_pct(snap.get("carry")) if snap.get("carry") is not None else "—")
+                        k6.metric("52w range", f"{snap.get('range_pct', 0):.0f}%"
+                                  if snap.get("range_pct") is not None else "—")
+
+                        series = fxa.cross(uv, dd_base, dd_quote)
+                        # Each row is labelled on its own axis rather than by a shared
+                        # legend and a figure title, which collided with each other and
+                        # with the header above the chart.
+                        st.markdown(f"##### {dd_base}/{dd_quote} — spot and realised volatility")
+                        fig_p = make_subplots(
+                            rows=2, cols=1, shared_xaxes=True,
+                            row_heights=[0.7, 0.3], vertical_spacing=0.08,
+                            subplot_titles=("Spot rate", "Realised volatility, 21-day (% annualised)"))
+                        fig_p.add_trace(go.Scatter(x=series.index, y=series.values, name="Spot",
+                                                   line=dict(color="#00cc66", width=1.4),
+                                                   hovertemplate="%{x|%d %b %Y}<br>%{y:.4f}<extra></extra>"),
+                                        row=1, col=1)
+                        if snap.get("range_low"):
+                            fig_p.add_hline(y=snap["range_low"], line_dash="dot", line_color="#777",
+                                            annotation_text="52w low",
+                                            annotation_position="bottom right",
+                                            annotation_font=dict(size=10, color="#999"),
+                                            row=1, col=1)
+                            fig_p.add_hline(y=snap["range_high"], line_dash="dot", line_color="#777",
+                                            annotation_text="52w high",
+                                            annotation_position="top right",
+                                            annotation_font=dict(size=10, color="#999"),
+                                            row=1, col=1)
+                        r_ = np.log(series.astype(float)).diff()
+                        rv = (r_.rolling(21).std() * np.sqrt(fxa.FX_BARS_PER_YEAR) * 100).dropna()
+                        fig_p.add_trace(go.Scatter(x=rv.index, y=rv.values, name="21d vol",
+                                                   line=dict(color="#ffaa00", width=1.2),
+                                                   hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"),
+                                        row=2, col=1)
+                        fig_p.update_layout(
+                            template="plotly_dark", height=480,
+                            margin=dict(l=0, r=0, t=34, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            showlegend=False, hovermode="x unified",
+                        )
+                        for ann in fig_p.layout.annotations[:2]:
+                            ann.font.size = 12
+                            ann.font.color = "#bbb"
+                            ann.xanchor, ann.x = "left", 0
+                        fig_p.update_yaxes(gridcolor="#1a1a1a",
+                                           title_text=f"{dd_quote} per {dd_base}", row=1, col=1)
+                        fig_p.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=2, col=1)
+                        fig_p.update_xaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_p, use_container_width=True)
+                        st.caption(
+                            f"Top: the {dd_base}/{dd_quote} rate — how many {dd_quote} one "
+                            f"{dd_base} buys — with the 52-week extremes marked. Bottom: "
+                            "volatility of the last 21 sessions, annualised, so it reads on "
+                            "the same scale as a quoted vol."
+                        )
+
+                        dcol1, dcol2 = st.columns([1, 1])
+                        with dcol1:
+                            st.markdown("##### Driver ranking")
+                            dc = fxa.driver_correlations(uv, dd_base, dd_quote, fx_prices, window=63)
+                            if dc.empty:
+                                st.info("No driver data.")
+                            else:
+                                st.dataframe(
+                                    dc.reset_index().rename(columns={"driver": "Driver", "corr": "ρ",
+                                                                     "channel": "Channel", "n": "obs"})
+                                    .style.format({"ρ": "{:+.2f}"}),
+                                    use_container_width=True, hide_index=True,
+                                )
+                        with dcol2:
+                            st.markdown("##### Carry detail")
+                            if snap.get("carry") is not None:
+                                cd = pd.DataFrame([
+                                    {"Metric": f"{dd_base} policy rate", "Value": f"{snap['rate_base']:.2f}%",
+                                     "As of": snap.get("rate_base_as_of")},
+                                    {"Metric": f"{dd_quote} policy rate", "Value": f"{snap['rate_quote']:.2f}%",
+                                     "As of": snap.get("rate_quote_as_of")},
+                                    {"Metric": "Carry (annual)", "Value": f"{snap['carry']:+.2f}%", "As of": ""},
+                                    {"Metric": "Carry / vol", "Value":
+                                        f"{snap['carry_to_vol']:.2f}" if snap.get("carry_to_vol") else "—",
+                                     "As of": ""},
+                                    {"Metric": "Spot drift (1y ann.)", "Value":
+                                        f"{snap['spot_1y']:+.1f}%" if snap.get("spot_1y") is not None else "—",
+                                     "As of": ""},
+                                    {"Metric": "Total return (1y)", "Value":
+                                        f"{snap['total_1y']:+.1f}%" if snap.get("total_1y") is not None else "—",
+                                     "As of": ""},
+                                ])
+                                st.dataframe(cd, use_container_width=True, hide_index=True)
+                                if snap.get("drift_to_vol") and snap["drift_to_vol"] >= 2.0:
+                                    st.warning("Spot drift is more than twice realised volatility — this "
+                                               "pair trends rather than oscillates, and carry / vol "
+                                               "overstates how safe the carry is.")
+                            else:
+                                st.info("Policy rates unavailable for this pair.")
+
+                        ev = fxa.fx_event_risk(fx_econ_events(), [dd_base, dd_quote], 14)
+                        st.markdown("##### Event risk — next 14 days")
+                        if ev.empty:
+                            st.caption("No tier-1 releases scheduled for either currency.")
+                        else:
+                            ev_show = ev.copy()
+                            ev_show["Event"] = ev_show["flag"] + " " + ev_show["event"]
+                            ev_show["Type"] = ev_show["is_cb"].map({True: "🏛 Central bank", False: "📊 Data"})
+                            st.dataframe(ev_show[["date", "ccy", "Event", "Type"]].rename(
+                                columns={"date": "Date", "ccy": "Ccy"}),
+                                use_container_width=True, hide_index=True)
+                            st.caption("Carry and momentum both stop working across a policy decision.")
+
+                        if run_dd:
+                            _err = ai_unavailable("read")
+                            if _err:
+                                st.error(f"AI read unavailable: {_err}.")
+                            else:
+                                with st.spinner("Reading the tape…"):
+                                    try:
+                                        ctx = {
+                                            "pair": snap["pair"],
+                                            "snapshot": {k: v for k, v in snap.items()
+                                                         if not isinstance(v, dict)},
+                                            "dominant_driver": snap.get("dominant_driver"),
+                                            "driver_ranking": (
+                                                fxa.driver_correlations(uv, dd_base, dd_quote,
+                                                                        fx_prices).reset_index()
+                                                .to_dict("records")),
+                                            "strength_ranking": (
+                                                fxa.currency_strength(uv, fx_codes, fx_bars)
+                                                ["strength"].round(2).to_dict()),
+                                            "events": ev.to_dict("records") if not ev.empty else [],
+                                        }
+                                        fx_system = (
+                                            "You are an FX strategist on an institutional desk. You are "
+                                            "given measured data for one currency pair: spot changes, "
+                                            "realised volatility and its percentile, carry and the "
+                                            "realised spot drift, the empirical correlation of the pair "
+                                            "to each macro driver, the cross-sectional strength ranking, "
+                                            "and scheduled events.\n\n"
+                                            "Write the read a portfolio manager needs before taking risk:\n"
+                                            "1. What the pair is doing and whether it is a base-currency "
+                                            "or quote-currency story — use the strength ranking to settle it.\n"
+                                            "2. Which driver is in control and what would break that link.\n"
+                                            "3. What the carry is worth once the spot drift is netted off.\n"
+                                            "4. Where volatility sits versus its own history and what that "
+                                            "implies for sizing and for option structures.\n"
+                                            "5. The specific events that could invalidate the setup.\n\n"
+                                            "Rules: use only the supplied numbers and cite them. Do not "
+                                            "invent levels, positioning data, or forecasts. Correlation is "
+                                            "not causation — say when a relationship is weak. State what "
+                                            "would make you wrong. No position sizing, no investment advice. "
+                                            "Be concise and specific; a desk reads this in ninety seconds."
+                                        )
+                                        read = ai_agent.complete(
+                                            fx_system, json.dumps(ctx, default=str, indent=2),
+                                            max_tokens=9000, effort="high")
+                                        st.markdown("---")
+                                        st.markdown("### 🤖 Desk read")
+                                        st.markdown(read)
+                                    except Exception as e:
+                                        st.error(f"AI read failed: {type(e).__name__}: {e}")
+    else:
+        locked_tab("fx")
 
 
 
@@ -4507,18 +4556,19 @@ with tab_fx:
 # fx_analytics.carry_basket and unwind_conditions.
 
 with tab_carry:
-    if not _HAS_FXA:
-        st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "carry"):
+        if not _HAS_FXA:
+            st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CARRY TRADE MONITOR</span>
         <span style="font-size:14px;color:#888;margin-left:12px">The position · what it has paid · what precedes an unwind</span>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("What this panel does, and how to read it", expanded=False):
-            st.markdown("""
+            with st.expander("What this panel does, and how to read it", expanded=False):
+                st.markdown("""
 A carry trade borrows in a low-yielding currency and holds a higher-yielding
 one. The yen has been the classic funding leg for thirty years, which is why it
 is the default here — though the funding currency is selectable, because the
@@ -4551,191 +4601,191 @@ prevailing at the time, so the curve is tilted toward the current regime, and
 that error is largest exactly where it matters most — around a policy turn.
             """)
 
-        cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
-        with cc1:
-            funding_ccy = st.selectbox(
-                "Funding currency", ["JPY", "CHF", "EUR", "USD"],
-                key="carry_funding", label_visibility="collapsed")
-        with cc2:
-            target_scope = st.radio("Targets", ["G10", "G10 + EM"], horizontal=True,
-                                    key="carry_scope", label_visibility="collapsed")
-        with cc3:
-            if st.button("🔄 Refresh", key="carry_refresh", use_container_width=True):
-                fx_load_prices.clear()
+            cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+            with cc1:
+                funding_ccy = st.selectbox(
+                    "Funding currency", ["JPY", "CHF", "EUR", "USD"],
+                    key="carry_funding", label_visibility="collapsed")
+            with cc2:
+                target_scope = st.radio("Targets", ["G10", "G10 + EM"], horizontal=True,
+                                        key="carry_scope", label_visibility="collapsed")
+            with cc3:
+                if st.button("🔄 Refresh", key="carry_refresh", use_container_width=True):
+                    fx_load_prices.clear()
 
-        carry_targets = fxa.G10 if target_scope == "G10" else fxa.G10 + fxa.EM
+            carry_targets = fxa.G10 if target_scope == "G10" else fxa.G10 + fxa.EM
 
-        with st.spinner("Loading FX universe…"):
-            c_prices, c_failed = fx_load_prices()
+            with st.spinner("Loading FX universe…"):
+                c_prices, c_failed = fx_load_prices()
 
-        if c_prices.empty:
-            st.error("No FX data available — Yahoo returned no series.")
-        else:
-            c_uv = fxa.usd_values(c_prices)
-            c_rates = fxa.policy_rates(
-                get_secret("FRED_API_KEY"),
-                st.session_state.get("fx_rate_overrides") or {})
-            if c_failed:
-                st.caption(f"⚠️ No data for: {', '.join(c_failed)} — omitted.")
+            if c_prices.empty:
+                st.error("No FX data available — Yahoo returned no series.")
+            else:
+                c_uv = fxa.usd_values(c_prices)
+                c_rates = fxa.policy_rates(
+                    get_secret("FRED_API_KEY"),
+                    st.session_state.get("fx_rate_overrides") or {})
+                if c_failed:
+                    st.caption(f"⚠️ No data for: {', '.join(c_failed)} — omitted.")
 
-            f_rate = c_rates["rate"].get(funding_ccy)
-            f_status = c_rates["status"].get(funding_ccy)
-            f_missing = f_rate is None or pd.isna(f_rate)
-            if f_missing:
-                st.error(
-                    f"No policy rate is available for {funding_ccy}, so no differential "
-                    "can be computed against it. Enter one in the Currencies → Carry "
-                    "panel and this page will populate."
-                )
-
-            ct1, ct2, ct3, ct4 = st.tabs([
-                "💴 The position", "📈 The basket", "🌡 Unwind conditions", "🤖 Desk read"])
-
-            # ═══════════════════════════════════════════════════
-            with ct1:
-                _fr = "rate unavailable" if f_missing else f"{f_rate:.2f}%"
-                st.markdown(f"##### Funding in {fxa.CURRENCIES[funding_ccy].flag} "
-                            f"{funding_ccy} at {_fr}")
-                if f_status not in fxa.TRUSTED_RATE_STATUS:
-                    st.warning(
-                        f"The {funding_ccy} policy rate has not been confirmed recently, so "
-                        "every differential on this page inherits that uncertainty. "
-                        "Correct it in the Currencies → Carry panel and this page "
-                        "recomputes."
+                f_rate = c_rates["rate"].get(funding_ccy)
+                f_status = c_rates["status"].get(funding_ccy)
+                f_missing = f_rate is None or pd.isna(f_rate)
+                if f_missing:
+                    st.error(
+                        f"No policy rate is available for {funding_ccy}, so no differential "
+                        "can be computed against it. Enter one in the Currencies → Carry "
+                        "panel and this page will populate."
                     )
 
-                ct = fxa.carry_table(c_uv, c_rates, carry_targets, vs=funding_ccy)
-                if ct.empty:
-                    st.warning("No carry legs available for this combination.")
-                else:
-                    disp = ct.copy()
-                    disp["Currency"] = disp["flag"] + " " + disp.index
-                    disp["Rate"] = disp["rate_status"].map(
-                        {"live": "🟢", "verified": "🟢", "override": "✏️",
-                         "unverified": "🟠", "missing": "⚪"}).fillna("") + " " + \
-                        disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
-                    view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
-                                 "spot_1y", "total_1y", "regime"]].rename(columns={
-                        "carry": f"Carry vs {funding_ccy}", "vol_3m": "Vol (3m)",
-                        "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
-                        "total_1y": "Total (1y)", "regime": "Regime"})
-                    st.dataframe(
-                        view.style.apply(fx_heat_col, subset=["Total (1y)"]).format(
-                            {f"Carry vs {funding_ccy}": "{:+.2f}%", "Vol (3m)": "{:.1f}%",
-                             "Carry / vol": "{:.2f}", "Spot (1y ann.)": "{:+.1f}%",
-                             "Total (1y)": "{:+.1f}%"}, na_rep="—"),
-                        use_container_width=True, hide_index=True)
-                    st.caption(
-                        "**Carry** is what the differential pays per year. **Total** nets "
-                        "the realised spot move against it — the difference between the two "
-                        "columns is the whole risk of the trade. A currency flagged "
-                        "*managed* drifts far more than it wobbles, so its low volatility "
-                        "flatters carry-to-vol; read its total, not its ratio."
-                    )
+                ct1, ct2, ct3, ct4 = st.tabs([
+                    "💴 The position", "📈 The basket", "🌡 Unwind conditions", "🤖 Desk read"])
 
-            # ═══════════════════════════════════════════════════
-            with ct2:
-                basket = fxa.carry_basket(c_uv, c_rates, carry_targets, funding=funding_ccy)
-                if "error" in basket:
-                    st.warning(
-                        f"Basket unavailable: {basket['error']}. "
-                        + (f"Legs skipped for want of a confirmed policy rate: "
-                           f"{', '.join(basket.get('skipped', []))}."
-                           if basket.get("skipped") else "")
-                    )
-                else:
-                    st.markdown(f"##### Equal-weighted basket funded in {funding_ccy}")
-                    st.caption(
-                        "Long " + ", ".join(f"{fxa.CURRENCIES[c].flag} {c}" for c in basket["legs"])
-                        + f" against {funding_ccy}, rebalanced to equal weight."
-                        + (f" Excluded for want of a confirmed policy rate: "
-                           f"{', '.join(basket['skipped'])}." if basket["skipped"] else "")
-                    )
-
-                    b1, b2, b3, b4, b5 = st.columns(5)
-                    b1.metric("Total return", f"{basket['total_return_pct']:+.1f}%")
-                    b2.metric("Annualised", f"{basket['ann_return_pct']:+.1f}%")
-                    b3.metric("Volatility", f"{basket['ann_vol_pct']:.1f}%")
-                    b4.metric("Return / vol",
-                              f"{basket['return_to_vol']:.2f}" if basket['return_to_vol'] else "—")
-                    b5.metric("Worst drawdown", f"{basket['max_drawdown_pct']:.1f}%",
-                              f"now {basket['current_drawdown_pct']:.1f}%")
-
-                    eq, dd = basket["equity"], basket["drawdown"]
-                    fig_b = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                          row_heights=[0.65, 0.35], vertical_spacing=0.08,
-                                          subplot_titles=("Growth of 1 unit",
-                                                          "Drawdown from peak (%)"))
-                    fig_b.add_trace(go.Scatter(
-                        x=eq.index, y=eq.values, name="Basket",
-                        line=dict(color="#00cc66", width=1.5),
-                        hovertemplate="%{x|%d %b %Y}<br>%{y:.3f}<extra></extra>"), row=1, col=1)
-                    fig_b.add_hline(y=1.0, line_dash="dot", line_color="#555", row=1, col=1)
-                    fig_b.add_trace(go.Scatter(
-                        x=dd.index, y=dd.values, name="Drawdown", fill="tozeroy",
-                        fillcolor="rgba(255,68,68,0.20)", line=dict(color="#ff4444", width=1),
-                        hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"), row=2, col=1)
-                    fig_b.update_layout(
-                        template="plotly_dark", height=500,
-                        margin=dict(l=0, r=0, t=34, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                        showlegend=False, hovermode="x unified")
-                    for ann in fig_b.layout.annotations[:2]:
-                        ann.font.size, ann.font.color = 12, "#bbb"
-                        ann.xanchor, ann.x = "left", 0
-                    fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="× initial", row=1, col=1)
-                    fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="%", row=2, col=1)
-                    fig_b.update_xaxes(gridcolor="#1a1a1a")
-                    st.plotly_chart(fig_b, use_container_width=True)
-                    st.caption(
-                        "The shape is the point. Carry accrues steadily and the spot leg "
-                        "does not, so the curve climbs quietly and falls abruptly — the "
-                        "drawdowns below are where the accrued profit went."
-                    )
-
-                    eps = fxa.worst_episodes(dd, n=4)
-                    if eps:
-                        st.markdown("##### Worst episodes")
-                        st.dataframe(pd.DataFrame([{
-                            "From": str(e["start"])[:10],
-                            "Trough": str(e["trough"])[:10],
-                            "Recovered": "still under water" if e["ongoing"] else str(e["end"])[:10],
-                            "Depth": f"{e['depth_pct']:.1f}%",
-                            "Days": e["days"],
-                        } for e in eps]), use_container_width=True, hide_index=True)
-                        st.caption(
-                            "Bounded by the peak each fell from and the recovery back to it, "
-                            "so two dips inside one drawdown are counted once. The duration "
-                            "column is usually the harder constraint to hold through."
+                # ═══════════════════════════════════════════════════
+                with ct1:
+                    _fr = "rate unavailable" if f_missing else f"{f_rate:.2f}%"
+                    st.markdown(f"##### Funding in {fxa.CURRENCIES[funding_ccy].flag} "
+                                f"{funding_ccy} at {_fr}")
+                    if f_status not in fxa.TRUSTED_RATE_STATUS:
+                        st.warning(
+                            f"The {funding_ccy} policy rate has not been confirmed recently, so "
+                            "every differential on this page inherits that uncertainty. "
+                            "Correct it in the Currencies → Carry panel and this page "
+                            "recomputes."
                         )
 
-            # ═══════════════════════════════════════════════════
-            with ct3:
-                cond = fxa.unwind_conditions(
-                    c_uv, c_prices, funding=funding_ccy,
-                    basket_targets=carry_targets, rates=c_rates)
+                    ct = fxa.carry_table(c_uv, c_rates, carry_targets, vs=funding_ccy)
+                    if ct.empty:
+                        st.warning("No carry legs available for this combination.")
+                    else:
+                        disp = ct.copy()
+                        disp["Currency"] = disp["flag"] + " " + disp.index
+                        disp["Rate"] = disp["rate_status"].map(
+                            {"live": "🟢", "verified": "🟢", "override": "✏️",
+                             "unverified": "🟠", "missing": "⚪"}).fillna("") + " " + \
+                            disp["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                        view = disp[["Currency", "Rate", "carry", "vol_3m", "carry_to_vol",
+                                     "spot_1y", "total_1y", "regime"]].rename(columns={
+                            "carry": f"Carry vs {funding_ccy}", "vol_3m": "Vol (3m)",
+                            "carry_to_vol": "Carry / vol", "spot_1y": "Spot (1y ann.)",
+                            "total_1y": "Total (1y)", "regime": "Regime"})
+                        st.dataframe(
+                            view.style.apply(fx_heat_col, subset=["Total (1y)"]).format(
+                                {f"Carry vs {funding_ccy}": "{:+.2f}%", "Vol (3m)": "{:.1f}%",
+                                 "Carry / vol": "{:.2f}", "Spot (1y ann.)": "{:+.1f}%",
+                                 "Total (1y)": "{:+.1f}%"}, na_rep="—"),
+                            use_container_width=True, hide_index=True)
+                        st.caption(
+                            "**Carry** is what the differential pays per year. **Total** nets "
+                            "the realised spot move against it — the difference between the two "
+                            "columns is the whole risk of the trade. A currency flagged "
+                            "*managed* drifts far more than it wobbles, so its low volatility "
+                            "flatters carry-to-vol; read its total, not its ratio."
+                        )
 
-                st.markdown(f"##### The three conditions, measured — {funding_ccy} funding")
-                st.caption(
-                    "Each is a fact about the present, shown against its own history. "
-                    "They are not combined, and none of them predicts: all three were "
-                    "present before past unwinds and are also present at times when "
-                    "nothing follows."
-                )
+                # ═══════════════════════════════════════════════════
+                with ct2:
+                    basket = fxa.carry_basket(c_uv, c_rates, carry_targets, funding=funding_ccy)
+                    if "error" in basket:
+                        st.warning(
+                            f"Basket unavailable: {basket['error']}. "
+                            + (f"Legs skipped for want of a confirmed policy rate: "
+                               f"{', '.join(basket.get('skipped', []))}."
+                               if basket.get("skipped") else "")
+                        )
+                    else:
+                        st.markdown(f"##### Equal-weighted basket funded in {funding_ccy}")
+                        st.caption(
+                            "Long " + ", ".join(f"{fxa.CURRENCIES[c].flag} {c}" for c in basket["legs"])
+                            + f" against {funding_ccy}, rebalanced to equal weight."
+                            + (f" Excluded for want of a confirmed policy rate: "
+                               f"{', '.join(basket['skipped'])}." if basket["skipped"] else "")
+                        )
 
-                u1, u2, u3 = st.columns(3)
-                fv, fvp = cond.get("funding_vol"), cond.get("funding_vol_pct")
-                u1.metric(f"{funding_ccy} volatility",
-                          f"{fv:.1f}%" if fv is not None else "—",
-                          f"{ordinal(fvp)} percentile" if fvp is not None else None)
-                ec, ecp = cond.get("equity_corr"), cond.get("equity_corr_pct")
-                u2.metric(f"{funding_ccy} vs S&P 500",
-                          f"{ec:+.2f}" if ec is not None else "—",
-                          f"{ordinal(ecp)} percentile" if ecp is not None else None)
-                rv = cond.get("basket_return_to_vol")
-                u3.metric("Basket return / vol", f"{rv:.2f}" if rv is not None else "—")
+                        b1, b2, b3, b4, b5 = st.columns(5)
+                        b1.metric("Total return", f"{basket['total_return_pct']:+.1f}%")
+                        b2.metric("Annualised", f"{basket['ann_return_pct']:+.1f}%")
+                        b3.metric("Volatility", f"{basket['ann_vol_pct']:.1f}%")
+                        b4.metric("Return / vol",
+                                  f"{basket['return_to_vol']:.2f}" if basket['return_to_vol'] else "—")
+                        b5.metric("Worst drawdown", f"{basket['max_drawdown_pct']:.1f}%",
+                                  f"now {basket['current_drawdown_pct']:.1f}%")
 
-                st.markdown(f"""
+                        eq, dd = basket["equity"], basket["drawdown"]
+                        fig_b = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                              row_heights=[0.65, 0.35], vertical_spacing=0.08,
+                                              subplot_titles=("Growth of 1 unit",
+                                                              "Drawdown from peak (%)"))
+                        fig_b.add_trace(go.Scatter(
+                            x=eq.index, y=eq.values, name="Basket",
+                            line=dict(color="#00cc66", width=1.5),
+                            hovertemplate="%{x|%d %b %Y}<br>%{y:.3f}<extra></extra>"), row=1, col=1)
+                        fig_b.add_hline(y=1.0, line_dash="dot", line_color="#555", row=1, col=1)
+                        fig_b.add_trace(go.Scatter(
+                            x=dd.index, y=dd.values, name="Drawdown", fill="tozeroy",
+                            fillcolor="rgba(255,68,68,0.20)", line=dict(color="#ff4444", width=1),
+                            hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>"), row=2, col=1)
+                        fig_b.update_layout(
+                            template="plotly_dark", height=500,
+                            margin=dict(l=0, r=0, t=34, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            showlegend=False, hovermode="x unified")
+                        for ann in fig_b.layout.annotations[:2]:
+                            ann.font.size, ann.font.color = 12, "#bbb"
+                            ann.xanchor, ann.x = "left", 0
+                        fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="× initial", row=1, col=1)
+                        fig_b.update_yaxes(gridcolor="#1a1a1a", title_text="%", row=2, col=1)
+                        fig_b.update_xaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_b, use_container_width=True)
+                        st.caption(
+                            "The shape is the point. Carry accrues steadily and the spot leg "
+                            "does not, so the curve climbs quietly and falls abruptly — the "
+                            "drawdowns below are where the accrued profit went."
+                        )
+
+                        eps = fxa.worst_episodes(dd, n=4)
+                        if eps:
+                            st.markdown("##### Worst episodes")
+                            st.dataframe(pd.DataFrame([{
+                                "From": str(e["start"])[:10],
+                                "Trough": str(e["trough"])[:10],
+                                "Recovered": "still under water" if e["ongoing"] else str(e["end"])[:10],
+                                "Depth": f"{e['depth_pct']:.1f}%",
+                                "Days": e["days"],
+                            } for e in eps]), use_container_width=True, hide_index=True)
+                            st.caption(
+                                "Bounded by the peak each fell from and the recovery back to it, "
+                                "so two dips inside one drawdown are counted once. The duration "
+                                "column is usually the harder constraint to hold through."
+                            )
+
+                # ═══════════════════════════════════════════════════
+                with ct3:
+                    cond = fxa.unwind_conditions(
+                        c_uv, c_prices, funding=funding_ccy,
+                        basket_targets=carry_targets, rates=c_rates)
+
+                    st.markdown(f"##### The three conditions, measured — {funding_ccy} funding")
+                    st.caption(
+                        "Each is a fact about the present, shown against its own history. "
+                        "They are not combined, and none of them predicts: all three were "
+                        "present before past unwinds and are also present at times when "
+                        "nothing follows."
+                    )
+
+                    u1, u2, u3 = st.columns(3)
+                    fv, fvp = cond.get("funding_vol"), cond.get("funding_vol_pct")
+                    u1.metric(f"{funding_ccy} volatility",
+                              f"{fv:.1f}%" if fv is not None else "—",
+                              f"{ordinal(fvp)} percentile" if fvp is not None else None)
+                    ec, ecp = cond.get("equity_corr"), cond.get("equity_corr_pct")
+                    u2.metric(f"{funding_ccy} vs S&P 500",
+                              f"{ec:+.2f}" if ec is not None else "—",
+                              f"{ordinal(ecp)} percentile" if ecp is not None else None)
+                    rv = cond.get("basket_return_to_vol")
+                    u3.metric("Basket return / vol", f"{rv:.2f}" if rv is not None else "—")
+
+                    st.markdown(f"""
 - **{funding_ccy} volatility.** An unwind is a scramble to buy back the funding
   currency, so its volatility rises as the trade comes off. A high percentile
   means the funding leg is already moving more than usual.
@@ -4748,117 +4798,119 @@ that error is largest exactly where it matters most — around a policy turn.
   ordinary drawdown into a disorderly one.
                 """)
 
-                vs = cond.get("funding_vol_series")
-                cs = cond.get("equity_corr_series")
-                if vs is not None and not vs.empty:
-                    fig_u = make_subplots(
-                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
-                        subplot_titles=(f"{funding_ccy}/USD realised volatility, 21-day (% ann.)",
-                                        f"{funding_ccy}/USD vs S&P 500 — 63-day rolling correlation"))
-                    fig_u.add_trace(go.Scatter(x=vs.index, y=vs.values, name="vol",
-                                               line=dict(color="#ffaa00", width=1.2)), row=1, col=1)
-                    if cs is not None and not cs.empty:
-                        fig_u.add_trace(go.Scatter(x=cs.index, y=cs.values, name="corr",
-                                                   line=dict(color="#4488ff", width=1.2)), row=2, col=1)
-                        fig_u.add_hline(y=0, line_dash="dot", line_color="#555", row=2, col=1)
-                    fig_u.update_layout(
-                        template="plotly_dark", height=460,
-                        margin=dict(l=0, r=0, t=34, b=0),
-                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                        showlegend=False, hovermode="x unified")
-                    for ann in fig_u.layout.annotations[:2]:
-                        ann.font.size, ann.font.color = 12, "#bbb"
-                        ann.xanchor, ann.x = "left", 0
-                    fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=1, col=1)
-                    fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="ρ",
-                                       range=[-1, 1], row=2, col=1)
-                    fig_u.update_xaxes(gridcolor="#1a1a1a")
-                    st.plotly_chart(fig_u, use_container_width=True)
+                    vs = cond.get("funding_vol_series")
+                    cs = cond.get("equity_corr_series")
+                    if vs is not None and not vs.empty:
+                        fig_u = make_subplots(
+                            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
+                            subplot_titles=(f"{funding_ccy}/USD realised volatility, 21-day (% ann.)",
+                                            f"{funding_ccy}/USD vs S&P 500 — 63-day rolling correlation"))
+                        fig_u.add_trace(go.Scatter(x=vs.index, y=vs.values, name="vol",
+                                                   line=dict(color="#ffaa00", width=1.2)), row=1, col=1)
+                        if cs is not None and not cs.empty:
+                            fig_u.add_trace(go.Scatter(x=cs.index, y=cs.values, name="corr",
+                                                       line=dict(color="#4488ff", width=1.2)), row=2, col=1)
+                            fig_u.add_hline(y=0, line_dash="dot", line_color="#555", row=2, col=1)
+                        fig_u.update_layout(
+                            template="plotly_dark", height=460,
+                            margin=dict(l=0, r=0, t=34, b=0),
+                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                            showlegend=False, hovermode="x unified")
+                        for ann in fig_u.layout.annotations[:2]:
+                            ann.font.size, ann.font.color = 12, "#bbb"
+                            ann.xanchor, ann.x = "left", 0
+                        fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="% ann.", row=1, col=1)
+                        fig_u.update_yaxes(gridcolor="#1a1a1a", title_text="ρ",
+                                           range=[-1, 1], row=2, col=1)
+                        fig_u.update_xaxes(gridcolor="#1a1a1a")
+                        st.plotly_chart(fig_u, use_container_width=True)
 
-                ev = fxa.fx_event_risk(fx_econ_events(), [funding_ccy] + carry_targets, 14)
-                st.markdown("##### Policy events in the next 14 days")
-                if ev.empty:
-                    st.caption("No tier-1 releases scheduled for the currencies in this trade.")
-                else:
-                    evs = ev.copy()
-                    evs["Event"] = evs["flag"] + " " + evs["event"]
-                    evs["Type"] = evs["is_cb"].map({True: "🏛 Central bank", False: "📊 Data"})
-                    st.dataframe(evs[["date", "ccy", "Event", "Type"]].rename(
-                        columns={"date": "Date", "ccy": "Ccy"}),
-                        use_container_width=True, hide_index=True)
-                    st.caption("A funding-currency policy decision is the single event most "
-                               "capable of repricing this trade in one session.")
-
-            # ═══════════════════════════════════════════════════
-            with ct4:
-                st.caption("Reads the measured figures above. It has no positioning data, "
-                           "no options pricing and no flow — say so if the question needs them.")
-                if st.button("▶ Read the carry trade", type="primary", key="carry_ai"):
-                    _err = ai_unavailable()
-                    if _err:
-                        st.error(f"AI read unavailable: {_err}.")
+                    ev = fxa.fx_event_risk(fx_econ_events(), [funding_ccy] + carry_targets, 14)
+                    st.markdown("##### Policy events in the next 14 days")
+                    if ev.empty:
+                        st.caption("No tier-1 releases scheduled for the currencies in this trade.")
                     else:
-                        with st.spinner("Reading…"):
-                            try:
-                                _b = fxa.carry_basket(c_uv, c_rates, carry_targets,
-                                                      funding=funding_ccy)
-                                ctx = {
-                                    "funding_currency": funding_ccy,
-                                    "funding_rate": f_rate,
-                                    "funding_rate_status": f_status,
-                                    "carry_legs": (
-                                        fxa.carry_table(c_uv, c_rates, carry_targets,
-                                                        vs=funding_ccy)
-                                        .drop(columns=["name", "flag"], errors="ignore")
-                                        .reset_index().to_dict("records")),
-                                    "basket": {k: v for k, v in _b.items()
-                                               if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                    "worst_episodes": [
-                                        {**e, "start": str(e["start"])[:10],
-                                         "end": str(e["end"])[:10],
-                                         "trough": str(e["trough"])[:10]}
-                                        for e in fxa.worst_episodes(_b["drawdown"], 4)
-                                    ] if "error" not in _b else [],
-                                    "unwind_conditions": {
-                                        k: v for k, v in cond.items()
-                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                    "events": ev.to_dict("records") if not ev.empty else [],
-                                }
-                                sysmsg = (
-                                    "You are an FX strategist writing on the carry trade for "
-                                    "a portfolio manager. You are given the funding rate, each "
-                                    "leg's differential and realised spot move, an equal-weighted "
-                                    "basket with its equity curve statistics and worst drawdown "
-                                    "episodes, three measured unwind conditions with their "
-                                    "historical percentiles, and the policy calendar.\n\n"
-                                    "Write:\n"
-                                    "1. What the trade currently pays, and what it has actually "
-                                    "returned once spot is netted off. Those differ, and the "
-                                    "difference is the argument.\n"
-                                    "2. Where the risk sits — which leg carries it and why. "
-                                    "Note any leg flagged as a managed regime: its volatility "
-                                    "understates the risk, so its carry-to-vol flatters it.\n"
-                                    "3. What the three unwind conditions currently say, one by "
-                                    "one, against their own history. Do not aggregate them into "
-                                    "a verdict.\n"
-                                    "4. What the drawdown history implies about how this trade "
-                                    "fails — the shape and duration, not just the depth.\n"
-                                    "5. What on the calendar could reprice it.\n\n"
-                                    "Rules: cite the numbers. The basket holds today's policy "
-                                    "rates constant across its whole history, so say the curve "
-                                    "is tilted toward the current regime — that error is largest "
-                                    "around a policy turn. Attach no probability to an unwind; "
-                                    "nothing here produces one. You have no positioning, options "
-                                    "or flow data — name that as a gap rather than working "
-                                    "around it. No position sizing, no recommendation."
-                                )
-                                read = ai_agent.complete(
-                                    sysmsg, json.dumps(ctx, default=str, indent=2),
-                                    max_tokens=9000, effort="high")
-                                st.markdown("---")
-                                st.markdown(read)
-                            except Exception as e:
-                                st.error(f"AI read failed: {type(e).__name__}: {e}")
+                        evs = ev.copy()
+                        evs["Event"] = evs["flag"] + " " + evs["event"]
+                        evs["Type"] = evs["is_cb"].map({True: "🏛 Central bank", False: "📊 Data"})
+                        st.dataframe(evs[["date", "ccy", "Event", "Type"]].rename(
+                            columns={"date": "Date", "ccy": "Ccy"}),
+                            use_container_width=True, hide_index=True)
+                        st.caption("A funding-currency policy decision is the single event most "
+                                   "capable of repricing this trade in one session.")
+
+                # ═══════════════════════════════════════════════════
+                with ct4:
+                    st.caption("Reads the measured figures above. It has no positioning data, "
+                               "no options pricing and no flow — say so if the question needs them.")
+                    if st.button("▶ Read the carry trade", type="primary", key="carry_ai"):
+                        _err = ai_unavailable("read")
+                        if _err:
+                            st.error(f"AI read unavailable: {_err}.")
+                        else:
+                            with st.spinner("Reading…"):
+                                try:
+                                    _b = fxa.carry_basket(c_uv, c_rates, carry_targets,
+                                                          funding=funding_ccy)
+                                    ctx = {
+                                        "funding_currency": funding_ccy,
+                                        "funding_rate": f_rate,
+                                        "funding_rate_status": f_status,
+                                        "carry_legs": (
+                                            fxa.carry_table(c_uv, c_rates, carry_targets,
+                                                            vs=funding_ccy)
+                                            .drop(columns=["name", "flag"], errors="ignore")
+                                            .reset_index().to_dict("records")),
+                                        "basket": {k: v for k, v in _b.items()
+                                                   if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                        "worst_episodes": [
+                                            {**e, "start": str(e["start"])[:10],
+                                             "end": str(e["end"])[:10],
+                                             "trough": str(e["trough"])[:10]}
+                                            for e in fxa.worst_episodes(_b["drawdown"], 4)
+                                        ] if "error" not in _b else [],
+                                        "unwind_conditions": {
+                                            k: v for k, v in cond.items()
+                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                        "events": ev.to_dict("records") if not ev.empty else [],
+                                    }
+                                    sysmsg = (
+                                        "You are an FX strategist writing on the carry trade for "
+                                        "a portfolio manager. You are given the funding rate, each "
+                                        "leg's differential and realised spot move, an equal-weighted "
+                                        "basket with its equity curve statistics and worst drawdown "
+                                        "episodes, three measured unwind conditions with their "
+                                        "historical percentiles, and the policy calendar.\n\n"
+                                        "Write:\n"
+                                        "1. What the trade currently pays, and what it has actually "
+                                        "returned once spot is netted off. Those differ, and the "
+                                        "difference is the argument.\n"
+                                        "2. Where the risk sits — which leg carries it and why. "
+                                        "Note any leg flagged as a managed regime: its volatility "
+                                        "understates the risk, so its carry-to-vol flatters it.\n"
+                                        "3. What the three unwind conditions currently say, one by "
+                                        "one, against their own history. Do not aggregate them into "
+                                        "a verdict.\n"
+                                        "4. What the drawdown history implies about how this trade "
+                                        "fails — the shape and duration, not just the depth.\n"
+                                        "5. What on the calendar could reprice it.\n\n"
+                                        "Rules: cite the numbers. The basket holds today's policy "
+                                        "rates constant across its whole history, so say the curve "
+                                        "is tilted toward the current regime — that error is largest "
+                                        "around a policy turn. Attach no probability to an unwind; "
+                                        "nothing here produces one. You have no positioning, options "
+                                        "or flow data — name that as a gap rather than working "
+                                        "around it. No position sizing, no recommendation."
+                                    )
+                                    read = ai_agent.complete(
+                                        sysmsg, json.dumps(ctx, default=str, indent=2),
+                                        max_tokens=9000, effort="high")
+                                    st.markdown("---")
+                                    st.markdown(read)
+                                except Exception as e:
+                                    st.error(f"AI read failed: {type(e).__name__}: {e}")
+    else:
+        locked_tab("carry")
 
 
 # -------- CRYPTO TAB --------
@@ -4913,18 +4965,19 @@ def cb_gold_latest():
 
 
 with tab_cb:
-    if not _HAS_CBK:
-        st.error(f"Central bank module failed to load: {_CBK_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "cb"):
+        if not _HAS_CBK:
+            st.error(f"Central bank module failed to load: {_CBK_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CENTRAL BANKS</span>
         <span style="font-size:14px;color:#888;margin-left:12px">Policy rates · real rates · what the market has priced · gold</span>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("What this panel does, and how to read it", expanded=False):
-            st.markdown("""
+            with st.expander("What this panel does, and how to read it", expanded=False):
+                st.markdown("""
 Every number on this panel is fetched from the institution that published it.
 None of it is typed into this app by hand, and that is the point: a policy rate
 is checkable, and a table maintained by hand rots quietly between checks. When
@@ -4957,169 +5010,169 @@ takes an assumed move size and an assumed meeting calendar and quietly does
 most of the work.
             """)
 
-        hist, observed = cb_load_history(6)
-        infl = cb_load_inflation()
+            hist, observed = cb_load_history(6)
+            infl = cb_load_inflation()
 
-        if hist.empty:
-            st.error(
-                "The BIS returned no policy rate data, so this panel cannot be "
-                "built. The rest of the app falls back to a stored table of "
-                "rates confirmed on 2026-08-25 — see Currencies → Carry for "
-                "what each currency is currently using."
-            )
-        else:
-            board = cbk.policy_board(hist, infl, observed=observed)
-
-            cbt1, cbt2, cbt3, cbt4, cbt5 = st.tabs([
-                "🏛 The board", "📉 Real rates", "🇺🇸 What's priced",
-                "🥇 Gold", "🤖 Desk read"])
-
-            # ---------------- the board ----------------
-            with cbt1:
-                stale = board[board["stale_days"].fillna(0) > cbk.RATE_STALE_DAYS]
-                if not stale.empty:
-                    st.warning(
-                        "Last published more than "
-                        f"{cbk.RATE_STALE_DAYS} days ago: "
-                        + " · ".join(f"{c} ({int(board.loc[c, 'stale_days'])}d)"
-                                     for c in stale.index)
-                        + ". These banks meet less often rather than the feed "
-                          "being broken, but a decision could have landed since."
-                    )
-
-                show = board.copy()
-                show["Rate"] = show["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
-                show["Real"] = show["real_rate"].map(
-                    lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
-                show["Last move"] = [
-                    (f"{r['last_change']}  {r['last_change_bp']:+.0f}bp"
-                     if pd.notna(r.get("last_change_bp")) else "no move on record")
-                    for _, r in board.iterrows()]
-                show["12m"] = show["bp_12m"].map(
-                    lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
-                show["From peak"] = show["from_peak_bp"].map(
-                    lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
-                show["Published"] = [
-                    f"{r['as_of']}" + (f"  ({int(r['stale_days'])}d)"
-                                       if pd.notna(r["stale_days"]) else "")
-                    for _, r in board.iterrows()]
-
-                cols = ["bank", "instrument", "Rate", "Real", "Last move",
-                        "12m", "From peak", "Published"]
-                st.dataframe(
-                    show[cols].rename(columns={"bank": "Central bank",
-                                               "instrument": "What the rate is"}),
-                    use_container_width=True, height=640)
-
-                st.caption(
-                    "**Real** is the policy rate less year-on-year inflation — "
-                    "realised, not expected. The forward-looking version needs "
-                    "inflation expectations, which trade for a handful of these "
-                    "countries and are surveyed for the rest; mixing the two "
-                    "would make the column incomparable across the very rows it "
-                    "exists to compare. **From peak** measures against the "
-                    "highest rate of the last six years."
+            if hist.empty:
+                st.error(
+                    "The BIS returned no policy rate data, so this panel cannot be "
+                    "built. The rest of the app falls back to a stored table of "
+                    "rates confirmed on 2026-08-25 — see Currencies → Carry for "
+                    "what each currency is currently using."
                 )
+            else:
+                board = cbk.policy_board(hist, infl, observed=observed)
 
-                st.markdown("##### Confirmed against the banks themselves")
-                xc = cb_load_crosschecks(
-                    {c: float(board.loc[c, "rate"])
-                     for c in board.index if pd.notna(board.loc[c, "rate"])})
+                cbt1, cbt2, cbt3, cbt4, cbt5 = st.tabs([
+                    "🏛 The board", "📉 Real rates", "🇺🇸 What's priced",
+                    "🥇 Gold", "🤖 Desk read"])
 
-                if xc.empty:
-                    st.info("No cross-checks returned.")
-                else:
-                    xcols = st.columns(len(xc))
-                    for col, (ccy, row) in zip(xcols, xc.iterrows()):
-                        with col:
-                            verdict = row["verdict"]
-                            if verdict == "agrees":
-                                colour, icon = "#26a69a", "✓"
-                            elif verdict == "DISAGREES":
-                                colour, icon = "#ef5350", "✗"
-                            else:
-                                colour, icon = "#888", "—"
-                            own = (f"{row['own_rate']:.3f}%"
-                                   if pd.notna(row["own_rate"]) else "unavailable")
-                            st.markdown(
-                                f"<div style='border-left:3px solid {colour};padding-left:10px'>"
-                                f"<b>{ccy}</b> {icon} {verdict}<br>"
-                                f"<span style='font-size:12px;color:#888'>"
-                                f"{row['bank_source']}<br>"
-                                f"says {own}"
-                                + (f", BIS says {row['bis_rate']:.3f}%"
-                                   if pd.notna(row["bis_rate"]) else "")
-                                + (f"<br>{row['note']}" if row.get("note") else "")
-                                + "</span></div>",
-                                unsafe_allow_html=True)
-
-                    bad = xc[xc["verdict"] == "DISAGREES"]
-                    if not bad.empty:
-                        st.error(
-                            "A source disagrees by more than "
-                            f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points: "
-                            + ", ".join(bad.index)
-                            + ". Treat the rate for these as unconfirmed until "
-                              "checked by hand — the panel does not pick a winner."
-                        )
-                    else:
-                        st.caption(
-                            "A gap inside "
-                            f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points is "
-                            "a convention difference, not a conflict: the BIS "
-                            "reports the Fed at the midpoint of its target range, "
-                            "so a source quoting the upper bound sits 12.5bp away "
-                            "and both are right."
+                # ---------------- the board ----------------
+                with cbt1:
+                    stale = board[board["stale_days"].fillna(0) > cbk.RATE_STALE_DAYS]
+                    if not stale.empty:
+                        st.warning(
+                            "Last published more than "
+                            f"{cbk.RATE_STALE_DAYS} days ago: "
+                            + " · ".join(f"{c} ({int(board.loc[c, 'stale_days'])}d)"
+                                         for c in stale.index)
+                            + ". These banks meet less often rather than the feed "
+                              "being broken, but a decision could have landed since."
                         )
 
-                st.markdown("##### The path of each rate")
-                pick = st.multiselect(
-                    "Banks to plot", list(board.index),
-                    default=[c for c in ("USD", "EUR", "JPY", "GBP") if c in board.index],
-                    key="cb_path_pick")
-                if pick:
-                    fig = go.Figure()
-                    for ccy in pick:
-                        if ccy not in hist.columns:
-                            continue
-                        fig.add_trace(go.Scatter(
-                            x=hist.index, y=hist[ccy], name=ccy,
-                            line=dict(width=2, shape="hv"),
-                            hovertemplate=f"{ccy} %{{y:.2f}}%<br>%{{x|%d %b %Y}}<extra></extra>"))
-                    fig.update_layout(
-                        height=380, template="plotly_dark",
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        yaxis_title="Policy rate (%)",
-                        legend=dict(orientation="h", y=1.12, x=0))
-                    st.plotly_chart(fig, use_container_width=True)
+                    show = board.copy()
+                    show["Rate"] = show["rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "—")
+                    show["Real"] = show["real_rate"].map(
+                        lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
+                    show["Last move"] = [
+                        (f"{r['last_change']}  {r['last_change_bp']:+.0f}bp"
+                         if pd.notna(r.get("last_change_bp")) else "no move on record")
+                        for _, r in board.iterrows()]
+                    show["12m"] = show["bp_12m"].map(
+                        lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
+                    show["From peak"] = show["from_peak_bp"].map(
+                        lambda v: f"{v:+.0f}bp" if pd.notna(v) else "—")
+                    show["Published"] = [
+                        f"{r['as_of']}" + (f"  ({int(r['stale_days'])}d)"
+                                           if pd.notna(r["stale_days"]) else "")
+                        for _, r in board.iterrows()]
+
+                    cols = ["bank", "instrument", "Rate", "Real", "Last move",
+                            "12m", "From peak", "Published"]
+                    st.dataframe(
+                        show[cols].rename(columns={"bank": "Central bank",
+                                                   "instrument": "What the rate is"}),
+                        use_container_width=True, height=640)
+
                     st.caption(
-                        "Drawn as steps, because that is what a policy rate is — "
-                        "it holds its level between decisions rather than drifting "
-                        "between them."
+                        "**Real** is the policy rate less year-on-year inflation — "
+                        "realised, not expected. The forward-looking version needs "
+                        "inflation expectations, which trade for a handful of these "
+                        "countries and are surveyed for the rest; mixing the two "
+                        "would make the column incomparable across the very rows it "
+                        "exists to compare. **From peak** measures against the "
+                        "highest rate of the last six years."
                     )
 
-            # ---------------- real rates ----------------
-            with cbt2:
-                real = board[board["real_rate"].notna()].sort_values("real_rate")
-                if real.empty:
-                    st.info("Inflation data unavailable, so no real rates.")
-                else:
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(
-                        x=real["real_rate"], y=real.index, orientation="h",
-                        marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
-                                           for v in real["real_rate"]]),
-                        text=[f"{v:+.2f}%" for v in real["real_rate"]],
-                        textposition="outside",
-                        hovertemplate="%{y}: %{x:+.2f}% real<extra></extra>"))
-                    fig.update_layout(
-                        height=520, template="plotly_dark",
-                        margin=dict(l=10, r=40, t=30, b=10),
-                        xaxis_title="Policy rate less year-on-year inflation (%)",
-                        showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown("##### Confirmed against the banks themselves")
+                    xc = cb_load_crosschecks(
+                        {c: float(board.loc[c, "rate"])
+                         for c in board.index if pd.notna(board.loc[c, "rate"])})
 
-                    st.markdown("""
+                    if xc.empty:
+                        st.info("No cross-checks returned.")
+                    else:
+                        xcols = st.columns(len(xc))
+                        for col, (ccy, row) in zip(xcols, xc.iterrows()):
+                            with col:
+                                verdict = row["verdict"]
+                                if verdict == "agrees":
+                                    colour, icon = "#26a69a", "✓"
+                                elif verdict == "DISAGREES":
+                                    colour, icon = "#ef5350", "✗"
+                                else:
+                                    colour, icon = "#888", "—"
+                                own = (f"{row['own_rate']:.3f}%"
+                                       if pd.notna(row["own_rate"]) else "unavailable")
+                                st.markdown(
+                                    f"<div style='border-left:3px solid {colour};padding-left:10px'>"
+                                    f"<b>{ccy}</b> {icon} {verdict}<br>"
+                                    f"<span style='font-size:12px;color:#888'>"
+                                    f"{row['bank_source']}<br>"
+                                    f"says {own}"
+                                    + (f", BIS says {row['bis_rate']:.3f}%"
+                                       if pd.notna(row["bis_rate"]) else "")
+                                    + (f"<br>{row['note']}" if row.get("note") else "")
+                                    + "</span></div>",
+                                    unsafe_allow_html=True)
+
+                        bad = xc[xc["verdict"] == "DISAGREES"]
+                        if not bad.empty:
+                            st.error(
+                                "A source disagrees by more than "
+                                f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points: "
+                                + ", ".join(bad.index)
+                                + ". Treat the rate for these as unconfirmed until "
+                                  "checked by hand — the panel does not pick a winner."
+                            )
+                        else:
+                            st.caption(
+                                "A gap inside "
+                                f"{cbk.CROSSCHECK_TOLERANCE * 100:.0f} basis points is "
+                                "a convention difference, not a conflict: the BIS "
+                                "reports the Fed at the midpoint of its target range, "
+                                "so a source quoting the upper bound sits 12.5bp away "
+                                "and both are right."
+                            )
+
+                    st.markdown("##### The path of each rate")
+                    pick = st.multiselect(
+                        "Banks to plot", list(board.index),
+                        default=[c for c in ("USD", "EUR", "JPY", "GBP") if c in board.index],
+                        key="cb_path_pick")
+                    if pick:
+                        fig = go.Figure()
+                        for ccy in pick:
+                            if ccy not in hist.columns:
+                                continue
+                            fig.add_trace(go.Scatter(
+                                x=hist.index, y=hist[ccy], name=ccy,
+                                line=dict(width=2, shape="hv"),
+                                hovertemplate=f"{ccy} %{{y:.2f}}%<br>%{{x|%d %b %Y}}<extra></extra>"))
+                        fig.update_layout(
+                            height=380, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="Policy rate (%)",
+                            legend=dict(orientation="h", y=1.12, x=0))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption(
+                            "Drawn as steps, because that is what a policy rate is — "
+                            "it holds its level between decisions rather than drifting "
+                            "between them."
+                        )
+
+                # ---------------- real rates ----------------
+                with cbt2:
+                    real = board[board["real_rate"].notna()].sort_values("real_rate")
+                    if real.empty:
+                        st.info("Inflation data unavailable, so no real rates.")
+                    else:
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(
+                            x=real["real_rate"], y=real.index, orientation="h",
+                            marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                               for v in real["real_rate"]]),
+                            text=[f"{v:+.2f}%" for v in real["real_rate"]],
+                            textposition="outside",
+                            hovertemplate="%{y}: %{x:+.2f}% real<extra></extra>"))
+                        fig.update_layout(
+                            height=520, template="plotly_dark",
+                            margin=dict(l=10, r=40, t=30, b=10),
+                            xaxis_title="Policy rate less year-on-year inflation (%)",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("""
 **Why this ranking and not the nominal one.** A currency is not attractive
 because its rate is high; it is attractive because its rate is high *relative
 to what inflation is taking away*. Those two rankings come apart constantly.
@@ -5132,82 +5185,82 @@ below inflation is subsidising borrowers and taxing savers, and if it is doing
 so deliberately it usually has a reason it has not said out loud.
                     """)
 
-                    detail = real.copy()
-                    detail["Policy"] = detail["rate"].map(lambda v: f"{v:.2f}%")
-                    detail["Inflation"] = detail["cpi_yoy"].map(lambda v: f"{v:.2f}%")
-                    detail["Real"] = detail["real_rate"].map(lambda v: f"{v:+.2f}%")
-                    detail["CPI as of"] = detail["cpi_as_of"]
-                    detail["Cross-check"] = detail["cpi_check"]
-                    st.dataframe(
-                        detail[["bank", "Policy", "Inflation", "Real",
-                                "CPI as of", "Cross-check"]]
-                        .rename(columns={"bank": "Central bank"}),
-                        use_container_width=True, height=560)
+                        detail = real.copy()
+                        detail["Policy"] = detail["rate"].map(lambda v: f"{v:.2f}%")
+                        detail["Inflation"] = detail["cpi_yoy"].map(lambda v: f"{v:.2f}%")
+                        detail["Real"] = detail["real_rate"].map(lambda v: f"{v:+.2f}%")
+                        detail["CPI as of"] = detail["cpi_as_of"]
+                        detail["Cross-check"] = detail["cpi_check"]
+                        st.dataframe(
+                            detail[["bank", "Policy", "Inflation", "Real",
+                                    "CPI as of", "Cross-check"]]
+                            .rename(columns={"bank": "Central bank"}),
+                            use_container_width=True, height=560)
 
-                    mismatched = detail[detail["cpi_check"] == "mismatch"]
-                    if not mismatched.empty:
-                        st.warning(
-                            "Published inflation and the rate derived from the "
-                            "price index disagree for: "
-                            + ", ".join(mismatched.index)
-                            + ". Usually a rebasing or a revision. The published "
-                              "figure is the one shown."
+                        mismatched = detail[detail["cpi_check"] == "mismatch"]
+                        if not mismatched.empty:
+                            st.warning(
+                                "Published inflation and the rate derived from the "
+                                "price index disagree for: "
+                                + ", ".join(mismatched.index)
+                                + ". Usually a rebasing or a revision. The published "
+                                  "figure is the one shown."
+                            )
+                        else:
+                            st.caption(
+                                "**Cross-check** recomputes each inflation rate from "
+                                "the underlying price index and compares it to the "
+                                "published rate. `ok` means the two agree — which "
+                                "turns an assumption about the feed into a test of it."
+                            )
+
+                # ---------------- what's priced ----------------
+                with cbt3:
+                    curve = cb_load_fed_curve(15)
+                    usd_rate = (float(board.loc["USD", "rate"])
+                                if "USD" in board.index and pd.notna(board.loc["USD", "rate"])
+                                else None)
+                    path = cbk.implied_path(curve, usd_rate)
+
+                    if not path.get("available"):
+                        st.info(
+                            "Fed funds futures were unavailable this run, so there is "
+                            "nothing priced to show. Nothing else on this panel "
+                            "depends on them."
                         )
                     else:
-                        st.caption(
-                            "**Cross-check** recomputes each inflation rate from "
-                            "the underlying price index and compares it to the "
-                            "published rate. `ok` means the two agree — which "
-                            "turns an assumption about the feed into a test of it."
-                        )
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Fed funds now", f"{path['current']:.2f}%",
+                                  help="BIS midpoint of the target range.")
+                        if "bp_6m" in path:
+                            m2.metric(f"Priced by {path['label_6m']}",
+                                      f"{path['implied_6m']:.2f}%",
+                                      f"{path['bp_6m']:+.0f}bp")
+                        if "bp_12m" in path:
+                            m3.metric(f"Priced by {path['label_12m']}",
+                                      f"{path['implied_12m']:.2f}%",
+                                      f"{path['bp_12m']:+.0f}bp")
+                        m4.metric("Market reading", path["reading"].replace("priced ", ""),
+                                  help="Derived from the 12-month point, not a forecast.")
 
-            # ---------------- what's priced ----------------
-            with cbt3:
-                curve = cb_load_fed_curve(15)
-                usd_rate = (float(board.loc["USD", "rate"])
-                            if "USD" in board.index and pd.notna(board.loc["USD", "rate"])
-                            else None)
-                path = cbk.implied_path(curve, usd_rate)
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=curve["label"], y=curve["implied"],
+                            mode="lines+markers", name="Implied by futures",
+                            line=dict(width=3, color="#42a5f5"),
+                            hovertemplate="%{x}: %{y:.3f}%<extra></extra>"))
+                        fig.add_hline(
+                            y=path["current"], line_dash="dash", line_color="#888",
+                            annotation_text=f"today {path['current']:.3f}%",
+                            annotation_position="top left")
+                        fig.update_layout(
+                            height=400, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="Implied average fed funds rate (%)",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
 
-                if not path.get("available"):
-                    st.info(
-                        "Fed funds futures were unavailable this run, so there is "
-                        "nothing priced to show. Nothing else on this panel "
-                        "depends on them."
-                    )
-                else:
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Fed funds now", f"{path['current']:.2f}%",
-                              help="BIS midpoint of the target range.")
-                    if "bp_6m" in path:
-                        m2.metric(f"Priced by {path['label_6m']}",
-                                  f"{path['implied_6m']:.2f}%",
-                                  f"{path['bp_6m']:+.0f}bp")
-                    if "bp_12m" in path:
-                        m3.metric(f"Priced by {path['label_12m']}",
-                                  f"{path['implied_12m']:.2f}%",
-                                  f"{path['bp_12m']:+.0f}bp")
-                    m4.metric("Market reading", path["reading"].replace("priced ", ""),
-                              help="Derived from the 12-month point, not a forecast.")
-
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=curve["label"], y=curve["implied"],
-                        mode="lines+markers", name="Implied by futures",
-                        line=dict(width=3, color="#42a5f5"),
-                        hovertemplate="%{x}: %{y:.3f}%<extra></extra>"))
-                    fig.add_hline(
-                        y=path["current"], line_dash="dash", line_color="#888",
-                        annotation_text=f"today {path['current']:.3f}%",
-                        annotation_position="top left")
-                    fig.update_layout(
-                        height=400, template="plotly_dark",
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        yaxis_title="Implied average fed funds rate (%)",
-                        showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    st.markdown(f"""
+                        st.markdown(f"""
 **What this is.** A fed funds future settles to the average effective rate over
 its contract month, so `100 − price` is the rate the market is paying to lock
 in. The curve above runs {len(curve)} months out and currently prices the rate
@@ -5230,189 +5283,191 @@ the other banks on this panel have no priced path here — an absence, not a
 judgement that their rates are settled.
                     """)
 
-            # ---------------- gold ----------------
-            with cbt4:
-                gold = cb_load_gold()
-                if "error" in gold:
-                    st.warning(
-                        f"Gold holdings unavailable: {gold['error']}. "
-                        "The file ships with the app from the World Gold "
-                        "Council; see the note below on refreshing it."
-                    )
-                else:
-                    latest = cb_gold_latest()
-                    g1, g2, g3 = st.columns(3)
-                    g1.metric("World official holdings",
-                              f"{gold['world_tonnes']:,.0f} t")
-                    if gold.get("euro_area"):
-                        g2.metric("Euro area (incl. ECB)",
-                                  f"{gold['euro_area']['tonnes']:,.0f} t")
-                    rng = gold.get("as_of_range")
-                    if rng:
-                        g3.metric("Countries reporting to", rng[1],
-                                  help="Each country reports on its own schedule; "
-                                       "this is the most recent date in the table.")
+                # ---------------- gold ----------------
+                with cbt4:
+                    gold = cb_load_gold()
+                    if "error" in gold:
+                        st.warning(
+                            f"Gold holdings unavailable: {gold['error']}. "
+                            "The file ships with the app from the World Gold "
+                            "Council; see the note below on refreshing it."
+                        )
+                    else:
+                        latest = cb_gold_latest()
+                        g1, g2, g3 = st.columns(3)
+                        g1.metric("World official holdings",
+                                  f"{gold['world_tonnes']:,.0f} t")
+                        if gold.get("euro_area"):
+                            g2.metric("Euro area (incl. ECB)",
+                                      f"{gold['euro_area']['tonnes']:,.0f} t")
+                        rng = gold.get("as_of_range")
+                        if rng:
+                            g3.metric("Countries reporting to", rng[1],
+                                      help="Each country reports on its own schedule; "
+                                           "this is the most recent date in the table.")
 
-                    joined = cbk.gold_vs_reserves(gold, board)
-                    if not joined.empty:
-                        held = joined[joined["tonnes"].notna()].copy()
-                        fig = go.Figure()
-                        fig.add_trace(go.Bar(
-                            x=held.index, y=held["pct_reserves"],
-                            marker=dict(color="#ffb300"),
-                            text=[f"{v:.0f}%" for v in held["pct_reserves"]],
-                            textposition="outside",
-                            customdata=held["tonnes"],
-                            hovertemplate="%{x}: %{y:.1f}% of reserves"
-                                          "<br>%{customdata:,.0f} tonnes<extra></extra>"))
-                        fig.update_layout(
-                            height=380, template="plotly_dark",
-                            margin=dict(l=10, r=10, t=30, b=10),
-                            yaxis_title="Gold as % of total reserves",
-                            showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                        joined = cbk.gold_vs_reserves(gold, board)
+                        if not joined.empty:
+                            held = joined[joined["tonnes"].notna()].copy()
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(
+                                x=held.index, y=held["pct_reserves"],
+                                marker=dict(color="#ffb300"),
+                                text=[f"{v:.0f}%" for v in held["pct_reserves"]],
+                                textposition="outside",
+                                customdata=held["tonnes"],
+                                hovertemplate="%{x}: %{y:.1f}% of reserves"
+                                              "<br>%{customdata:,.0f} tonnes<extra></extra>"))
+                            fig.update_layout(
+                                height=380, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title="Gold as % of total reserves",
+                                showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.caption(
+                                "The share, not the tonnage, is the informative "
+                                "number. A large economy can hold a large absolute "
+                                "amount and still hold very little of it relative to "
+                                "its dollars — and it is that ratio, not the weight, "
+                                "that says something about how a bank thinks about "
+                                "the dollar."
+                            )
+
+                            gshow = joined.copy()
+                            gshow["Tonnes"] = gshow["tonnes"].map(
+                                lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+                            gshow["% of reserves"] = gshow["pct_reserves"].map(
+                                lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+                            gshow["Rank"] = gshow["rank"].map(
+                                lambda v: f"#{int(v)}" if pd.notna(v) else "—")
+                            gshow["Reported"] = gshow["gold_as_of"].fillna("—")
+                            st.dataframe(
+                                gshow[["bank", "Rank", "Tonnes", "% of reserves",
+                                       "Reported", "status"]]
+                                .rename(columns={"bank": "Central bank",
+                                                 "status": "Basis"}),
+                                use_container_width=True, height=640)
+
+                            nil = joined[joined["status"] == "below listing threshold"]
+                            if not nil.empty:
+                                st.info(
+                                    "**"
+                                    + ", ".join(f"{c} ({board.loc[c, 'bank']})"
+                                                for c in nil.index)
+                                    + "** do not appear in the table at all. It runs "
+                                      f"to a hundred holders and stops at "
+                                      f"{gold['cutoff_tonnes']:.1f} tonnes, so each of "
+                                      "them holds less than that — all three sold their "
+                                      "reserves down. Shown rather than dropped, "
+                                      "because a central bank choosing to hold no gold "
+                                      "is a policy, not a gap in the data."
+                                )
+
+                        st.markdown("##### Where this comes from, and when it goes stale")
+                        vintage = gold.get("vintage", "unknown vintage")
+                        note = (
+                            f"The file shipped with the app is **{vintage}**. "
+                            "The World Gold Council compiles it from the IMF's "
+                            "reserve statistics and publishes a new one in the first "
+                            "ten days of each month, with the underlying data about "
+                            "two months behind."
+                        )
+                        if latest.get("published"):
+                            note += f" The current file on their site is **{latest['published']}**."
+                        st.markdown(note)
+
+                        if latest.get("filename") and gold.get("vintage"):
+                            shipped_month = gold["vintage"].split(",")[-1].strip()
+                            if latest.get("published") and \
+                                    latest["published"].lower()[:3] not in shipped_month.lower():
+                                st.warning(
+                                    f"A newer file is available ({latest['published']}). "
+                                    "The download needs a free Goldhub account, so the "
+                                    "app cannot fetch it — replace "
+                                    "`refdata/wgc_official_gold_holdings.xlsx` to update."
+                                )
                         st.caption(
-                            "The share, not the tonnage, is the informative "
-                            "number. A large economy can hold a large absolute "
-                            "amount and still hold very little of it relative to "
-                            "its dollars — and it is that ratio, not the weight, "
-                            "that says something about how a bank thinks about "
-                            "the dollar."
+                            "Holdings move by a few tonnes a month, so a file a "
+                            "quarter old barely differs from a current one. It is "
+                            "shown with its vintage regardless, because the reader "
+                            "should not have to assume."
                         )
 
-                        gshow = joined.copy()
-                        gshow["Tonnes"] = gshow["tonnes"].map(
-                            lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
-                        gshow["% of reserves"] = gshow["pct_reserves"].map(
-                            lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
-                        gshow["Rank"] = gshow["rank"].map(
-                            lambda v: f"#{int(v)}" if pd.notna(v) else "—")
-                        gshow["Reported"] = gshow["gold_as_of"].fillna("—")
-                        st.dataframe(
-                            gshow[["bank", "Rank", "Tonnes", "% of reserves",
-                                   "Reported", "status"]]
-                            .rename(columns={"bank": "Central bank",
-                                             "status": "Basis"}),
-                            use_container_width=True, height=640)
-
-                        nil = joined[joined["status"] == "below listing threshold"]
-                        if not nil.empty:
-                            st.info(
-                                "**"
-                                + ", ".join(f"{c} ({board.loc[c, 'bank']})"
-                                            for c in nil.index)
-                                + "** do not appear in the table at all. It runs "
-                                  f"to a hundred holders and stops at "
-                                  f"{gold['cutoff_tonnes']:.1f} tonnes, so each of "
-                                  "them holds less than that — all three sold their "
-                                  "reserves down. Shown rather than dropped, "
-                                  "because a central bank choosing to hold no gold "
-                                  "is a policy, not a gap in the data."
-                            )
-
-                    st.markdown("##### Where this comes from, and when it goes stale")
-                    vintage = gold.get("vintage", "unknown vintage")
-                    note = (
-                        f"The file shipped with the app is **{vintage}**. "
-                        "The World Gold Council compiles it from the IMF's "
-                        "reserve statistics and publishes a new one in the first "
-                        "ten days of each month, with the underlying data about "
-                        "two months behind."
-                    )
-                    if latest.get("published"):
-                        note += f" The current file on their site is **{latest['published']}**."
-                    st.markdown(note)
-
-                    if latest.get("filename") and gold.get("vintage"):
-                        shipped_month = gold["vintage"].split(",")[-1].strip()
-                        if latest.get("published") and \
-                                latest["published"].lower()[:3] not in shipped_month.lower():
-                            st.warning(
-                                f"A newer file is available ({latest['published']}). "
-                                "The download needs a free Goldhub account, so the "
-                                "app cannot fetch it — replace "
-                                "`refdata/wgc_official_gold_holdings.xlsx` to update."
-                            )
+                # ---------------- desk read ----------------
+                with cbt5:
                     st.caption(
-                        "Holdings move by a few tonnes a month, so a file a "
-                        "quarter old barely differs from a current one. It is "
-                        "shown with its vintage regardless, because the reader "
-                        "should not have to assume."
+                        "Reads the measured figures above. It has no meeting "
+                        "minutes, no speeches and no positioning data — say so if "
+                        "the question needs them."
                     )
-
-            # ---------------- desk read ----------------
-            with cbt5:
-                st.caption(
-                    "Reads the measured figures above. It has no meeting "
-                    "minutes, no speeches and no positioning data — say so if "
-                    "the question needs them."
-                )
-                if st.button("▶ Read the policy picture", type="primary",
-                             key="cb_ai_read"):
-                    _err = ai_unavailable()
-                    if _err:
-                        st.error(f"AI read unavailable: {_err}.")
-                    else:
-                        with st.spinner("Reading…"):
-                            try:
-                                _fpath = cbk.implied_path(
-                                    cb_load_fed_curve(15),
-                                    float(board.loc["USD", "rate"])
-                                    if "USD" in board.index
-                                    and pd.notna(board.loc["USD", "rate"]) else None)
-                                ctx = {
-                                    "banks": [
-                                        {k: (None if pd.isna(v) else v)
-                                         for k, v in row.items()
-                                         if not isinstance(v, (pd.Series, pd.DataFrame))}
-                                        | {"ccy": c}
-                                        for c, row in board.iterrows()],
-                                    "fed_futures_path": {
-                                        k: v for k, v in _fpath.items()
-                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                    "gold": (
-                                        cbk.gold_vs_reserves(cb_load_gold(), board)
-                                        [["tonnes", "pct_reserves", "status"]]
-                                        .reset_index().to_dict("records")
-                                        if "error" not in cb_load_gold() else []),
-                                    "caveats": [
-                                        "Real rates are ex-post: the policy rate less "
-                                        "realised year-on-year inflation, not inflation "
-                                        "expectations.",
-                                        "Inflation lags two to five months depending on "
-                                        "the country; the policy rate is current.",
-                                        "The futures curve carries a risk premium and is "
-                                        "not a forecast. It exists for the dollar only.",
-                                        "No meeting calendar, minutes, speeches or "
-                                        "positioning data are in this payload.",
-                                    ],
-                                }
-                                sysmsg = (
-                                    "You are writing the policy section of a morning note "
-                                    "for a macro desk. You are given every covered central "
-                                    "bank's policy rate, its inflation rate and the real "
-                                    "rate that follows, the direction and date of its last "
-                                    "move, how far it sits from its own cycle peak, the fed "
-                                    "funds futures path, and official gold holdings.\n\n"
-                                    "Write 250-350 words covering:\n"
-                                    "1. Where policy is genuinely divergent, and where the "
-                                    "divergence is only nominal once inflation is netted "
-                                    "off. These give different answers and the difference "
-                                    "is the point.\n"
-                                    "2. Which banks sit furthest from their own cycle peak, "
-                                    "and which have not moved at all.\n"
-                                    "3. What the fed funds curve implies, and what would "
-                                    "have to be true for it to be wrong.\n\n"
-                                    "Quote the numbers you rely on. Do not predict any "
-                                    "decision and do not attach a probability to one. If "
-                                    "something the argument needs is absent from the "
-                                    "payload, say so rather than supplying it from memory."
-                                )
-                                st.markdown(ai_agent.complete(
-                                    sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=8000, effort="medium"))
-                            except Exception as _e:
-                                st.error(f"Model call failed: {_e}")
+                    if st.button("▶ Read the policy picture", type="primary",
+                                 key="cb_ai_read"):
+                        _err = ai_unavailable("read")
+                        if _err:
+                            st.error(f"AI read unavailable: {_err}.")
+                        else:
+                            with st.spinner("Reading…"):
+                                try:
+                                    _fpath = cbk.implied_path(
+                                        cb_load_fed_curve(15),
+                                        float(board.loc["USD", "rate"])
+                                        if "USD" in board.index
+                                        and pd.notna(board.loc["USD", "rate"]) else None)
+                                    ctx = {
+                                        "banks": [
+                                            {k: (None if pd.isna(v) else v)
+                                             for k, v in row.items()
+                                             if not isinstance(v, (pd.Series, pd.DataFrame))}
+                                            | {"ccy": c}
+                                            for c, row in board.iterrows()],
+                                        "fed_futures_path": {
+                                            k: v for k, v in _fpath.items()
+                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                        "gold": (
+                                            cbk.gold_vs_reserves(cb_load_gold(), board)
+                                            [["tonnes", "pct_reserves", "status"]]
+                                            .reset_index().to_dict("records")
+                                            if "error" not in cb_load_gold() else []),
+                                        "caveats": [
+                                            "Real rates are ex-post: the policy rate less "
+                                            "realised year-on-year inflation, not inflation "
+                                            "expectations.",
+                                            "Inflation lags two to five months depending on "
+                                            "the country; the policy rate is current.",
+                                            "The futures curve carries a risk premium and is "
+                                            "not a forecast. It exists for the dollar only.",
+                                            "No meeting calendar, minutes, speeches or "
+                                            "positioning data are in this payload.",
+                                        ],
+                                    }
+                                    sysmsg = (
+                                        "You are writing the policy section of a morning note "
+                                        "for a macro desk. You are given every covered central "
+                                        "bank's policy rate, its inflation rate and the real "
+                                        "rate that follows, the direction and date of its last "
+                                        "move, how far it sits from its own cycle peak, the fed "
+                                        "funds futures path, and official gold holdings.\n\n"
+                                        "Write 250-350 words covering:\n"
+                                        "1. Where policy is genuinely divergent, and where the "
+                                        "divergence is only nominal once inflation is netted "
+                                        "off. These give different answers and the difference "
+                                        "is the point.\n"
+                                        "2. Which banks sit furthest from their own cycle peak, "
+                                        "and which have not moved at all.\n"
+                                        "3. What the fed funds curve implies, and what would "
+                                        "have to be true for it to be wrong.\n\n"
+                                        "Quote the numbers you rely on. Do not predict any "
+                                        "decision and do not attach a probability to one. If "
+                                        "something the argument needs is absent from the "
+                                        "payload, say so rather than supplying it from memory."
+                                    )
+                                    st.markdown(ai_agent.complete(
+                                        sysmsg, json.dumps(ctx, indent=1, default=str),
+                                        max_tokens=8000, effort="medium"))
+                                except Exception as _e:
+                                    st.error(f"Model call failed: {_e}")
+    else:
+        locked_tab("cb")
 
 
 # ============================== METALS ==============================
@@ -5463,18 +5518,19 @@ def mt_load_cpi():
 
 
 with tab_metals:
-    if not _HAS_MTL:
-        st.error(f"Metals module failed to load: {_MTL_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "metals"):
+        if not _HAS_MTL:
+            st.error(f"Metals module failed to load: {_MTL_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">METALS</span>
         <span style="font-size:14px;color:#888;margin-left:12px">Prices · metal or dollar · ratios · what they trade on</span>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("What this panel does, and how to read it", expanded=False):
-            st.markdown("""
+            with st.expander("What this panel does, and how to read it", expanded=False):
+                st.markdown("""
 Metals are quoted in dollars, which means the price answers two questions at
 once and separates neither. A dollar that falls ten percent lifts the gold
 price ten percent without a single ounce changing hands, and a great deal of
@@ -5507,196 +5563,196 @@ is an artefact of contract specifications. Those are shown as an index against
 their own median instead of as a decimal that only looks precise.
             """)
 
-        mc1, mc2, mc3 = st.columns([1.5, 1.6, 1])
-        with mc1:
-            mt_window = st.selectbox(
-                "Comparison window", ["1 year", "6 months", "3 months", "2 years"],
-                key="mt_window", label_visibility="collapsed")
-        with mc2:
-            mt_corr_window = st.radio(
-                "Correlation window", ["6 months", "1 year"], horizontal=True,
-                key="mt_corr_win", label_visibility="collapsed")
-        with mc3:
-            if st.button("🔄 Refresh", key="mt_refresh", use_container_width=True):
-                mt_load_prices.clear()
-                st.rerun()
+            mc1, mc2, mc3 = st.columns([1.5, 1.6, 1])
+            with mc1:
+                mt_window = st.selectbox(
+                    "Comparison window", ["1 year", "6 months", "3 months", "2 years"],
+                    key="mt_window", label_visibility="collapsed")
+            with mc2:
+                mt_corr_window = st.radio(
+                    "Correlation window", ["6 months", "1 year"], horizontal=True,
+                    key="mt_corr_win", label_visibility="collapsed")
+            with mc3:
+                if st.button("🔄 Refresh", key="mt_refresh", use_container_width=True):
+                    mt_load_prices.clear()
+                    st.rerun()
 
-        # Calendar days, not bar counts — the label has to mean the same thing
-        # whatever frequency the feed returns.
-        _WINDOW_DAYS = {"3 months": 91, "6 months": 182,
-                        "1 year": 365, "2 years": 730}
-        win = _WINDOW_DAYS[mt_window]
-        corr_win = _WINDOW_DAYS[mt_corr_window]
+            # Calendar days, not bar counts — the label has to mean the same thing
+            # whatever frequency the feed returns.
+            _WINDOW_DAYS = {"3 months": 91, "6 months": 182,
+                            "1 year": 365, "2 years": 730}
+            win = _WINDOW_DAYS[mt_window]
+            corr_win = _WINDOW_DAYS[mt_corr_window]
 
-        mt_px, mt_failed = mt_load_prices()
+            mt_px, mt_failed = mt_load_prices()
 
-        if mt_px.empty:
-            st.error(
-                "No metals prices returned this run, so the panel cannot be built. "
-                + (f"Failed tickers: {', '.join(mt_failed)}." if mt_failed else "")
-            )
-        else:
-            if mt_failed:
-                st.warning(
-                    "No data for: " + ", ".join(mt_failed)
-                    + ". Anything derived from these is omitted rather than "
-                      "estimated."
+            if mt_px.empty:
+                st.error(
+                    "No metals prices returned this run, so the panel cannot be built. "
+                    + (f"Failed tickers: {', '.join(mt_failed)}." if mt_failed else "")
                 )
-
-            mtt1, mtt2, mtt3, mtt4, mtt5 = st.tabs([
-                "🥇 The board", "💵 Metal or dollar?", "⚖️ Ratios",
-                "🔗 What drives them", "🤖 Desk read"])
-
-            # ---------------- the board ----------------
-            with mtt1:
-                bd = mtl.board(mt_px)
-                if bd.empty:
-                    st.info("No metal had enough history to build the board.")
-                else:
-                    show = bd.copy()
-                    show["Price"] = [
-                        f"{r['last']:,.2f}" for _, r in bd.iterrows()]
-                    for col, label in (("ret_1w", "1w"), ("ret_1m", "1m"),
-                                       ("ret_3m", "3m"), ("ret_ytd", "YTD"),
-                                       ("ret_1y", "1y")):
-                        show[label] = show[col].map(
-                            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
-                    show["Vol"] = show["vol_1y"].map(
-                        lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
-                    show["52w range"] = [
-                        (f"{r['pct_of_range']:.0f}%" if pd.notna(r["pct_of_range"]) else "—")
-                        for _, r in bd.iterrows()]
-
-                    st.dataframe(
-                        show[["unit", "Price", "1w", "1m", "3m", "YTD", "1y",
-                              "Vol", "52w range"]]
-                        .rename(columns={"unit": "Quoted in"}),
-                        use_container_width=True, height=250)
-                    st.caption(
-                        "**52w range** is where the price sits between its "
-                        "one-year low and high — 0% is on the low, 100% on the "
-                        "high. **Vol** is annualised from daily moves over the "
-                        "last year. Both describe the past; neither forecasts."
+            else:
+                if mt_failed:
+                    st.warning(
+                        "No data for: " + ", ".join(mt_failed)
+                        + ". Anything derived from these is omitted rather than "
+                          "estimated."
                     )
 
-                    with st.expander("What each metal actually trades on"):
-                        for name, row in bd.iterrows():
-                            if row.get("note"):
-                                st.markdown(f"**{name}** — {row['note']}")
+                mtt1, mtt2, mtt3, mtt4, mtt5 = st.tabs([
+                    "🥇 The board", "💵 Metal or dollar?", "⚖️ Ratios",
+                    "🔗 What drives them", "🤖 Desk read"])
 
-                    st.markdown("##### Thematic baskets")
-                    th = mtl.board(mt_px, mtl.THEMES)
-                    if th.empty:
-                        st.info("No thematic basket returned data.")
+                # ---------------- the board ----------------
+                with mtt1:
+                    bd = mtl.board(mt_px)
+                    if bd.empty:
+                        st.info("No metal had enough history to build the board.")
                     else:
-                        tshow = th.copy()
-                        tshow["Price"] = tshow["last"].map(lambda v: f"{v:,.2f}")
-                        for col, label in (("ret_1m", "1m"), ("ret_3m", "3m"),
-                                           ("ret_ytd", "YTD"), ("ret_1y", "1y")):
-                            tshow[label] = tshow[col].map(
+                        show = bd.copy()
+                        show["Price"] = [
+                            f"{r['last']:,.2f}" for _, r in bd.iterrows()]
+                        for col, label in (("ret_1w", "1w"), ("ret_1m", "1m"),
+                                           ("ret_3m", "3m"), ("ret_ytd", "YTD"),
+                                           ("ret_1y", "1y")):
+                            show[label] = show[col].map(
                                 lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
-                        tshow["Vol"] = tshow["vol_1y"].map(
+                        show["Vol"] = show["vol_1y"].map(
                             lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                        show["52w range"] = [
+                            (f"{r['pct_of_range']:.0f}%" if pd.notna(r["pct_of_range"]) else "—")
+                            for _, r in bd.iterrows()]
+
                         st.dataframe(
-                            tshow[["Price", "1m", "3m", "YTD", "1y", "Vol"]],
-                            use_container_width=True, height=180)
+                            show[["unit", "Price", "1w", "1m", "3m", "YTD", "1y",
+                                  "Vol", "52w range"]]
+                            .rename(columns={"unit": "Quoted in"}),
+                            use_container_width=True, height=250)
                         st.caption(
-                            "These are equity baskets, not metal prices, and "
-                            "they are kept apart from the table above for that "
-                            "reason. A uranium fund holds miners and enrichers "
-                            "whose relationship to the uranium price is loose, "
-                            "geared, and mediated by everything else that moves "
-                            "equities."
+                            "**52w range** is where the price sits between its "
+                            "one-year low and high — 0% is on the low, 100% on the "
+                            "high. **Vol** is annualised from daily moves over the "
+                            "last year. Both describe the past; neither forecasts."
                         )
 
-                    st.markdown("##### In real terms")
-                    cpi = mt_load_cpi()
-                    if cpi.empty:
-                        st.info(
-                            "Consumer price data unavailable this run, so the "
-                            "real series cannot be computed. The nominal prices "
-                            "above are unaffected."
-                        )
-                    else:
-                        rp_metal = st.selectbox(
-                            "Metal", list(mtl.METALS.keys()), key="mt_real_pick")
-                        tkr = mtl.METALS[rp_metal].yahoo
-                        rp = (mtl.real_price(mt_px[tkr], cpi)
-                              if tkr in mt_px.columns else {"available": False})
+                        with st.expander("What each metal actually trades on"):
+                            for name, row in bd.iterrows():
+                                if row.get("note"):
+                                    st.markdown(f"**{name}** — {row['note']}")
 
-                        if not rp.get("available"):
-                            st.info(f"Not enough history to deflate {rp_metal}.")
+                        st.markdown("##### Thematic baskets")
+                        th = mtl.board(mt_px, mtl.THEMES)
+                        if th.empty:
+                            st.info("No thematic basket returned data.")
                         else:
-                            r1, r2, r3 = st.columns(3)
-                            r1.metric(f"{rp_metal} today", f"{rp['nominal_last']:,.0f}")
-                            r2.metric("Real peak", f"{rp['real_peak']:,.0f}",
-                                      rp["real_peak_date"])
-                            r3.metric("Below real peak",
-                                      f"{rp['below_real_peak_pct']:+.1f}%")
-
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=rp["nominal"].index, y=rp["nominal"],
-                                name="Nominal", line=dict(width=1.5, color="#888")))
-                            fig.add_trace(go.Scatter(
-                                x=rp["real"].index, y=rp["real"],
-                                name=f"In {rp['cpi_last'][:7]} money",
-                                line=dict(width=2.5, color="#ffb300")))
-                            fig.update_layout(
-                                height=380, template="plotly_dark",
-                                margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title=mtl.METALS[rp_metal].unit,
-                                legend=dict(orientation="h", y=1.12, x=0))
-                            st.plotly_chart(fig, use_container_width=True)
-
+                            tshow = th.copy()
+                            tshow["Price"] = tshow["last"].map(lambda v: f"{v:,.2f}")
+                            for col, label in (("ret_1m", "1m"), ("ret_3m", "3m"),
+                                               ("ret_ytd", "YTD"), ("ret_1y", "1y")):
+                                tshow[label] = tshow[col].map(
+                                    lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                            tshow["Vol"] = tshow["vol_1y"].map(
+                                lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                            st.dataframe(
+                                tshow[["Price", "1m", "3m", "YTD", "1y", "Vol"]],
+                                use_container_width=True, height=180)
                             st.caption(
-                                "Deflated by US consumer prices and expressed in "
-                                f"the money of {rp['cpi_last'][:7]}, which is why "
-                                "the two lines meet at the right-hand edge. "
-                                f"Consumer prices are published in arrears — the "
-                                f"latest reading is {rp['cpi_lag_days']} days old, "
-                                "so the most recent stretch of the real line will "
-                                "move slightly when the next print lands. History "
-                                f"starts {rp['from']}, which is as far back as the "
-                                "futures contract goes; earlier peaks are outside "
-                                "what this data can speak to."
+                                "These are equity baskets, not metal prices, and "
+                                "they are kept apart from the table above for that "
+                                "reason. A uranium fund holds miners and enrichers "
+                                "whose relationship to the uranium price is loose, "
+                                "geared, and mediated by everything else that moves "
+                                "equities."
                             )
 
-            # ---------------- metal or dollar ----------------
-            with mtt2:
-                dec_metal = st.selectbox(
-                    "Metal", list(mtl.METALS.keys()), key="mt_dec_pick")
-                tkr = mtl.METALS[dec_metal].yahoo
+                        st.markdown("##### In real terms")
+                        cpi = mt_load_cpi()
+                        if cpi.empty:
+                            st.info(
+                                "Consumer price data unavailable this run, so the "
+                                "real series cannot be computed. The nominal prices "
+                                "above are unaffected."
+                            )
+                        else:
+                            rp_metal = st.selectbox(
+                                "Metal", list(mtl.METALS.keys()), key="mt_real_pick")
+                            tkr = mtl.METALS[rp_metal].yahoo
+                            rp = (mtl.real_price(mt_px[tkr], cpi)
+                                  if tkr in mt_px.columns else {"available": False})
 
-                fx_px, _fx_failed = fx_load_prices()
-                uv = fxa.usd_values(fx_px) if _HAS_FXA and not fx_px.empty else pd.DataFrame()
+                            if not rp.get("available"):
+                                st.info(f"Not enough history to deflate {rp_metal}.")
+                            else:
+                                r1, r2, r3 = st.columns(3)
+                                r1.metric(f"{rp_metal} today", f"{rp['nominal_last']:,.0f}")
+                                r2.metric("Real peak", f"{rp['real_peak']:,.0f}",
+                                          rp["real_peak_date"])
+                                r3.metric("Below real peak",
+                                          f"{rp['below_real_peak_pct']:+.1f}%")
 
-                if uv.empty or tkr not in mt_px.columns:
-                    st.info(
-                        "The currency universe or the metal price was "
-                        "unavailable this run, so the split cannot be computed."
-                    )
-                else:
-                    dec = mtl.in_currencies(mt_px[tkr], uv, days=win)
-                    if not dec.get("available"):
+                                fig = go.Figure()
+                                fig.add_trace(go.Scatter(
+                                    x=rp["nominal"].index, y=rp["nominal"],
+                                    name="Nominal", line=dict(width=1.5, color="#888")))
+                                fig.add_trace(go.Scatter(
+                                    x=rp["real"].index, y=rp["real"],
+                                    name=f"In {rp['cpi_last'][:7]} money",
+                                    line=dict(width=2.5, color="#ffb300")))
+                                fig.update_layout(
+                                    height=380, template="plotly_dark",
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    yaxis_title=mtl.METALS[rp_metal].unit,
+                                    legend=dict(orientation="h", y=1.12, x=0))
+                                st.plotly_chart(fig, use_container_width=True)
+
+                                st.caption(
+                                    "Deflated by US consumer prices and expressed in "
+                                    f"the money of {rp['cpi_last'][:7]}, which is why "
+                                    "the two lines meet at the right-hand edge. "
+                                    f"Consumer prices are published in arrears — the "
+                                    f"latest reading is {rp['cpi_lag_days']} days old, "
+                                    "so the most recent stretch of the real line will "
+                                    "move slightly when the next print lands. History "
+                                    f"starts {rp['from']}, which is as far back as the "
+                                    "futures contract goes; earlier peaks are outside "
+                                    "what this data can speak to."
+                                )
+
+                # ---------------- metal or dollar ----------------
+                with mtt2:
+                    dec_metal = st.selectbox(
+                        "Metal", list(mtl.METALS.keys()), key="mt_dec_pick")
+                    tkr = mtl.METALS[dec_metal].yahoo
+
+                    fx_px, _fx_failed = fx_load_prices()
+                    uv = fxa.usd_values(fx_px) if _HAS_FXA and not fx_px.empty else pd.DataFrame()
+
+                    if uv.empty or tkr not in mt_px.columns:
                         st.info(
-                            f"Not enough overlapping history to split "
-                            f"{dec_metal} over {mt_window.lower()}."
+                            "The currency universe or the metal price was "
+                            "unavailable this run, so the split cannot be computed."
                         )
                     else:
-                        d1, d2, d3, d4 = st.columns(4)
-                        d1.metric(f"{dec_metal} in USD",
-                                  f"{dec['usd_return_pct']:+.1f}%",
-                                  help=f"{dec['start']} to {dec['end']}")
-                        d2.metric("Typical local currency",
-                                  f"{dec['median_local_pct']:+.1f}%",
-                                  help=f"Median across {dec['n_currencies']} currencies.")
-                        d3.metric("The dollar's part",
-                                  f"{dec['dollar_contribution_pct']:+.1f}pp")
-                        if "reading" in dec:
-                            d4.metric("This move was", dec["reading"])
+                        dec = mtl.in_currencies(mt_px[tkr], uv, days=win)
+                        if not dec.get("available"):
+                            st.info(
+                                f"Not enough overlapping history to split "
+                                f"{dec_metal} over {mt_window.lower()}."
+                            )
+                        else:
+                            d1, d2, d3, d4 = st.columns(4)
+                            d1.metric(f"{dec_metal} in USD",
+                                      f"{dec['usd_return_pct']:+.1f}%",
+                                      help=f"{dec['start']} to {dec['end']}")
+                            d2.metric("Typical local currency",
+                                      f"{dec['median_local_pct']:+.1f}%",
+                                      help=f"Median across {dec['n_currencies']} currencies.")
+                            d3.metric("The dollar's part",
+                                      f"{dec['dollar_contribution_pct']:+.1f}pp")
+                            if "reading" in dec:
+                                d4.metric("This move was", dec["reading"])
 
-                        st.markdown(f"""
+                            st.markdown(f"""
 Over {mt_window.lower()}, {dec_metal.lower()} returned
 **{dec['usd_return_pct']:+.1f}% in dollars**. Repriced into
 {dec['n_currencies']} other currencies, the typical return was
@@ -5706,34 +5762,34 @@ dollar contributed, because a return quoted in dollars is the metal's move
 less the dollar's own.
                         """)
 
-                        per = pd.Series(dec["per_currency"]).sort_values()
-                        fig = go.Figure()
-                        fig.add_trace(go.Bar(
-                            x=per.values, y=per.index, orientation="h",
-                            marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
-                                               for v in per.values]),
-                            text=[f"{v:+.1f}%" for v in per.values],
-                            textposition="outside",
-                            hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
-                        fig.add_vline(
-                            x=dec["usd_return_pct"], line_dash="dash",
-                            line_color="#42a5f5",
-                            annotation_text=f"in USD {dec['usd_return_pct']:+.1f}%",
-                            annotation_position="top")
-                        fig.add_vline(
-                            x=dec["median_local_pct"], line_dash="dot",
-                            line_color="#ffb300",
-                            annotation_text=f"median {dec['median_local_pct']:+.1f}%",
-                            annotation_position="bottom")
-                        fig.update_layout(
-                            height=520, template="plotly_dark",
-                            margin=dict(l=10, r=60, t=40, b=10),
-                            xaxis_title=f"{dec_metal} return over {mt_window.lower()}, "
-                                        f"in each currency (%)",
-                            showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                            per = pd.Series(dec["per_currency"]).sort_values()
+                            fig = go.Figure()
+                            fig.add_trace(go.Bar(
+                                x=per.values, y=per.index, orientation="h",
+                                marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                                   for v in per.values]),
+                                text=[f"{v:+.1f}%" for v in per.values],
+                                textposition="outside",
+                                hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
+                            fig.add_vline(
+                                x=dec["usd_return_pct"], line_dash="dash",
+                                line_color="#42a5f5",
+                                annotation_text=f"in USD {dec['usd_return_pct']:+.1f}%",
+                                annotation_position="top")
+                            fig.add_vline(
+                                x=dec["median_local_pct"], line_dash="dot",
+                                line_color="#ffb300",
+                                annotation_text=f"median {dec['median_local_pct']:+.1f}%",
+                                annotation_position="bottom")
+                            fig.update_layout(
+                                height=520, template="plotly_dark",
+                                margin=dict(l=10, r=60, t=40, b=10),
+                                xaxis_title=f"{dec_metal} return over {mt_window.lower()}, "
+                                            f"in each currency (%)",
+                                showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
 
-                        st.markdown("""
+                            st.markdown("""
 **Reading the spread.** A currency near the top of this chart is one that has
 weakened — its holders paid much more for the same ounce. A currency near the
 bottom has held its value. The chart is therefore as much a picture of the
@@ -5745,163 +5801,163 @@ inflation would drag an average on its own and make the dollar look innocent.
 The median is unmoved by an outlier, which is the whole reason to use it here.
                         """)
 
-                        st.markdown("##### Rebased to 100")
-                        default_ccys = [c for c in ("USD", "EUR", "JPY", "CNY", "TRY")
-                                        if c == "USD" or c in uv.columns]
-                        picks = st.multiselect(
-                            "Currencies", ["USD"] + [c for c in uv.columns if c != "USD"],
-                            default=default_ccys, key="mt_ccy_pick")
-                        if picks:
-                            reb = mtl.in_currencies_series(
-                                mt_px[tkr].tail(win + 1), uv, picks)
-                            if reb.empty:
-                                st.info("No overlapping history for that selection.")
-                            else:
-                                fig2 = go.Figure()
-                                for c in reb.columns:
-                                    fig2.add_trace(go.Scatter(
-                                        x=reb.index, y=reb[c], name=c,
-                                        line=dict(width=2.5 if c == "USD" else 1.6)))
-                                fig2.update_layout(
-                                    height=380, template="plotly_dark",
-                                    margin=dict(l=10, r=10, t=30, b=10),
-                                    yaxis_title="Rebased to 100 at the start",
-                                    legend=dict(orientation="h", y=1.12, x=0))
-                                st.plotly_chart(fig2, use_container_width=True)
-                                st.caption(
-                                    "Rebased because an ounce costs a few "
-                                    "thousand dollars and a few hundred thousand "
-                                    "lira; on one axis the comparison would be "
-                                    "invisible. Lines that travel together mean "
-                                    "the metal moved. Lines that fan apart mean "
-                                    "the currencies did."
-                                )
+                            st.markdown("##### Rebased to 100")
+                            default_ccys = [c for c in ("USD", "EUR", "JPY", "CNY", "TRY")
+                                            if c == "USD" or c in uv.columns]
+                            picks = st.multiselect(
+                                "Currencies", ["USD"] + [c for c in uv.columns if c != "USD"],
+                                default=default_ccys, key="mt_ccy_pick")
+                            if picks:
+                                reb = mtl.in_currencies_series(
+                                    mt_px[tkr].tail(win + 1), uv, picks)
+                                if reb.empty:
+                                    st.info("No overlapping history for that selection.")
+                                else:
+                                    fig2 = go.Figure()
+                                    for c in reb.columns:
+                                        fig2.add_trace(go.Scatter(
+                                            x=reb.index, y=reb[c], name=c,
+                                            line=dict(width=2.5 if c == "USD" else 1.6)))
+                                    fig2.update_layout(
+                                        height=380, template="plotly_dark",
+                                        margin=dict(l=10, r=10, t=30, b=10),
+                                        yaxis_title="Rebased to 100 at the start",
+                                        legend=dict(orientation="h", y=1.12, x=0))
+                                    st.plotly_chart(fig2, use_container_width=True)
+                                    st.caption(
+                                        "Rebased because an ounce costs a few "
+                                        "thousand dollars and a few hundred thousand "
+                                        "lira; on one axis the comparison would be "
+                                        "invisible. Lines that travel together mean "
+                                        "the metal moved. Lines that fan apart mean "
+                                        "the currencies did."
+                                    )
 
-            # ---------------- ratios ----------------
-            with mtt3:
-                rt = mtl.ratio_table(mt_px)
-                if rt.empty:
-                    st.info("No ratio had enough history to compute.")
-                else:
-                    cols = st.columns(len(rt))
-                    for col, (name, row) in zip(cols, rt.iterrows()):
-                        with col:
-                            pct = row["percentile"]
-                            if pct >= 80:
-                                colour, where = "#ef5350", "historically high"
-                            elif pct <= 20:
-                                colour, where = "#42a5f5", "historically low"
-                            else:
-                                colour, where = "#888", "mid-range"
-                            level = (f"{row['display']:,.2f}" if row["comparable"]
-                                     else f"{row['display']:,.0f}")
-                            unit = "" if row["comparable"] else " (median = 100)"
-                            st.markdown(
-                                f"<div style='border-left:3px solid {colour};padding-left:10px'>"
-                                f"<b>{name}</b><br>"
-                                f"<span style='font-size:22px;font-weight:700'>{level}</span>"
-                                f"<span style='font-size:11px;color:#888'>{unit}</span><br>"
-                                f"<span style='font-size:12px;color:#888'>"
-                                f"{ordinal(pct)} percentile — {where}<br>"
-                                f"{row['vs_median_pct']:+.0f}% vs median · "
-                                f"{row['ret_1y']:+.0f}% over 1y</span></div>",
-                                unsafe_allow_html=True)
+                # ---------------- ratios ----------------
+                with mtt3:
+                    rt = mtl.ratio_table(mt_px)
+                    if rt.empty:
+                        st.info("No ratio had enough history to compute.")
+                    else:
+                        cols = st.columns(len(rt))
+                        for col, (name, row) in zip(cols, rt.iterrows()):
+                            with col:
+                                pct = row["percentile"]
+                                if pct >= 80:
+                                    colour, where = "#ef5350", "historically high"
+                                elif pct <= 20:
+                                    colour, where = "#42a5f5", "historically low"
+                                else:
+                                    colour, where = "#888", "mid-range"
+                                level = (f"{row['display']:,.2f}" if row["comparable"]
+                                         else f"{row['display']:,.0f}")
+                                unit = "" if row["comparable"] else " (median = 100)"
+                                st.markdown(
+                                    f"<div style='border-left:3px solid {colour};padding-left:10px'>"
+                                    f"<b>{name}</b><br>"
+                                    f"<span style='font-size:22px;font-weight:700'>{level}</span>"
+                                    f"<span style='font-size:11px;color:#888'>{unit}</span><br>"
+                                    f"<span style='font-size:12px;color:#888'>"
+                                    f"{ordinal(pct)} percentile — {where}<br>"
+                                    f"{row['vs_median_pct']:+.0f}% vs median · "
+                                    f"{row['ret_1y']:+.0f}% over 1y</span></div>",
+                                    unsafe_allow_html=True)
 
-                    st.caption(
-                        f"Percentiles are against each ratio's own history from "
-                        f"{rt['from'].min()} — as far back as these futures "
-                        "contracts go. A percentile over twenty-six years is a "
-                        "different claim from one over fifty, and only the first "
-                        "is available here."
-                    )
+                        st.caption(
+                            f"Percentiles are against each ratio's own history from "
+                            f"{rt['from'].min()} — as far back as these futures "
+                            "contracts go. A percentile over twenty-six years is a "
+                            "different claim from one over fifty, and only the first "
+                            "is available here."
+                        )
 
-                    pick_ratio = st.selectbox(
-                        "Chart", list(rt.index), key="mt_ratio_pick")
-                    spec = next(s for s in mtl.RATIOS if s["name"] == pick_ratio)
-                    r = mtl.ratio(mt_px, spec["num"], spec["den"])
-                    if r.get("available"):
-                        s = r["series"]
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=s.index, y=s.values, name=pick_ratio,
-                            line=dict(width=1.8, color="#42a5f5")))
-                        fig.add_hline(
-                            y=r["median"], line_dash="dash", line_color="#888",
-                            annotation_text="median", annotation_position="right")
+                        pick_ratio = st.selectbox(
+                            "Chart", list(rt.index), key="mt_ratio_pick")
+                        spec = next(s for s in mtl.RATIOS if s["name"] == pick_ratio)
+                        r = mtl.ratio(mt_px, spec["num"], spec["den"])
+                        if r.get("available"):
+                            s = r["series"]
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=s.index, y=s.values, name=pick_ratio,
+                                line=dict(width=1.8, color="#42a5f5")))
+                            fig.add_hline(
+                                y=r["median"], line_dash="dash", line_color="#888",
+                                annotation_text="median", annotation_position="right")
+                            fig.update_layout(
+                                height=400, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title=pick_ratio, showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("##### What each ratio is asking")
+                        for name, row in rt.iterrows():
+                            st.markdown(f"**{name}** — {row['asks']}")
+
+                # ---------------- what drives them ----------------
+                with mtt4:
+                    uni = {**{m.name: m.yahoo for m in mtl.METALS.values()},
+                           **mtl.DRIVERS}
+                    cm = mtl.correlations(mt_px, uni, window=corr_win)
+                    if cm.empty:
+                        st.info("Not enough overlapping history for correlations.")
+                    else:
+                        fig = go.Figure(data=go.Heatmap(
+                            z=cm.values, x=cm.columns, y=cm.index,
+                            zmin=-1, zmax=1, colorscale="RdBu", reversescale=True,
+                            text=cm.round(2).values, texttemplate="%{text}",
+                            hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>"))
                         fig.update_layout(
-                            height=400, template="plotly_dark",
-                            margin=dict(l=10, r=10, t=30, b=10),
-                            yaxis_title=pick_ratio, showlegend=False)
+                            height=520, template="plotly_dark",
+                            margin=dict(l=10, r=10, t=30, b=10))
                         st.plotly_chart(fig, use_container_width=True)
-
-                    st.markdown("##### What each ratio is asking")
-                    for name, row in rt.iterrows():
-                        st.markdown(f"**{name}** — {row['asks']}")
-
-            # ---------------- what drives them ----------------
-            with mtt4:
-                uni = {**{m.name: m.yahoo for m in mtl.METALS.values()},
-                       **mtl.DRIVERS}
-                cm = mtl.correlations(mt_px, uni, window=corr_win)
-                if cm.empty:
-                    st.info("Not enough overlapping history for correlations.")
-                else:
-                    fig = go.Figure(data=go.Heatmap(
-                        z=cm.values, x=cm.columns, y=cm.index,
-                        zmin=-1, zmax=1, colorscale="RdBu", reversescale=True,
-                        text=cm.round(2).values, texttemplate="%{text}",
-                        hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>"))
-                    fig.update_layout(
-                        height=520, template="plotly_dark",
-                        margin=dict(l=10, r=10, t=30, b=10))
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption(
-                        f"Correlation of daily returns over the last "
-                        f"{mt_corr_window.lower()}. Returns rather than price "
-                        "levels — two rising series correlate near one whatever "
-                        "they are, which measures only that both went up."
-                    )
-
-                    metal_cm = mtl.correlations(
-                        mt_px, {m.name: m.yahoo for m in mtl.METALS.values()},
-                        window=corr_win)
-                    groups = mtl.clustered(metal_cm, 0.7)
-                    if groups:
-                        st.warning(
-                            "Effectively one position at |ρ| ≥ 0.7:\n\n"
-                            + "\n\n".join(" · ".join(g) for g in groups)
-                            + "\n\nSizing these separately multiplies the "
-                              "exposure without diversifying it — they fall "
-                              "together, and they fall together precisely when "
-                              "the reason for holding them is being tested."
-                        )
-                    else:
-                        st.info(
-                            "No pair of metals is correlated above 0.7 over this "
-                            "window, so each is currently carrying its own risk."
+                        st.caption(
+                            f"Correlation of daily returns over the last "
+                            f"{mt_corr_window.lower()}. Returns rather than price "
+                            "levels — two rising series correlate near one whatever "
+                            "they are, which measures only that both went up."
                         )
 
-                    st.markdown("##### Mining equity against the metal")
-                    ms = mtl.miner_spread(mt_px, window=win)
-                    if ms.empty:
-                        st.info("No miner had enough overlapping history.")
-                    else:
-                        mshow = ms.copy()
-                        mshow["Beta to metal"] = mshow["beta"].map(
-                            lambda v: f"{v:.2f}" if pd.notna(v) else "—")
-                        mshow["Correlation"] = mshow["corr"].map(
-                            lambda v: f"{v:.2f}" if pd.notna(v) else "—")
-                        for c, label in (("equity_1y", "Equity"),
-                                         ("metal_1y", "Metal"),
-                                         ("excess_1y", "Excess")):
-                            mshow[label] = mshow[c].map(
-                                lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
-                        st.dataframe(
-                            mshow[["metal", "Beta to metal", "Correlation",
-                                   "Equity", "Metal", "Excess"]]
-                            .rename(columns={"metal": "Against"}),
-                            use_container_width=True, height=170)
-                        st.markdown(f"""
+                        metal_cm = mtl.correlations(
+                            mt_px, {m.name: m.yahoo for m in mtl.METALS.values()},
+                            window=corr_win)
+                        groups = mtl.clustered(metal_cm, 0.7)
+                        if groups:
+                            st.warning(
+                                "Effectively one position at |ρ| ≥ 0.7:\n\n"
+                                + "\n\n".join(" · ".join(g) for g in groups)
+                                + "\n\nSizing these separately multiplies the "
+                                  "exposure without diversifying it — they fall "
+                                  "together, and they fall together precisely when "
+                                  "the reason for holding them is being tested."
+                            )
+                        else:
+                            st.info(
+                                "No pair of metals is correlated above 0.7 over this "
+                                "window, so each is currently carrying its own risk."
+                            )
+
+                        st.markdown("##### Mining equity against the metal")
+                        ms = mtl.miner_spread(mt_px, window=win)
+                        if ms.empty:
+                            st.info("No miner had enough overlapping history.")
+                        else:
+                            mshow = ms.copy()
+                            mshow["Beta to metal"] = mshow["beta"].map(
+                                lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                            mshow["Correlation"] = mshow["corr"].map(
+                                lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                            for c, label in (("equity_1y", "Equity"),
+                                             ("metal_1y", "Metal"),
+                                             ("excess_1y", "Excess")):
+                                mshow[label] = mshow[c].map(
+                                    lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                            st.dataframe(
+                                mshow[["metal", "Beta to metal", "Correlation",
+                                       "Equity", "Metal", "Excess"]]
+                                .rename(columns={"metal": "Against"}),
+                                use_container_width=True, height=170)
+                            st.markdown(f"""
 A miner is a levered claim on the metal net of a cost base, so it should move
 further than the metal in both directions — that is what **beta** measures,
 and a beta above one is the normal state rather than a discovery.
@@ -5915,90 +5971,92 @@ about the industry which the metal price cannot carry, and it is the reason to
 look at the equity at all.
                         """)
 
-            # ---------------- desk read ----------------
-            with mtt5:
-                st.caption(
-                    "Reads the measured figures above. It has no inventory "
-                    "data, no mine supply, no positioning — say so if the "
-                    "question needs them."
-                )
-                if st.button("▶ Read the metals complex", type="primary",
-                             key="mt_ai"):
-                    _err = ai_unavailable()
-                    if _err:
-                        st.error(f"AI read unavailable: {_err}.")
-                    else:
-                        with st.spinner("Reading…"):
-                            try:
-                                fx_px, _ = fx_load_prices()
-                                uv = (fxa.usd_values(fx_px)
-                                      if _HAS_FXA and not fx_px.empty else pd.DataFrame())
-                                bd = mtl.board(mt_px)
-                                rt = mtl.ratio_table(mt_px)
-                                ctx = {
-                                    "window": mt_window,
-                                    "board": (bd.drop(columns=["note"], errors="ignore")
-                                              .reset_index().to_dict("records")),
-                                    "themes": mtl.board(mt_px, mtl.THEMES)
-                                              .reset_index().to_dict("records"),
-                                    "ratios": (rt.drop(columns=["asks"], errors="ignore")
-                                               .reset_index().to_dict("records")),
-                                    "decomposition": {
-                                        name: {k: v for k, v in
-                                               mtl.in_currencies(
-                                                   mt_px[m.yahoo], uv, days=win).items()
-                                               if k != "per_currency"}
-                                        for name, m in mtl.METALS.items()
-                                        if m.yahoo in mt_px.columns and not uv.empty},
-                                    "driver_correlations":
-                                        mtl.driver_betas(mt_px, window=corr_win)
-                                        .reset_index().to_dict("records"),
-                                    "clusters": mtl.clustered(
-                                        mtl.correlations(
-                                            mt_px,
-                                            {m.name: m.yahoo for m in mtl.METALS.values()},
-                                            window=corr_win), 0.7),
-                                    "miners": mtl.miner_spread(mt_px, window=win)
-                                              .reset_index().to_dict("records"),
-                                    "caveats": [
-                                        "Decomposition splits a dollar-quoted move into "
-                                        "the metal's part and the dollar's, using the "
-                                        "median return across currencies.",
-                                        "Ratio percentiles run from 2000 at the earliest "
-                                        "— as far back as these futures go.",
-                                        "No inventory, mine supply, ETF flow or "
-                                        "positioning data is in this payload.",
-                                    ],
-                                }
-                                sysmsg = (
-                                    "You are a commodities strategist writing the metals "
-                                    "section of a morning note. You are given prices and "
-                                    "returns, the split of each metal's move into the "
-                                    "metal's part and the dollar's, the classic ratios "
-                                    "against their own history, correlations to macro "
-                                    "drivers, correlation clusters, and mining equity "
-                                    "against its metal.\n\n"
-                                    "Write 250-350 words covering:\n"
-                                    "1. What actually moved — and for each notable move, "
-                                    "whether it was the metal or the dollar. The "
-                                    "decomposition is given; use it rather than assuming.\n"
-                                    "2. What the ratios say about the regime, one at a "
-                                    "time. Do not blend them into a verdict.\n"
-                                    "3. Where the complex is concentrated — a cluster is "
-                                    "one position held several times, and worth saying "
-                                    "plainly.\n"
-                                    "4. Whether the miners confirm or contradict their "
-                                    "metal, and what that would imply about costs.\n\n"
-                                    "Quote the numbers you rely on. Do not forecast a "
-                                    "price. If the argument needs something absent from "
-                                    "the payload — inventories, flows, supply — say so "
-                                    "rather than supplying it from memory."
-                                )
-                                st.markdown(ai_agent.complete(
-                                    sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=8000, effort="medium"))
-                            except Exception as _e:
-                                st.error(f"Model call failed: {_e}")
+                # ---------------- desk read ----------------
+                with mtt5:
+                    st.caption(
+                        "Reads the measured figures above. It has no inventory "
+                        "data, no mine supply, no positioning — say so if the "
+                        "question needs them."
+                    )
+                    if st.button("▶ Read the metals complex", type="primary",
+                                 key="mt_ai"):
+                        _err = ai_unavailable("read")
+                        if _err:
+                            st.error(f"AI read unavailable: {_err}.")
+                        else:
+                            with st.spinner("Reading…"):
+                                try:
+                                    fx_px, _ = fx_load_prices()
+                                    uv = (fxa.usd_values(fx_px)
+                                          if _HAS_FXA and not fx_px.empty else pd.DataFrame())
+                                    bd = mtl.board(mt_px)
+                                    rt = mtl.ratio_table(mt_px)
+                                    ctx = {
+                                        "window": mt_window,
+                                        "board": (bd.drop(columns=["note"], errors="ignore")
+                                                  .reset_index().to_dict("records")),
+                                        "themes": mtl.board(mt_px, mtl.THEMES)
+                                                  .reset_index().to_dict("records"),
+                                        "ratios": (rt.drop(columns=["asks"], errors="ignore")
+                                                   .reset_index().to_dict("records")),
+                                        "decomposition": {
+                                            name: {k: v for k, v in
+                                                   mtl.in_currencies(
+                                                       mt_px[m.yahoo], uv, days=win).items()
+                                                   if k != "per_currency"}
+                                            for name, m in mtl.METALS.items()
+                                            if m.yahoo in mt_px.columns and not uv.empty},
+                                        "driver_correlations":
+                                            mtl.driver_betas(mt_px, window=corr_win)
+                                            .reset_index().to_dict("records"),
+                                        "clusters": mtl.clustered(
+                                            mtl.correlations(
+                                                mt_px,
+                                                {m.name: m.yahoo for m in mtl.METALS.values()},
+                                                window=corr_win), 0.7),
+                                        "miners": mtl.miner_spread(mt_px, window=win)
+                                                  .reset_index().to_dict("records"),
+                                        "caveats": [
+                                            "Decomposition splits a dollar-quoted move into "
+                                            "the metal's part and the dollar's, using the "
+                                            "median return across currencies.",
+                                            "Ratio percentiles run from 2000 at the earliest "
+                                            "— as far back as these futures go.",
+                                            "No inventory, mine supply, ETF flow or "
+                                            "positioning data is in this payload.",
+                                        ],
+                                    }
+                                    sysmsg = (
+                                        "You are a commodities strategist writing the metals "
+                                        "section of a morning note. You are given prices and "
+                                        "returns, the split of each metal's move into the "
+                                        "metal's part and the dollar's, the classic ratios "
+                                        "against their own history, correlations to macro "
+                                        "drivers, correlation clusters, and mining equity "
+                                        "against its metal.\n\n"
+                                        "Write 250-350 words covering:\n"
+                                        "1. What actually moved — and for each notable move, "
+                                        "whether it was the metal or the dollar. The "
+                                        "decomposition is given; use it rather than assuming.\n"
+                                        "2. What the ratios say about the regime, one at a "
+                                        "time. Do not blend them into a verdict.\n"
+                                        "3. Where the complex is concentrated — a cluster is "
+                                        "one position held several times, and worth saying "
+                                        "plainly.\n"
+                                        "4. Whether the miners confirm or contradict their "
+                                        "metal, and what that would imply about costs.\n\n"
+                                        "Quote the numbers you rely on. Do not forecast a "
+                                        "price. If the argument needs something absent from "
+                                        "the payload — inventories, flows, supply — say so "
+                                        "rather than supplying it from memory."
+                                    )
+                                    st.markdown(ai_agent.complete(
+                                        sysmsg, json.dumps(ctx, indent=1, default=str),
+                                        max_tokens=8000, effort="medium"))
+                                except Exception as _e:
+                                    st.error(f"Model call failed: {_e}")
+    else:
+        locked_tab("metals")
 
 # ============================== CRYPTO ==============================
 
@@ -6059,18 +6117,19 @@ def cr_load_macro():
 
 
 with tab_crypto:
-    if not _HAS_CRA:
-        st.error(f"Crypto module failed to load: {_CRA_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "crypto"):
+        if not _HAS_CRA:
+            st.error(f"Crypto module failed to load: {_CRA_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CRYPTO</span>
         <span style="font-size:14px;color:#888;margin-left:12px">The complex · how much of it is bitcoin · who is already positioned</span>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("What this panel does, and how to read it", expanded=False):
-            st.markdown("""
+            with st.expander("What this panel does, and how to read it", expanded=False):
+                st.markdown("""
 Two facts shape almost everything a crypto book does, and neither is visible
 on a page of prices.
 
@@ -6108,163 +6167,163 @@ the asset class did. For deep single-coin work — regime, tail risk, Monte
 Carlo — the Quant Lab takes any Binance symbol directly.
             """)
 
-        cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
-        with cc1:
-            cr_size = st.selectbox("Universe size", [20, 30, 40, 60],
-                                   index=2, key="cr_size",
-                                   label_visibility="collapsed")
-        with cc2:
-            cr_win_label = st.radio("Window", ["90 days", "180 days", "1 year"],
-                                    index=1, horizontal=True, key="cr_win",
-                                    label_visibility="collapsed")
-        with cc3:
-            if st.button("🔄 Refresh", key="cr_refresh", use_container_width=True):
-                cr_load_market.clear()
-                cr_load_closes.clear()
-                cr_load_funding.clear()
-                st.rerun()
+            cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+            with cc1:
+                cr_size = st.selectbox("Universe size", [20, 30, 40, 60],
+                                       index=2, key="cr_size",
+                                       label_visibility="collapsed")
+            with cc2:
+                cr_win_label = st.radio("Window", ["90 days", "180 days", "1 year"],
+                                        index=1, horizontal=True, key="cr_win",
+                                        label_visibility="collapsed")
+            with cc3:
+                if st.button("🔄 Refresh", key="cr_refresh", use_container_width=True):
+                    cr_load_market.clear()
+                    cr_load_closes.clear()
+                    cr_load_funding.clear()
+                    st.rerun()
 
-        _CR_WIN = {"90 days": 90, "180 days": 180, "1 year": 365}
-        cr_win = _CR_WIN[cr_win_label]
+            _CR_WIN = {"90 days": 90, "180 days": 180, "1 year": 365}
+            cr_win = _CR_WIN[cr_win_label]
 
-        market, glob = cr_load_market(100)
-        tradable = cr_load_tradable()
+            market, glob = cr_load_market(100)
+            tradable = cr_load_tradable()
 
-        if market.empty:
-            st.error(
-                "CoinGecko returned no market data this run, so the universe "
-                "cannot be built. Nothing here is cached long enough to fall "
-                "back on — try Refresh in a minute."
-            )
-        elif not tradable:
-            st.error(
-                "Binance returned no tradable symbols this run. The board "
-                "needs them to know which coins it can price."
-            )
-        else:
-            universe = cra.build_universe(market, tradable, limit=int(cr_size))
-            syms = tuple(universe["binance_symbol"])
-            closes = cr_load_closes(syms, "1d", 500)
-
-            crt1, crt2, crt3, crt4, crt5 = st.tabs([
-                "📊 The board", "₿ How much is bitcoin?", "🎢 Positioning",
-                "🌐 Risk asset or hedge?", "🤖 Desk read"])
-
-            # ---------------- the board ----------------
-            with crt1:
-                if glob:
-                    g1, g2, g3, g4 = st.columns(4)
-                    g1.metric("Total market cap",
-                              f"${glob['total_mcap_usd']/1e9:,.0f}bn",
-                              f"{glob['mcap_chg_24h_pct']:+.1f}% 24h")
-                    g2.metric("24h volume",
-                              f"${glob['total_volume_usd']/1e9:,.0f}bn")
-                    btc_dom = glob.get("dominance", {}).get("BTC")
-                    if btc_dom is not None:
-                        g3.metric("Bitcoin dominance", f"{btc_dom:.1f}%",
-                                  help="Bitcoin's share of total crypto market "
-                                       "capitalisation. Rising dominance means "
-                                       "money concentrating in bitcoin, which "
-                                       "usually means the rest is bleeding.")
-                    eth_dom = glob.get("dominance", {}).get("ETH")
-                    if eth_dom is not None:
-                        g4.metric("Ethereum dominance", f"{eth_dom:.1f}%")
-
-                show = universe.copy()
-                show["Price"] = [
-                    (f"${p:,.2f}" if p and p >= 1 else f"${p:,.6f}".rstrip("0"))
-                    for p in show["price"]]
-                show["Mkt cap"] = show["market_cap"].map(
-                    lambda v: f"${v/1e9:,.1f}bn" if pd.notna(v) else "—")
-                for col, label in (("chg_24h", "24h"), ("chg_7d", "7d"),
-                                   ("chg_30d", "30d"), ("chg_1y", "1y")):
-                    show[label] = show[col].map(
-                        lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
-                show["From ATH"] = show["from_ath_pct"].map(
-                    lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
-                show["ATH set"] = show["ath_date"].fillna("—")
-
-                st.dataframe(
-                    show[["name", "rank", "Price", "Mkt cap", "24h", "7d",
-                          "30d", "1y", "From ATH", "ATH set"]]
-                    .rename(columns={"name": "Coin", "rank": "#"}),
-                    use_container_width=True, height=680)
-
-                st.caption(
-                    f"{len(universe)} coins — the largest by market "
-                    "capitalisation that Binance quotes in USDT, so every "
-                    "figure downstream comes from one venue. Stablecoins and "
-                    "tokenised gold are excluded. **From ATH** is the distance "
-                    "from the all-time high, which for most of this list is a "
-                    "different cycle rather than a different year."
+            if market.empty:
+                st.error(
+                    "CoinGecko returned no market data this run, so the universe "
+                    "cannot be built. Nothing here is cached long enough to fall "
+                    "back on — try Refresh in a minute."
                 )
+            elif not tradable:
+                st.error(
+                    "Binance returned no tradable symbols this run. The board "
+                    "needs them to know which coins it can price."
+                )
+            else:
+                universe = cra.build_universe(market, tradable, limit=int(cr_size))
+                syms = tuple(universe["binance_symbol"])
+                closes = cr_load_closes(syms, "1d", 500)
 
-                deep = universe[universe["from_ath_pct"].notna()]
-                if not deep.empty:
-                    worst = deep.nsmallest(3, "from_ath_pct")
-                    near = deep.nlargest(3, "from_ath_pct")
-                    st.markdown(
-                        "**Furthest from their highs:** "
-                        + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
-                                     for i, r in worst.iterrows())
-                        + "  \n**Closest to them:** "
-                        + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
-                                     for i, r in near.iterrows())
+                crt1, crt2, crt3, crt4, crt5 = st.tabs([
+                    "📊 The board", "₿ How much is bitcoin?", "🎢 Positioning",
+                    "🌐 Risk asset or hedge?", "🤖 Desk read"])
+
+                # ---------------- the board ----------------
+                with crt1:
+                    if glob:
+                        g1, g2, g3, g4 = st.columns(4)
+                        g1.metric("Total market cap",
+                                  f"${glob['total_mcap_usd']/1e9:,.0f}bn",
+                                  f"{glob['mcap_chg_24h_pct']:+.1f}% 24h")
+                        g2.metric("24h volume",
+                                  f"${glob['total_volume_usd']/1e9:,.0f}bn")
+                        btc_dom = glob.get("dominance", {}).get("BTC")
+                        if btc_dom is not None:
+                            g3.metric("Bitcoin dominance", f"{btc_dom:.1f}%",
+                                      help="Bitcoin's share of total crypto market "
+                                           "capitalisation. Rising dominance means "
+                                           "money concentrating in bitcoin, which "
+                                           "usually means the rest is bleeding.")
+                        eth_dom = glob.get("dominance", {}).get("ETH")
+                        if eth_dom is not None:
+                            g4.metric("Ethereum dominance", f"{eth_dom:.1f}%")
+
+                    show = universe.copy()
+                    show["Price"] = [
+                        (f"${p:,.2f}" if p and p >= 1 else f"${p:,.6f}".rstrip("0"))
+                        for p in show["price"]]
+                    show["Mkt cap"] = show["market_cap"].map(
+                        lambda v: f"${v/1e9:,.1f}bn" if pd.notna(v) else "—")
+                    for col, label in (("chg_24h", "24h"), ("chg_7d", "7d"),
+                                       ("chg_30d", "30d"), ("chg_1y", "1y")):
+                        show[label] = show[col].map(
+                            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+                    show["From ATH"] = show["from_ath_pct"].map(
+                        lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
+                    show["ATH set"] = show["ath_date"].fillna("—")
+
+                    st.dataframe(
+                        show[["name", "rank", "Price", "Mkt cap", "24h", "7d",
+                              "30d", "1y", "From ATH", "ATH set"]]
+                        .rename(columns={"name": "Coin", "rank": "#"}),
+                        use_container_width=True, height=680)
+
+                    st.caption(
+                        f"{len(universe)} coins — the largest by market "
+                        "capitalisation that Binance quotes in USDT, so every "
+                        "figure downstream comes from one venue. Stablecoins and "
+                        "tokenised gold are excluded. **From ATH** is the distance "
+                        "from the all-time high, which for most of this list is a "
+                        "different cycle rather than a different year."
                     )
 
-            # ---------------- how much is bitcoin ----------------
-            with crt2:
-                if closes.empty or "BTC" not in closes.columns:
-                    st.warning(
-                        "Binance returned no usable price history this run, so "
-                        "beta and correlation cannot be computed. The board "
-                        "above is unaffected — it comes from a different source."
-                    )
-                else:
-                    rel = cra.btc_relationship(closes, window=cr_win)
-                    if rel.empty:
-                        st.info(
-                            f"Not enough overlapping history over "
-                            f"{cr_win_label.lower()} to measure beta."
+                    deep = universe[universe["from_ath_pct"].notna()]
+                    if not deep.empty:
+                        worst = deep.nsmallest(3, "from_ath_pct")
+                        near = deep.nlargest(3, "from_ath_pct")
+                        st.markdown(
+                            "**Furthest from their highs:** "
+                            + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
+                                         for i, r in worst.iterrows())
+                            + "  \n**Closest to them:** "
+                            + " · ".join(f"{i} {r['from_ath_pct']:.0f}%"
+                                         for i, r in near.iterrows())
+                        )
+
+                # ---------------- how much is bitcoin ----------------
+                with crt2:
+                    if closes.empty or "BTC" not in closes.columns:
+                        st.warning(
+                            "Binance returned no usable price history this run, so "
+                            "beta and correlation cannot be computed. The board "
+                            "above is unaffected — it comes from a different source."
                         )
                     else:
-                        b1, b2, b3 = st.columns(3)
-                        b1.metric("Median beta to bitcoin",
-                                  f"{rel['beta'].median():.2f}",
-                                  help="How far the typical coin travels for a "
-                                       "given bitcoin move.")
-                        b2.metric("Median variance explained",
-                                  f"{rel['r2'].median()*100:.0f}%",
-                                  help="Share of the typical coin's movement "
-                                       "that bitcoin accounts for.")
-                        b3.metric("Coins over 50% explained",
-                                  f"{int((rel['r2'] > 0.5).sum())} of {len(rel)}")
+                        rel = cra.btc_relationship(closes, window=cr_win)
+                        if rel.empty:
+                            st.info(
+                                f"Not enough overlapping history over "
+                                f"{cr_win_label.lower()} to measure beta."
+                            )
+                        else:
+                            b1, b2, b3 = st.columns(3)
+                            b1.metric("Median beta to bitcoin",
+                                      f"{rel['beta'].median():.2f}",
+                                      help="How far the typical coin travels for a "
+                                           "given bitcoin move.")
+                            b2.metric("Median variance explained",
+                                      f"{rel['r2'].median()*100:.0f}%",
+                                      help="Share of the typical coin's movement "
+                                           "that bitcoin accounts for.")
+                            b3.metric("Coins over 50% explained",
+                                      f"{int((rel['r2'] > 0.5).sum())} of {len(rel)}")
 
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=rel["beta"], y=rel["r2"] * 100,
-                            mode="markers+text", text=rel.index,
-                            textposition="top center",
-                            textfont=dict(size=9, color="#888"),
-                            marker=dict(size=11, color=rel["corr"],
-                                        colorscale="RdBu", reversescale=True,
-                                        cmin=-1, cmax=1,
-                                        colorbar=dict(title="ρ", thickness=12)),
-                            hovertemplate="%{text}<br>beta %{x:.2f}"
-                                          "<br>%{y:.0f}% explained<extra></extra>"))
-                        fig.add_vline(x=1.0, line_dash="dot", line_color="#666",
-                                      annotation_text="moves 1:1 with bitcoin",
-                                      annotation_position="top right",
-                                      annotation_font=dict(size=10, color="#999"))
-                        fig.update_layout(
-                            height=460, template="plotly_dark",
-                            margin=dict(l=10, r=10, t=30, b=10),
-                            xaxis_title="Beta to bitcoin",
-                            yaxis_title="% of the coin's movement bitcoin explains",
-                            showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=rel["beta"], y=rel["r2"] * 100,
+                                mode="markers+text", text=rel.index,
+                                textposition="top center",
+                                textfont=dict(size=9, color="#888"),
+                                marker=dict(size=11, color=rel["corr"],
+                                            colorscale="RdBu", reversescale=True,
+                                            cmin=-1, cmax=1,
+                                            colorbar=dict(title="ρ", thickness=12)),
+                                hovertemplate="%{text}<br>beta %{x:.2f}"
+                                              "<br>%{y:.0f}% explained<extra></extra>"))
+                            fig.add_vline(x=1.0, line_dash="dot", line_color="#666",
+                                          annotation_text="moves 1:1 with bitcoin",
+                                          annotation_position="top right",
+                                          annotation_font=dict(size=10, color="#999"))
+                            fig.update_layout(
+                                height=460, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                xaxis_title="Beta to bitcoin",
+                                yaxis_title="% of the coin's movement bitcoin explains",
+                                showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
 
-                        st.markdown("""
+                            st.markdown("""
 **Read the vertical axis first.** Beta says how far a coin travels; the
 variance explained says whether anything other than bitcoin is happening to
 it at all. A coin high on this axis is a bitcoin position with a different
@@ -6277,100 +6336,100 @@ provide. A high beta with negative excess is the worst of the arrangement —
 the full ride down, less of the ride up.
                         """)
 
-                        rshow = rel.copy()
-                        rshow["Beta"] = rshow["beta"].map(lambda v: f"{v:.2f}")
-                        rshow["Correlation"] = rshow["corr"].map(lambda v: f"{v:.2f}")
-                        rshow["Explained"] = rshow["r2"].map(lambda v: f"{v*100:.0f}%")
-                        rshow["Excess"] = rshow["excess_pct"].map(
-                            lambda v: f"{v:+.0f}%" if pd.notna(v) else "—")
-                        st.dataframe(
-                            rshow[["Beta", "Correlation", "Explained", "Excess"]],
-                            use_container_width=True, height=420)
+                            rshow = rel.copy()
+                            rshow["Beta"] = rshow["beta"].map(lambda v: f"{v:.2f}")
+                            rshow["Correlation"] = rshow["corr"].map(lambda v: f"{v:.2f}")
+                            rshow["Explained"] = rshow["r2"].map(lambda v: f"{v*100:.0f}%")
+                            rshow["Excess"] = rshow["excess_pct"].map(
+                                lambda v: f"{v:+.0f}%" if pd.notna(v) else "—")
+                            st.dataframe(
+                                rshow[["Beta", "Correlation", "Explained", "Excess"]],
+                                use_container_width=True, height=420)
 
-                        groups = cra.clusters(closes, 0.8, cr_win)
-                        if groups:
-                            st.warning(
-                                "Moving as one at |ρ| ≥ 0.8:\n\n"
-                                + "\n\n".join(" · ".join(g) for g in groups)
-                                + "\n\nHeld separately these look like "
-                                  "diversification and behave like size. The "
-                                  "threshold here is 0.8 rather than the 0.7 "
-                                  "used elsewhere in the app, because crypto "
-                                  "correlations sit high as a matter of course "
-                                  "and a lower bar would return the whole list."
-                            )
-                        else:
-                            st.info(
-                                f"No pair is correlated above 0.8 over "
-                                f"{cr_win_label.lower()} — unusual for this "
-                                "asset class, and worth a second look at "
-                                "whether the window is capturing a regime break."
-                            )
+                            groups = cra.clusters(closes, 0.8, cr_win)
+                            if groups:
+                                st.warning(
+                                    "Moving as one at |ρ| ≥ 0.8:\n\n"
+                                    + "\n\n".join(" · ".join(g) for g in groups)
+                                    + "\n\nHeld separately these look like "
+                                      "diversification and behave like size. The "
+                                      "threshold here is 0.8 rather than the 0.7 "
+                                      "used elsewhere in the app, because crypto "
+                                      "correlations sit high as a matter of course "
+                                      "and a lower bar would return the whole list."
+                                )
+                            else:
+                                st.info(
+                                    f"No pair is correlated above 0.8 over "
+                                    f"{cr_win_label.lower()} — unusual for this "
+                                    "asset class, and worth a second look at "
+                                    "whether the window is capturing a regime break."
+                                )
 
-                        alt = cra.alt_index(closes, window=cr_win)
-                        if not alt.empty:
-                            st.markdown("##### Bitcoin against the rest")
-                            fig2 = go.Figure()
-                            for col, colour, width in (
-                                    (alt.columns[0], "#f7931a", 2.6),
-                                    (alt.columns[1], "#42a5f5", 2.0)):
-                                fig2.add_trace(go.Scatter(
-                                    x=alt.index, y=alt[col], name=col,
-                                    line=dict(color=colour, width=width),
-                                    hovertemplate=f"{col} %{{y:.0f}}<extra></extra>"))
-                            fig2.update_layout(
-                                height=340, template="plotly_dark",
-                                margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title=f"Rebased to 100 at {alt.index[0].date()}",
-                                legend=dict(orientation="h", y=1.14, x=0),
-                                hovermode="x unified")
-                            st.plotly_chart(fig2, use_container_width=True)
-                            st.caption(
-                                "The median of the rest, not the average. One "
-                                "coin up twentyfold — there is usually one — "
-                                "carries a mean of thirty on its own and turns "
-                                "the chart into a report on that single "
-                                "position. The median is the typical coin, "
-                                "which is what the question is about."
-                            )
+                            alt = cra.alt_index(closes, window=cr_win)
+                            if not alt.empty:
+                                st.markdown("##### Bitcoin against the rest")
+                                fig2 = go.Figure()
+                                for col, colour, width in (
+                                        (alt.columns[0], "#f7931a", 2.6),
+                                        (alt.columns[1], "#42a5f5", 2.0)):
+                                    fig2.add_trace(go.Scatter(
+                                        x=alt.index, y=alt[col], name=col,
+                                        line=dict(color=colour, width=width),
+                                        hovertemplate=f"{col} %{{y:.0f}}<extra></extra>"))
+                                fig2.update_layout(
+                                    height=340, template="plotly_dark",
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    yaxis_title=f"Rebased to 100 at {alt.index[0].date()}",
+                                    legend=dict(orientation="h", y=1.14, x=0),
+                                    hovermode="x unified")
+                                st.plotly_chart(fig2, use_container_width=True)
+                                st.caption(
+                                    "The median of the rest, not the average. One "
+                                    "coin up twentyfold — there is usually one — "
+                                    "carries a mean of thirty on its own and turns "
+                                    "the chart into a report on that single "
+                                    "position. The median is the typical coin, "
+                                    "which is what the question is about."
+                                )
 
-            # ---------------- positioning ----------------
-            with crt3:
-                funding = cr_load_funding(syms)
-                if funding.empty:
-                    st.warning(
-                        "Binance futures did not respond this run, so funding "
-                        "and open interest are unavailable. This is the one "
-                        "panel in the app with real positioning data, and "
-                        "there is no substitute for it — the rest of the tab "
-                        "is unaffected."
-                    )
-                else:
-                    f1, f2, f3 = st.columns(3)
-                    f1.metric("Median funding, annualised",
-                              f"{funding['funding_annual_pct'].median():+.1f}%")
-                    f2.metric("Paying to be long",
-                              f"{int((funding['funding_annual_pct'] > 0).sum())} "
-                              f"of {len(funding)}")
-                    f3.metric("Paying to be short",
-                              f"{int((funding['funding_annual_pct'] < 0).sum())} "
-                              f"of {len(funding)}")
+                # ---------------- positioning ----------------
+                with crt3:
+                    funding = cr_load_funding(syms)
+                    if funding.empty:
+                        st.warning(
+                            "Binance futures did not respond this run, so funding "
+                            "and open interest are unavailable. This is the one "
+                            "panel in the app with real positioning data, and "
+                            "there is no substitute for it — the rest of the tab "
+                            "is unaffected."
+                        )
+                    else:
+                        f1, f2, f3 = st.columns(3)
+                        f1.metric("Median funding, annualised",
+                                  f"{funding['funding_annual_pct'].median():+.1f}%")
+                        f2.metric("Paying to be long",
+                                  f"{int((funding['funding_annual_pct'] > 0).sum())} "
+                                  f"of {len(funding)}")
+                        f3.metric("Paying to be short",
+                                  f"{int((funding['funding_annual_pct'] < 0).sum())} "
+                                  f"of {len(funding)}")
 
-                    fs = funding.sort_values("funding_annual_pct")
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(
-                        x=fs["funding_annual_pct"], y=fs.index, orientation="h",
-                        marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
-                                           for v in fs["funding_annual_pct"]]),
-                        hovertemplate="%{y}: %{x:+.1f}% annualised<extra></extra>"))
-                    fig.update_layout(
-                        height=max(360, 16 * len(fs)), template="plotly_dark",
-                        margin=dict(l=10, r=30, t=30, b=10),
-                        xaxis_title="Perpetual funding, annualised (%)",
-                        showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                        fs = funding.sort_values("funding_annual_pct")
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(
+                            x=fs["funding_annual_pct"], y=fs.index, orientation="h",
+                            marker=dict(color=["#ef5350" if v < 0 else "#26a69a"
+                                               for v in fs["funding_annual_pct"]]),
+                            hovertemplate="%{y}: %{x:+.1f}% annualised<extra></extra>"))
+                        fig.update_layout(
+                            height=max(360, 16 * len(fs)), template="plotly_dark",
+                            margin=dict(l=10, r=30, t=30, b=10),
+                            xaxis_title="Perpetual funding, annualised (%)",
+                            showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
 
-                    st.markdown("""
+                        st.markdown("""
 **What this is.** A perpetual future has no expiry, so nothing drags it back
 to spot except a payment made every eight hours by whichever side is pushing
 the price away from it. Positive means longs pay shorts — the market is paying
@@ -6388,102 +6447,102 @@ who is already in and what a reversal would have to unwind — which is a
 different and more durable thing than a direction.
                     """)
 
-                    st.markdown("##### One coin's funding through time")
-                    fh_pick = st.selectbox(
-                        "Coin", list(universe.index), key="cr_funding_pick")
-                    fh = cr_load_funding_history(f"{fh_pick}USDT", 200)
-                    if fh.empty:
-                        st.info(f"No funding history returned for {fh_pick}.")
-                    else:
-                        fig3 = go.Figure()
-                        fig3.add_trace(go.Scatter(
-                            x=fh.index, y=fh.values, mode="lines",
-                            line=dict(color="#42a5f5", width=1.4),
-                            hovertemplate="%{x|%d %b}<br>%{y:+.1f}%<extra></extra>"))
-                        fig3.add_hline(y=0, line_dash="dot", line_color="#666")
-                        fig3.update_layout(
-                            height=300, template="plotly_dark",
-                            margin=dict(l=10, r=10, t=30, b=10),
-                            yaxis_title="Annualised funding (%)",
-                            showlegend=False)
-                        st.plotly_chart(fig3, use_container_width=True)
-                        st.caption(
-                            f"{len(fh)} payments, {fh.index.min().date()} to "
-                            f"{fh.index.max().date()} — mean {fh.mean():+.1f}%, "
-                            f"highest {fh.max():+.1f}%, lowest {fh.min():+.1f}%. "
-                            "A single elevated print is noise; the same print "
-                            "held for weeks is a crowd."
-                        )
+                        st.markdown("##### One coin's funding through time")
+                        fh_pick = st.selectbox(
+                            "Coin", list(universe.index), key="cr_funding_pick")
+                        fh = cr_load_funding_history(f"{fh_pick}USDT", 200)
+                        if fh.empty:
+                            st.info(f"No funding history returned for {fh_pick}.")
+                        else:
+                            fig3 = go.Figure()
+                            fig3.add_trace(go.Scatter(
+                                x=fh.index, y=fh.values, mode="lines",
+                                line=dict(color="#42a5f5", width=1.4),
+                                hovertemplate="%{x|%d %b}<br>%{y:+.1f}%<extra></extra>"))
+                            fig3.add_hline(y=0, line_dash="dot", line_color="#666")
+                            fig3.update_layout(
+                                height=300, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title="Annualised funding (%)",
+                                showlegend=False)
+                            st.plotly_chart(fig3, use_container_width=True)
+                            st.caption(
+                                f"{len(fh)} payments, {fh.index.min().date()} to "
+                                f"{fh.index.max().date()} — mean {fh.mean():+.1f}%, "
+                                f"highest {fh.max():+.1f}%, lowest {fh.min():+.1f}%. "
+                                "A single elevated print is noise; the same print "
+                                "held for weeks is a crowd."
+                            )
 
-                    marks = tuple(funding["mark_price"].dropna().items())
-                    oi = cr_load_oi(syms[:15], marks)
-                    if not oi.empty and oi["open_interest_usd"].notna().any():
-                        st.markdown("##### Open interest")
-                        oshow = oi[oi["open_interest_usd"].notna()].copy()
-                        oshow["Notional"] = oshow["open_interest_usd"].map(
-                            lambda v: f"${v/1e9:,.2f}bn" if v >= 1e9
-                            else f"${v/1e6:,.0f}m")
-                        oshow["Contracts"] = oshow["open_interest_coins"].map(
-                            lambda v: f"{v:,.0f}")
-                        st.dataframe(oshow[["Notional", "Contracts"]],
-                                     use_container_width=True, height=300)
-                        st.caption(
-                            "Ranked on notional, because contracts are not "
-                            "comparable across coins — a hundred thousand "
-                            "bitcoin and three hundred million XRP differ by a "
-                            "factor of three thousand in coins and about two "
-                            "in dollars. Open interest counts positions still "
-                            "open, so it measures committed capital rather "
-                            "than turnover: rising with price is new money, "
-                            "falling with a rising price is shorts closing, "
-                            "and the two imply opposite things about what "
-                            "happens when the move stalls."
-                        )
+                        marks = tuple(funding["mark_price"].dropna().items())
+                        oi = cr_load_oi(syms[:15], marks)
+                        if not oi.empty and oi["open_interest_usd"].notna().any():
+                            st.markdown("##### Open interest")
+                            oshow = oi[oi["open_interest_usd"].notna()].copy()
+                            oshow["Notional"] = oshow["open_interest_usd"].map(
+                                lambda v: f"${v/1e9:,.2f}bn" if v >= 1e9
+                                else f"${v/1e6:,.0f}m")
+                            oshow["Contracts"] = oshow["open_interest_coins"].map(
+                                lambda v: f"{v:,.0f}")
+                            st.dataframe(oshow[["Notional", "Contracts"]],
+                                         use_container_width=True, height=300)
+                            st.caption(
+                                "Ranked on notional, because contracts are not "
+                                "comparable across coins — a hundred thousand "
+                                "bitcoin and three hundred million XRP differ by a "
+                                "factor of three thousand in coins and about two "
+                                "in dollars. Open interest counts positions still "
+                                "open, so it measures committed capital rather "
+                                "than turnover: rising with price is new money, "
+                                "falling with a rising price is shorts closing, "
+                                "and the two imply opposite things about what "
+                                "happens when the move stalls."
+                            )
 
-            # ---------------- risk asset or hedge ----------------
-            with crt4:
-                macro = cr_load_macro()
-                if closes.empty or "BTC" not in closes.columns or macro.empty:
-                    st.info(
-                        "Either the bitcoin history or the reference assets "
-                        "were unavailable this run, so the comparison cannot "
-                        "be drawn."
-                    )
-                else:
-                    mc = cra.macro_correlation(closes["BTC"], macro, window=90)
-                    if not mc.get("available"):
+                # ---------------- risk asset or hedge ----------------
+                with crt4:
+                    macro = cr_load_macro()
+                    if closes.empty or "BTC" not in closes.columns or macro.empty:
                         st.info(
-                            "Not enough overlapping history between bitcoin "
-                            "and the reference assets to compute a rolling "
-                            "correlation."
+                            "Either the bitcoin history or the reference assets "
+                            "were unavailable this run, so the comparison cannot "
+                            "be drawn."
                         )
                     else:
-                        latest = mc["latest"]
-                        cols = st.columns(len(latest) + (1 if "reading" in mc else 0))
-                        for col, (label, val) in zip(cols, latest.items()):
-                            col.metric(f"vs {label}", f"{val:+.2f}")
-                        if "reading" in mc:
-                            cols[-1].metric("Reading", mc["reading"].replace(
-                                "trading as ", ""))
+                        mc = cra.macro_correlation(closes["BTC"], macro, window=90)
+                        if not mc.get("available"):
+                            st.info(
+                                "Not enough overlapping history between bitcoin "
+                                "and the reference assets to compute a rolling "
+                                "correlation."
+                            )
+                        else:
+                            latest = mc["latest"]
+                            cols = st.columns(len(latest) + (1 if "reading" in mc else 0))
+                            for col, (label, val) in zip(cols, latest.items()):
+                                col.metric(f"vs {label}", f"{val:+.2f}")
+                            if "reading" in mc:
+                                cols[-1].metric("Reading", mc["reading"].replace(
+                                    "trading as ", ""))
 
-                        fig = go.Figure()
-                        palette = {"NASDAQ 100": "#42a5f5", "Gold": "#ffb300",
-                                   "Dollar index": "#26a69a", "S&P 500": "#ab47bc"}
-                        for col in mc["series"].columns:
-                            fig.add_trace(go.Scatter(
-                                x=mc["series"].index, y=mc["series"][col],
-                                name=col, line=dict(width=1.8,
-                                                    color=palette.get(col))))
-                        fig.add_hline(y=0, line_dash="dot", line_color="#666")
-                        fig.update_layout(
-                            height=420, template="plotly_dark",
-                            margin=dict(l=10, r=10, t=30, b=10),
-                            yaxis_title="90-day rolling correlation with bitcoin",
-                            legend=dict(orientation="h", y=1.14, x=0),
-                            hovermode="x unified")
-                        st.plotly_chart(fig, use_container_width=True)
+                            fig = go.Figure()
+                            palette = {"NASDAQ 100": "#42a5f5", "Gold": "#ffb300",
+                                       "Dollar index": "#26a69a", "S&P 500": "#ab47bc"}
+                            for col in mc["series"].columns:
+                                fig.add_trace(go.Scatter(
+                                    x=mc["series"].index, y=mc["series"][col],
+                                    name=col, line=dict(width=1.8,
+                                                        color=palette.get(col))))
+                            fig.add_hline(y=0, line_dash="dot", line_color="#666")
+                            fig.update_layout(
+                                height=420, template="plotly_dark",
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title="90-day rolling correlation with bitcoin",
+                                legend=dict(orientation="h", y=1.14, x=0),
+                                hovermode="x unified")
+                            st.plotly_chart(fig, use_container_width=True)
 
-                        st.markdown("""
+                            st.markdown("""
 **The oldest argument about bitcoin, measured.** It is described as two
 incompatible things — a long-duration risk asset that trades with the Nasdaq,
 and a monetary hedge that trades with gold. Both camps can point at periods
@@ -6500,93 +6559,95 @@ would insert two artificially flat days a week into the reference and drag
 every correlation toward zero.
                         """)
 
-            # ---------------- desk read ----------------
-            with crt5:
-                st.caption(
-                    "Reads the measured figures above. It has no on-chain "
-                    "data, no exchange flows and no order book — say so if the "
-                    "question needs them."
-                )
-                if st.button("▶ Read the crypto complex", type="primary",
-                             key="cr_ai"):
-                    _err = ai_unavailable()
-                    if _err:
-                        st.error(f"AI read unavailable: {_err}.")
-                    else:
-                        with st.spinner("Reading…"):
-                            try:
-                                rel = (cra.btc_relationship(closes, window=cr_win)
-                                       if not closes.empty else pd.DataFrame())
-                                funding = cr_load_funding(syms)
-                                macro = cr_load_macro()
-                                mc = (cra.macro_correlation(closes["BTC"], macro, 90)
-                                      if (not closes.empty and "BTC" in closes.columns
-                                          and not macro.empty) else {})
-                                ctx = {
-                                    "window": cr_win_label,
-                                    "global": glob,
-                                    "board": universe.drop(
-                                        columns=["binance_symbol",
-                                                 "tokenised_commodity"],
-                                        errors="ignore").reset_index().to_dict("records"),
-                                    "vs_bitcoin": (rel.reset_index().to_dict("records")
-                                                   if not rel.empty else []),
-                                    "clusters": cra.clusters(closes, 0.8, cr_win)
-                                                if not closes.empty else [],
-                                    "funding_annualised": (
-                                        funding[["funding_annual_pct"]]
-                                        .reset_index().to_dict("records")
-                                        if not funding.empty else []),
-                                    "macro_correlation": {
-                                        k: v for k, v in mc.items()
-                                        if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                    "caveats": [
-                                        "Funding is positioning, not a signal. It has "
-                                        "stayed expensive through whole trends and "
-                                        "turned negative at the bottom of them.",
-                                        "Annualised funding multiplies an eight-hour "
-                                        "payment out to a year; nobody earns it for a "
-                                        "year. Coins sharing an identical figure are "
-                                        "showing the exchange's baseline rate.",
-                                        "Stablecoins and tokenised gold are excluded "
-                                        "from the universe.",
-                                        "No on-chain data, exchange flows, order book "
-                                        "or liquidation data is in this payload.",
-                                    ],
-                                }
-                                sysmsg = (
-                                    "You are a crypto strategist writing the digital "
-                                    "assets section of a morning note for a macro "
-                                    "desk. You are given the market board with each "
-                                    "coin's distance from its all-time high, each "
-                                    "coin's beta and variance explained against "
-                                    "bitcoin, the correlation clusters, perpetual "
-                                    "funding rates, and bitcoin's rolling correlation "
-                                    "to equities and gold.\n\n"
-                                    "Write 250-350 words covering:\n"
-                                    "1. What moved, and how much of it was simply "
-                                    "bitcoin. Use the variance-explained figures "
-                                    "rather than assuming.\n"
-                                    "2. Where the complex is concentrated — name the "
-                                    "clusters plainly, since holding them separately "
-                                    "looks like diversification and behaves like "
-                                    "size.\n"
-                                    "3. What funding says about who is already "
-                                    "positioned, and what a reversal would have to "
-                                    "unwind. Do not treat it as a direction.\n"
-                                    "4. Whether bitcoin is currently trading as a risk "
-                                    "asset or as a hedge, quoting both correlations.\n\n"
-                                    "Quote the numbers you rely on. Do not forecast a "
-                                    "price. If the argument needs something absent "
-                                    "from the payload — flows, on-chain, "
-                                    "liquidations — say so rather than supplying it "
-                                    "from memory."
-                                )
-                                st.markdown(ai_agent.complete(
-                                    sysmsg, json.dumps(ctx, indent=1, default=str),
-                                    max_tokens=8000, effort="medium"))
-                            except Exception as _e:
-                                st.error(f"Model call failed: {_e}")
+                # ---------------- desk read ----------------
+                with crt5:
+                    st.caption(
+                        "Reads the measured figures above. It has no on-chain "
+                        "data, no exchange flows and no order book — say so if the "
+                        "question needs them."
+                    )
+                    if st.button("▶ Read the crypto complex", type="primary",
+                                 key="cr_ai"):
+                        _err = ai_unavailable("read")
+                        if _err:
+                            st.error(f"AI read unavailable: {_err}.")
+                        else:
+                            with st.spinner("Reading…"):
+                                try:
+                                    rel = (cra.btc_relationship(closes, window=cr_win)
+                                           if not closes.empty else pd.DataFrame())
+                                    funding = cr_load_funding(syms)
+                                    macro = cr_load_macro()
+                                    mc = (cra.macro_correlation(closes["BTC"], macro, 90)
+                                          if (not closes.empty and "BTC" in closes.columns
+                                              and not macro.empty) else {})
+                                    ctx = {
+                                        "window": cr_win_label,
+                                        "global": glob,
+                                        "board": universe.drop(
+                                            columns=["binance_symbol",
+                                                     "tokenised_commodity"],
+                                            errors="ignore").reset_index().to_dict("records"),
+                                        "vs_bitcoin": (rel.reset_index().to_dict("records")
+                                                       if not rel.empty else []),
+                                        "clusters": cra.clusters(closes, 0.8, cr_win)
+                                                    if not closes.empty else [],
+                                        "funding_annualised": (
+                                            funding[["funding_annual_pct"]]
+                                            .reset_index().to_dict("records")
+                                            if not funding.empty else []),
+                                        "macro_correlation": {
+                                            k: v for k, v in mc.items()
+                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                        "caveats": [
+                                            "Funding is positioning, not a signal. It has "
+                                            "stayed expensive through whole trends and "
+                                            "turned negative at the bottom of them.",
+                                            "Annualised funding multiplies an eight-hour "
+                                            "payment out to a year; nobody earns it for a "
+                                            "year. Coins sharing an identical figure are "
+                                            "showing the exchange's baseline rate.",
+                                            "Stablecoins and tokenised gold are excluded "
+                                            "from the universe.",
+                                            "No on-chain data, exchange flows, order book "
+                                            "or liquidation data is in this payload.",
+                                        ],
+                                    }
+                                    sysmsg = (
+                                        "You are a crypto strategist writing the digital "
+                                        "assets section of a morning note for a macro "
+                                        "desk. You are given the market board with each "
+                                        "coin's distance from its all-time high, each "
+                                        "coin's beta and variance explained against "
+                                        "bitcoin, the correlation clusters, perpetual "
+                                        "funding rates, and bitcoin's rolling correlation "
+                                        "to equities and gold.\n\n"
+                                        "Write 250-350 words covering:\n"
+                                        "1. What moved, and how much of it was simply "
+                                        "bitcoin. Use the variance-explained figures "
+                                        "rather than assuming.\n"
+                                        "2. Where the complex is concentrated — name the "
+                                        "clusters plainly, since holding them separately "
+                                        "looks like diversification and behaves like "
+                                        "size.\n"
+                                        "3. What funding says about who is already "
+                                        "positioned, and what a reversal would have to "
+                                        "unwind. Do not treat it as a direction.\n"
+                                        "4. Whether bitcoin is currently trading as a risk "
+                                        "asset or as a hedge, quoting both correlations.\n\n"
+                                        "Quote the numbers you rely on. Do not forecast a "
+                                        "price. If the argument needs something absent "
+                                        "from the payload — flows, on-chain, "
+                                        "liquidations — say so rather than supplying it "
+                                        "from memory."
+                                    )
+                                    st.markdown(ai_agent.complete(
+                                        sysmsg, json.dumps(ctx, indent=1, default=str),
+                                        max_tokens=8000, effort="medium"))
+                                except Exception as _e:
+                                    st.error(f"Model call failed: {_e}")
+    else:
+        locked_tab("crypto")
 
 
 # -------- FUNDAMENTALS TAB --------
@@ -6641,18 +6702,19 @@ def fund_pct_badge(p: Optional[float], directional: bool) -> str:
 
 
 with tab_fund:
-    if not _HAS_FUND:
-        st.error(f"Fundamentals module failed to load: {_FUND_IMPORT_ERROR}")
-    else:
-        st.markdown("""
+    if access.tab_open(current_user(), "fund"):
+        if not _HAS_FUND:
+            st.error(f"Fundamentals module failed to load: {_FUND_IMPORT_ERROR}")
+        else:
+            st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">FUNDAMENTALS</span>
         <span style="font-size:14px;color:#888;margin-left:12px">Valuation · Profitability · Growth · Balance sheet — always vs sector</span>
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("What this panel does, and how to read it", expanded=False):
-            st.markdown("""
+            with st.expander("What this panel does, and how to read it", expanded=False):
+                st.markdown("""
 Every other panel in this app measures **price**. This one measures the
 business underneath it.
 
@@ -6692,470 +6754,478 @@ estimates, which skew optimistic. Financials and REITs are not comparable to
 industrials on P/B or EV/EBITDA, so read them against their own sector only.
             """)
 
-        fc1, fc2, fc3 = st.columns([2, 1.4, 1])
-        with fc1:
-            fund_query = st.text_input(
-                "Company", value="AAPL", key="fund_query",
-                placeholder="Ticker or name — AAPL, Microsoft, JPM",
-                label_visibility="collapsed")
-        with fc2:
-            fund_sector_override = st.selectbox(
-                "Compare against", ["Own sector"] + (
-                    sorted(dl.universe_sector_counts().keys()) if _HAS_AGENT else []),
-                key="fund_sector", label_visibility="collapsed")
-        with fc3:
-            fund_run = st.button("▶ Analyse", type="primary", key="fund_run",
-                                 use_container_width=True)
+            fc1, fc2, fc3 = st.columns([2, 1.4, 1])
+            with fc1:
+                fund_query = st.text_input(
+                    "Company", value="AAPL", key="fund_query",
+                    placeholder="Ticker or name — AAPL, Microsoft, JPM",
+                    label_visibility="collapsed")
+            with fc2:
+                fund_sector_override = st.selectbox(
+                    "Compare against", ["Own sector"] + (
+                        sorted(dl.universe_sector_counts().keys()) if _HAS_AGENT else []),
+                    key="fund_sector", label_visibility="collapsed")
+            with fc3:
+                fund_run = st.button("▶ Analyse", type="primary", key="fund_run",
+                                     use_container_width=True)
 
-        fund_sym = None
-        if fund_query.strip():
-            q = fund_query.strip()
-            try:
-                hits = dl.universe_search(q, limit=1) if _HAS_AGENT else []
-            except Exception:
-                hits = []
-            if hits:
-                fund_sym = hits[0]["symbol"]
-            else:
-                fund_sym = q.upper()
-
-        if not fund_sym:
-            st.info("Enter a ticker or company name.")
-        else:
-            with st.spinner(f"Loading {fund_sym} and its sector…"):
-                base = fund_fetch_info((fund_sym,))
-            if not base:
-                st.error(f"No fundamental data returned for **{fund_sym}**. "
-                         "Check the ticker, or the company may not report the fields "
-                         "this panel uses.")
-            else:
-                rec_raw = base[0]
-                rec = fnd.normalise(rec_raw)
-                sector = (fund_sector_override if fund_sector_override != "Own sector"
-                          else fnd.gics_sector(rec.get("sector")))
-
-                name = rec.get("longName") or rec.get("shortName") or fund_sym
-                st.markdown(f"### {name} · `{fund_sym}`")
-                meta = " · ".join(x for x in [rec.get("sector"), rec.get("industry")] if x)
-                if meta:
-                    st.caption(meta)
-
-                # ---- headline row ----
-                h1, h2, h3, h4, h5, h6 = st.columns(6)
-                mc = rec.get("marketCap")
-                h1.metric("Market cap", fnd.fmt_value(mc, "cur") if mc else "—")
-                h2.metric("P/E trailing", fnd.fmt_value(rec.get("trailingPE"), "x"))
-                h3.metric("P/E forward", fnd.fmt_value(rec.get("forwardPE"), "x"))
-                h4.metric("Net margin", fnd.fmt_value(rec.get("profitMargins"), "%"))
-                h5.metric("Revenue growth", fnd.fmt_value(rec.get("revenueGrowth"), "%"))
-                rp = fnd.range_position(rec)
-                h6.metric("52w range", f"{rp:.0f}%" if rp is not None else "—")
-
-                peers = pd.DataFrame()
-                if sector:
-                    syms = fund_sector_symbols(sector)
-                    if fund_sym not in syms:
-                        syms = [fund_sym] + syms
-                    with st.spinner(f"Loading {len(syms)} peers in {sector}…"):
-                        peer_rows = fund_fetch_info(tuple(syms))
-                    peers = fnd.peer_frame(peer_rows)
-
-                if peers.empty or fund_sym not in peers.index:
-                    st.warning(
-                        "No peer set available, so the metrics below have no sector "
-                        "context. The raw values are still shown, but a multiple "
-                        "without a comparison is close to uninformative."
-                    )
-                    show = pd.DataFrame([
-                        {"Metric": m.label, "Group": m.group,
-                         "Value": fnd.fmt_value(rec.get(m.key), m.fmt),
-                         "What it is": m.note}
-                        for m in fnd.METRICS])
-                    st.dataframe(show, use_container_width=True, hide_index=True)
+            fund_sym = None
+            if fund_query.strip():
+                q = fund_query.strip()
+                try:
+                    hits = dl.universe_search(q, limit=1) if _HAS_AGENT else []
+                except Exception:
+                    hits = []
+                if hits:
+                    fund_sym = hits[0]["symbol"]
                 else:
-                    cmp_df = fnd.compare_to_peers(fund_sym, peers)
-                    st.caption(f"Compared against **{len(peers)}** companies in "
-                               f"**{sector}**. Percentile: 100 = the favourable end.")
+                    fund_sym = q.upper()
 
-                    for grp in ["Valuation", "Profitability", "Growth",
-                                "Balance sheet", "Shareholder returns", "Market"]:
-                        sub = cmp_df[cmp_df["group"] == grp]
-                        if sub.empty:
-                            continue
-                        st.markdown(f"##### {grp}")
-                        disp = pd.DataFrame({
-                            "Metric": sub["metric"],
-                            fund_sym: [fnd.fmt_value(v, f) for v, f in
-                                       zip(sub["value"], sub["fmt"])],
-                            "Sector median": [fnd.fmt_value(v, f) for v, f in
-                                              zip(sub["peer_median"], sub["fmt"])],
-                            "Percentile": [fund_pct_badge(p, d) for p, d in
-                                           zip(sub["percentile"], sub["directional"])],
-                            "What it is": sub["note"],
-                        })
-                        st.dataframe(disp, use_container_width=True, hide_index=True)
+            if not fund_sym:
+                st.info("Enter a ticker or company name.")
+            else:
+                with st.spinner(f"Loading {fund_sym} and its sector…"):
+                    base = fund_fetch_info((fund_sym,))
+                if not base:
+                    st.error(f"No fundamental data returned for **{fund_sym}**. "
+                             "Check the ticker, or the company may not report the fields "
+                             "this panel uses.")
+                else:
+                    rec_raw = base[0]
+                    rec = fnd.normalise(rec_raw)
+                    sector = (fund_sector_override if fund_sector_override != "Own sector"
+                              else fnd.gics_sector(rec.get("sector")))
 
-                    # ---- DuPont ----
-                    dp = fnd.dupont(rec)
-                    if dp and dp.get("asset_turnover") is not None:
-                        st.markdown("---")
-                        st.markdown("##### DuPont — where the return on equity comes from")
-                        d1, d2, d3, d4 = st.columns(4)
-                        d1.metric("Return on equity", f"{dp['roe']:.1f}%")
-                        d2.metric("Net margin", f"{dp['net_margin']:.1f}%")
-                        d3.metric("Asset turnover", f"{dp['asset_turnover']:.2f}x")
-                        d4.metric("Equity multiplier", f"{dp['equity_multiplier']:.2f}x")
-                        st.caption(
-                            f"ROE {dp['roe']:.1f}% = margin {dp['net_margin']:.1f}% × "
-                            f"turnover {dp['asset_turnover']:.2f} × leverage "
-                            f"{dp['equity_multiplier']:.2f}. A return built on margin and "
-                            "turnover is earned by the business; one built on the leverage "
-                            "term is borrowed, and reverses hard when funding costs rise or "
-                            "revenue falls. Asset turnover is derived from the identity "
-                            "rather than reported directly, so it absorbs any inconsistency "
-                            "between the three inputs."
+                    name = rec.get("longName") or rec.get("shortName") or fund_sym
+                    st.markdown(f"### {name} · `{fund_sym}`")
+                    meta = " · ".join(x for x in [rec.get("sector"), rec.get("industry")] if x)
+                    if meta:
+                        st.caption(meta)
+
+                    # ---- headline row ----
+                    h1, h2, h3, h4, h5, h6 = st.columns(6)
+                    mc = rec.get("marketCap")
+                    h1.metric("Market cap", fnd.fmt_value(mc, "cur") if mc else "—")
+                    h2.metric("P/E trailing", fnd.fmt_value(rec.get("trailingPE"), "x"))
+                    h3.metric("P/E forward", fnd.fmt_value(rec.get("forwardPE"), "x"))
+                    h4.metric("Net margin", fnd.fmt_value(rec.get("profitMargins"), "%"))
+                    h5.metric("Revenue growth", fnd.fmt_value(rec.get("revenueGrowth"), "%"))
+                    rp = fnd.range_position(rec)
+                    h6.metric("52w range", f"{rp:.0f}%" if rp is not None else "—")
+
+                    peers = pd.DataFrame()
+                    if sector:
+                        syms = fund_sector_symbols(sector)
+                        if fund_sym not in syms:
+                            syms = [fund_sym] + syms
+                        with st.spinner(f"Loading {len(syms)} peers in {sector}…"):
+                            peer_rows = fund_fetch_info(tuple(syms))
+                        peers = fnd.peer_frame(peer_rows)
+
+                    if peers.empty or fund_sym not in peers.index:
+                        st.warning(
+                            "No peer set available, so the metrics below have no sector "
+                            "context. The raw values are still shown, but a multiple "
+                            "without a comparison is close to uninformative."
                         )
-
-                    # ---- observations ----
-                    flags = fnd.quality_flags(rec)
-                    if flags:
-                        st.markdown("---")
-                        st.markdown("##### Observations")
-                        for f in flags:
-                            (st.warning if f["level"] == "warn" else st.info)(f["text"])
-                        st.caption("Conditions worth explaining, not conclusions. Each "
-                                   "quotes the numbers it rests on so it can be checked.")
-
-                    # ---- valuation vs growth ----
-                    st.markdown("---")
-                    st.markdown("##### Valuation against growth — the sector map")
-                    scat = peers[["forwardPE", "revenueGrowth", "profitMargins",
-                                  "marketCap"]].copy()
-                    scat = scat.replace([np.inf, -np.inf], np.nan).dropna(
-                        subset=["forwardPE", "revenueGrowth"])
-                    scat = scat[(scat["forwardPE"] > 0) & (scat["forwardPE"] < 200)]
-                    if len(scat) >= 5:
-                        fig_v = go.Figure()
-                        others = scat.drop(index=fund_sym, errors="ignore")
-                        fig_v.add_trace(go.Scatter(
-                            x=others["revenueGrowth"], y=others["forwardPE"],
-                            mode="markers+text", text=others.index,
-                            textposition="top center", textfont=dict(size=9, color="#777"),
-                            marker=dict(size=9, color="#4488ff", opacity=0.75),
-                            name="Sector",
-                            hovertemplate="%{text}<br>growth %{x:.1f}%<br>fwd P/E %{y:.1f}x<extra></extra>"))
-                        if fund_sym in scat.index:
-                            me = scat.loc[[fund_sym]]
-                            fig_v.add_trace(go.Scatter(
-                                x=me["revenueGrowth"], y=me["forwardPE"],
-                                mode="markers+text", text=[fund_sym],
-                                textposition="top center",
-                                textfont=dict(size=12, color="#fff"),
-                                marker=dict(size=16, color="#00cc66",
-                                            line=dict(width=2, color="#fff")),
-                                name=fund_sym))
-                        fig_v.add_hline(y=float(scat["forwardPE"].median()),
-                                        line_dash="dash", line_color="#555",
-                                        annotation_text="sector median P/E")
-                        fig_v.add_vline(x=float(scat["revenueGrowth"].median()),
-                                        line_dash="dash", line_color="#555",
-                                        annotation_text="median growth")
-                        fig_v.update_layout(
-                            template="plotly_dark", height=480,
-                            margin=dict(l=0, r=0, t=44, b=0),
-                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                            xaxis_title="Revenue growth, year on year (%)",
-                            yaxis_title="Forward P/E (x)",
-                            legend=dict(orientation="h", y=1.12, x=0, xanchor="left"))
-                        fig_v.update_xaxes(gridcolor="#1a1a1a")
-                        fig_v.update_yaxes(gridcolor="#1a1a1a")
-                        st.plotly_chart(fig_v, use_container_width=True)
-                        st.caption(
-                            "Bottom-right is cheap for the growth, top-left is expensive "
-                            "without it. The quadrants are a starting question, not an "
-                            "answer: a company sits bottom-right either because the market "
-                            "has missed something or because it expects the growth to stop, "
-                            "and this chart cannot tell you which."
-                        )
-
-                    # ---- sector distribution ----
-                    with st.expander(f"{sector} — full distribution"):
-                        ss = fnd.sector_summary(peers)
-                        if not ss.empty:
-                            ss_disp = pd.DataFrame({
-                                "Metric": ss["metric"], "Group": ss["group"],
-                                "P25": [fnd.fmt_value(v, f) for v, f in zip(ss["p25"], ss["fmt"])],
-                                "Median": [fnd.fmt_value(v, f) for v, f in zip(ss["median"], ss["fmt"])],
-                                "P75": [fnd.fmt_value(v, f) for v, f in zip(ss["p75"], ss["fmt"])],
-                                "n": ss["n"]})
-                            st.dataframe(ss_disp, use_container_width=True, hide_index=True)
-                            st.caption("The spread between P25 and P75 says how much the "
-                                       "metric varies within this sector — a wide spread "
-                                       "means the median is a weak benchmark.")
-
-                # ---- AI read ----
-                if fund_run:
-                    _err = ai_unavailable()
-                    if _err:
-                        st.error(f"AI read unavailable: {_err}.")
+                        show = pd.DataFrame([
+                            {"Metric": m.label, "Group": m.group,
+                             "Value": fnd.fmt_value(rec.get(m.key), m.fmt),
+                             "What it is": m.note}
+                            for m in fnd.METRICS])
+                        st.dataframe(show, use_container_width=True, hide_index=True)
                     else:
-                        with st.spinner("Reading the fundamentals…"):
-                            try:
-                                ctx = {
-                                    "company": name, "symbol": fund_sym,
-                                    "sector": rec.get("sector"),
-                                    "industry": rec.get("industry"),
-                                    "metrics": {k: v for k, v in rec.items()
-                                                if not isinstance(v, (list, dict))},
-                                    "peer_comparison": (
-                                        fnd.compare_to_peers(fund_sym, peers)
-                                        .drop(columns=["note"]).to_dict("records")
-                                        if not peers.empty and fund_sym in peers.index else []),
-                                    "peer_count": int(len(peers)),
-                                    "dupont": fnd.dupont(rec),
-                                    "observations": [f["text"] for f in fnd.quality_flags(rec)],
-                                    "range_position_pct": fnd.range_position(rec),
-                                }
-                                fund_system = (
-                                    "You are an equity analyst writing a fundamental note for "
-                                    "portfolio managers. You are given one company's metrics, "
-                                    "its sector peer medians and percentiles, a DuPont "
-                                    "decomposition, and mechanical observations.\n\n"
-                                    "Percentiles are oriented so 100 is the favourable end.\n\n"
-                                    "Write:\n"
-                                    "1. What this business is and how it makes money, from the "
-                                    "margin and turnover profile rather than from memory.\n"
-                                    "2. Valuation: what is being paid, against the sector and "
-                                    "against the company's own growth and returns. Reconcile "
-                                    "the multiples where they disagree.\n"
-                                    "3. Quality: is the return earned on operations or on "
-                                    "leverage — cite the DuPont split.\n"
-                                    "4. What the numbers cannot tell you, and which disclosure "
-                                    "would settle it.\n"
-                                    "5. The two or three things that would most change this "
-                                    "assessment, stated as checkable observations.\n\n"
-                                    "Rules: cite the specific figure behind every claim, with "
-                                    "the percentile where it matters. Never invent a number "
-                                    "that is not supplied — no revenue figures, segment splits, "
-                                    "management commentary or competitor names from memory. "
-                                    "Trailing multiples are meaningless on negative earnings; "
-                                    "say so instead of interpreting them. These figures are "
-                                    "unaudited and as current as the last filing. No price "
-                                    "target, no recommendation, no position sizing. If the "
-                                    "peer set is small, say the comparison is weak."
-                                )
-                                read = ai_agent.complete(
-                                    fund_system, json.dumps(ctx, default=str, indent=2),
-                                    max_tokens=10000, effort="high")
-                                st.markdown("---")
-                                st.markdown("### 🤖 Analyst read")
-                                st.markdown(read)
-                            except Exception as e:
-                                st.error(f"AI read failed: {type(e).__name__}: {e}")
+                        cmp_df = fnd.compare_to_peers(fund_sym, peers)
+                        st.caption(f"Compared against **{len(peers)}** companies in "
+                                   f"**{sector}**. Percentile: 100 = the favourable end.")
+
+                        for grp in ["Valuation", "Profitability", "Growth",
+                                    "Balance sheet", "Shareholder returns", "Market"]:
+                            sub = cmp_df[cmp_df["group"] == grp]
+                            if sub.empty:
+                                continue
+                            st.markdown(f"##### {grp}")
+                            disp = pd.DataFrame({
+                                "Metric": sub["metric"],
+                                fund_sym: [fnd.fmt_value(v, f) for v, f in
+                                           zip(sub["value"], sub["fmt"])],
+                                "Sector median": [fnd.fmt_value(v, f) for v, f in
+                                                  zip(sub["peer_median"], sub["fmt"])],
+                                "Percentile": [fund_pct_badge(p, d) for p, d in
+                                               zip(sub["percentile"], sub["directional"])],
+                                "What it is": sub["note"],
+                            })
+                            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                        # ---- DuPont ----
+                        dp = fnd.dupont(rec)
+                        if dp and dp.get("asset_turnover") is not None:
+                            st.markdown("---")
+                            st.markdown("##### DuPont — where the return on equity comes from")
+                            d1, d2, d3, d4 = st.columns(4)
+                            d1.metric("Return on equity", f"{dp['roe']:.1f}%")
+                            d2.metric("Net margin", f"{dp['net_margin']:.1f}%")
+                            d3.metric("Asset turnover", f"{dp['asset_turnover']:.2f}x")
+                            d4.metric("Equity multiplier", f"{dp['equity_multiplier']:.2f}x")
+                            st.caption(
+                                f"ROE {dp['roe']:.1f}% = margin {dp['net_margin']:.1f}% × "
+                                f"turnover {dp['asset_turnover']:.2f} × leverage "
+                                f"{dp['equity_multiplier']:.2f}. A return built on margin and "
+                                "turnover is earned by the business; one built on the leverage "
+                                "term is borrowed, and reverses hard when funding costs rise or "
+                                "revenue falls. Asset turnover is derived from the identity "
+                                "rather than reported directly, so it absorbs any inconsistency "
+                                "between the three inputs."
+                            )
+
+                        # ---- observations ----
+                        flags = fnd.quality_flags(rec)
+                        if flags:
+                            st.markdown("---")
+                            st.markdown("##### Observations")
+                            for f in flags:
+                                (st.warning if f["level"] == "warn" else st.info)(f["text"])
+                            st.caption("Conditions worth explaining, not conclusions. Each "
+                                       "quotes the numbers it rests on so it can be checked.")
+
+                        # ---- valuation vs growth ----
+                        st.markdown("---")
+                        st.markdown("##### Valuation against growth — the sector map")
+                        scat = peers[["forwardPE", "revenueGrowth", "profitMargins",
+                                      "marketCap"]].copy()
+                        scat = scat.replace([np.inf, -np.inf], np.nan).dropna(
+                            subset=["forwardPE", "revenueGrowth"])
+                        scat = scat[(scat["forwardPE"] > 0) & (scat["forwardPE"] < 200)]
+                        if len(scat) >= 5:
+                            fig_v = go.Figure()
+                            others = scat.drop(index=fund_sym, errors="ignore")
+                            fig_v.add_trace(go.Scatter(
+                                x=others["revenueGrowth"], y=others["forwardPE"],
+                                mode="markers+text", text=others.index,
+                                textposition="top center", textfont=dict(size=9, color="#777"),
+                                marker=dict(size=9, color="#4488ff", opacity=0.75),
+                                name="Sector",
+                                hovertemplate="%{text}<br>growth %{x:.1f}%<br>fwd P/E %{y:.1f}x<extra></extra>"))
+                            if fund_sym in scat.index:
+                                me = scat.loc[[fund_sym]]
+                                fig_v.add_trace(go.Scatter(
+                                    x=me["revenueGrowth"], y=me["forwardPE"],
+                                    mode="markers+text", text=[fund_sym],
+                                    textposition="top center",
+                                    textfont=dict(size=12, color="#fff"),
+                                    marker=dict(size=16, color="#00cc66",
+                                                line=dict(width=2, color="#fff")),
+                                    name=fund_sym))
+                            fig_v.add_hline(y=float(scat["forwardPE"].median()),
+                                            line_dash="dash", line_color="#555",
+                                            annotation_text="sector median P/E")
+                            fig_v.add_vline(x=float(scat["revenueGrowth"].median()),
+                                            line_dash="dash", line_color="#555",
+                                            annotation_text="median growth")
+                            fig_v.update_layout(
+                                template="plotly_dark", height=480,
+                                margin=dict(l=0, r=0, t=44, b=0),
+                                paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                xaxis_title="Revenue growth, year on year (%)",
+                                yaxis_title="Forward P/E (x)",
+                                legend=dict(orientation="h", y=1.12, x=0, xanchor="left"))
+                            fig_v.update_xaxes(gridcolor="#1a1a1a")
+                            fig_v.update_yaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_v, use_container_width=True)
+                            st.caption(
+                                "Bottom-right is cheap for the growth, top-left is expensive "
+                                "without it. The quadrants are a starting question, not an "
+                                "answer: a company sits bottom-right either because the market "
+                                "has missed something or because it expects the growth to stop, "
+                                "and this chart cannot tell you which."
+                            )
+
+                        # ---- sector distribution ----
+                        with st.expander(f"{sector} — full distribution"):
+                            ss = fnd.sector_summary(peers)
+                            if not ss.empty:
+                                ss_disp = pd.DataFrame({
+                                    "Metric": ss["metric"], "Group": ss["group"],
+                                    "P25": [fnd.fmt_value(v, f) for v, f in zip(ss["p25"], ss["fmt"])],
+                                    "Median": [fnd.fmt_value(v, f) for v, f in zip(ss["median"], ss["fmt"])],
+                                    "P75": [fnd.fmt_value(v, f) for v, f in zip(ss["p75"], ss["fmt"])],
+                                    "n": ss["n"]})
+                                st.dataframe(ss_disp, use_container_width=True, hide_index=True)
+                                st.caption("The spread between P25 and P75 says how much the "
+                                           "metric varies within this sector — a wide spread "
+                                           "means the median is a weak benchmark.")
+
+                    # ---- AI read ----
+                    if fund_run:
+                        _err = ai_unavailable("read")
+                        if _err:
+                            st.error(f"AI read unavailable: {_err}.")
+                        else:
+                            with st.spinner("Reading the fundamentals…"):
+                                try:
+                                    ctx = {
+                                        "company": name, "symbol": fund_sym,
+                                        "sector": rec.get("sector"),
+                                        "industry": rec.get("industry"),
+                                        "metrics": {k: v for k, v in rec.items()
+                                                    if not isinstance(v, (list, dict))},
+                                        "peer_comparison": (
+                                            fnd.compare_to_peers(fund_sym, peers)
+                                            .drop(columns=["note"]).to_dict("records")
+                                            if not peers.empty and fund_sym in peers.index else []),
+                                        "peer_count": int(len(peers)),
+                                        "dupont": fnd.dupont(rec),
+                                        "observations": [f["text"] for f in fnd.quality_flags(rec)],
+                                        "range_position_pct": fnd.range_position(rec),
+                                    }
+                                    fund_system = (
+                                        "You are an equity analyst writing a fundamental note for "
+                                        "portfolio managers. You are given one company's metrics, "
+                                        "its sector peer medians and percentiles, a DuPont "
+                                        "decomposition, and mechanical observations.\n\n"
+                                        "Percentiles are oriented so 100 is the favourable end.\n\n"
+                                        "Write:\n"
+                                        "1. What this business is and how it makes money, from the "
+                                        "margin and turnover profile rather than from memory.\n"
+                                        "2. Valuation: what is being paid, against the sector and "
+                                        "against the company's own growth and returns. Reconcile "
+                                        "the multiples where they disagree.\n"
+                                        "3. Quality: is the return earned on operations or on "
+                                        "leverage — cite the DuPont split.\n"
+                                        "4. What the numbers cannot tell you, and which disclosure "
+                                        "would settle it.\n"
+                                        "5. The two or three things that would most change this "
+                                        "assessment, stated as checkable observations.\n\n"
+                                        "Rules: cite the specific figure behind every claim, with "
+                                        "the percentile where it matters. Never invent a number "
+                                        "that is not supplied — no revenue figures, segment splits, "
+                                        "management commentary or competitor names from memory. "
+                                        "Trailing multiples are meaningless on negative earnings; "
+                                        "say so instead of interpreting them. These figures are "
+                                        "unaudited and as current as the last filing. No price "
+                                        "target, no recommendation, no position sizing. If the "
+                                        "peer set is small, say the comparison is weak."
+                                    )
+                                    read = ai_agent.complete(
+                                        fund_system, json.dumps(ctx, default=str, indent=2),
+                                        max_tokens=10000, effort="high")
+                                    st.markdown("---")
+                                    st.markdown("### 🤖 Analyst read")
+                                    st.markdown(read)
+                                except Exception as e:
+                                    st.error(f"AI read failed: {type(e).__name__}: {e}")
+    else:
+        locked_tab("fund")
 
 
 # -------- NEWS TAB --------
 with tab_news:
-    st.subheader("Global News & Macro Context")
+    if access.tab_open(current_user(), "news"):
+        st.subheader("Global News & Macro Context")
 
-    if not NEWSAPI_KEY:
-        st.info(
-            "NEWSAPI_KEY is not configured, so the NewsAPI headlines are "
-            "unavailable. The RSS feeds the scheduler collects still populate "
-            "the news database — set NEWSAPI_KEY in the environment to add "
-            "NewsAPI coverage on top."
-        )
-    else:
-        # ── AUTO-FETCH on page load ──
-        if "news_auto_fetched" not in st.session_state:
-            auto_items = auto_fetch_news_if_needed()
-            if auto_items:
-                st.session_state["news_items"] = auto_items
-                st.session_state["news_auto_fetch_msg"] = "Auto-fetched new articles on schedule."
-            st.session_state["news_auto_fetched"] = True
-
-        # If no news at all, load from history
-        if "news_items" not in st.session_state or not st.session_state.get("news_items"):
-            hist = load_news_history_df()
-            if not hist.empty:
-                st.session_state["news_items"] = hist.sort_values("published_at", ascending=False).to_dict("records")
-
-        # ── SCHEDULE STATUS ──
-        fetch_status = get_news_fetch_status()
-        with st.expander("📅 News Fetch Schedule"):
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("Fetches Today", f"{fetch_status['fetches_today']}/{fetch_status['max_fetches']}")
-            sc2.metric("Last Group", fetch_status["last_group"])
-            sc3.metric("Next Fetch", fetch_status["next_fetch_hour_utc"])
-
-            st.markdown(
-                f"**Schedule (UTC):** {', '.join(fetch_status['schedule'])}\n\n"
-                f"**Last fetch:** {fetch_status['last_fetch']}\n\n"
-                "**How it works:** News keywords are split into 3 rotation groups. "
-                "Each scheduled window fetches one group (~12 keywords x 3 articles = ~36 API calls). "
-                "Total: ~108 calls/day — fits within NewsAPI free tier limits."
+        if not NEWSAPI_KEY:
+            st.info(
+                "NEWSAPI_KEY is not configured, so the NewsAPI headlines are "
+                "unavailable. The RSS feeds the scheduler collects still populate "
+                "the news database — set NEWSAPI_KEY in the environment to add "
+                "NewsAPI coverage on top."
             )
+        else:
+            # ── AUTO-FETCH on page load ──
+            if "news_auto_fetched" not in st.session_state:
+                auto_items = auto_fetch_news_if_needed()
+                if auto_items:
+                    st.session_state["news_items"] = auto_items
+                    st.session_state["news_auto_fetch_msg"] = "Auto-fetched new articles on schedule."
+                st.session_state["news_auto_fetched"] = True
 
-            st.markdown(
-                "**Group A (08:00 UTC):** Crypto + Commodities + Major Macro\n\n"
-                "**Group B (14:00 UTC):** Big Tech + Key Figures\n\n"
-                "**Group C (21:00 UTC):** Defense + Institutions + Central Banks"
+            # If no news at all, load from history
+            if "news_items" not in st.session_state or not st.session_state.get("news_items"):
+                hist = load_news_history_df()
+                if not hist.empty:
+                    st.session_state["news_items"] = hist.sort_values("published_at", ascending=False).to_dict("records")
+
+            # ── SCHEDULE STATUS ──
+            fetch_status = get_news_fetch_status()
+            with st.expander("📅 News Fetch Schedule"):
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("Fetches Today", f"{fetch_status['fetches_today']}/{fetch_status['max_fetches']}")
+                sc2.metric("Last Group", fetch_status["last_group"])
+                sc3.metric("Next Fetch", fetch_status["next_fetch_hour_utc"])
+
+                st.markdown(
+                    f"**Schedule (UTC):** {', '.join(fetch_status['schedule'])}\n\n"
+                    f"**Last fetch:** {fetch_status['last_fetch']}\n\n"
+                    "**How it works:** News keywords are split into 3 rotation groups. "
+                    "Each scheduled window fetches one group (~12 keywords x 3 articles = ~36 API calls). "
+                    "Total: ~108 calls/day — fits within NewsAPI free tier limits."
+                )
+
+                st.markdown(
+                    "**Group A (08:00 UTC):** Crypto + Commodities + Major Macro\n\n"
+                    "**Group B (14:00 UTC):** Big Tech + Key Figures\n\n"
+                    "**Group C (21:00 UTC):** Defense + Institutions + Central Banks"
+                )
+
+            # Show auto-fetch notification
+            auto_msg = st.session_state.pop("news_auto_fetch_msg", None)
+            if auto_msg:
+                st.success(auto_msg)
+
+            df_global_for_ai = st.session_state.get("df_signals_global", pd.DataFrame())
+            df_crypto_for_ai = st.session_state.get("df_signals_binance", pd.DataFrame())
+
+            asset_options: List[str] = ["Global macro view"]
+
+            if not df_global_for_ai.empty:
+                asset_options.extend(
+                    df_global_for_ai["name"].astype(str)
+                    + " ("
+                    + df_global_for_ai["ticker"].astype(str)
+                    + ")"
+                )
+            if not df_crypto_for_ai.empty:
+                asset_options.extend(
+                    df_crypto_for_ai["name"].astype(str)
+                    + " ("
+                    + df_crypto_for_ai["symbol"].astype(str)
+                    + ")"
+                )
+
+            # Add the full S&P 500 universe + indices so the user can pick any
+            # of the ~500 companies for news-based focus, not just whatever
+            # happens to be in the global signal cache.
+            try:
+                dl.seed_universe()
+                for _r in dl.universe_all():
+                    if _r.get("asset_type") in ("equity", "index", "commodity",
+                                                  "fx_index", "vol_index", "rate_index"):
+                        asset_options.append(f"{_r['company_name']} ({_r['symbol']})")
+            except Exception:
+                pass
+
+            asset_options = sorted(set(asset_options))
+            current_focus = st.session_state.get("news_focus_asset", "Global macro view")
+
+            focus_asset = st.selectbox(
+                "Asset to focus (news-based forecast):",
+                options=asset_options,
+                index=asset_options.index(current_focus)
+                if current_focus in asset_options
+                else 0,
             )
+            st.session_state["news_focus_asset"] = focus_asset
 
-        # Show auto-fetch notification
-        auto_msg = st.session_state.pop("news_auto_fetch_msg", None)
-        if auto_msg:
-            st.success(auto_msg)
+            # ── BUTTONS ──
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-        df_global_for_ai = st.session_state.get("df_signals_global", pd.DataFrame())
-        df_crypto_for_ai = st.session_state.get("df_signals_binance", pd.DataFrame())
+            with btn_col1:
+                manual_refresh = st.button("🔄 Manual Refresh (uses API quota)")
+            with btn_col2:
+                rerun_forecast = st.button("♻️ Re-run AI forecast (1 credit)")
+            with btn_col3:
+                force_fetch = st.button("⚡ Force fetch all groups (uses 3x quota)")
 
-        asset_options: List[str] = ["Global macro view"]
+            if manual_refresh:
+                # Fetch only the current rotation group (saves quota)
+                slot = _get_nearest_slot_group()
+                keywords = NEWS_KEYWORD_GROUPS.get(slot, NEWS_KEYWORD_GROUPS[0])
+                news_items = aggregate_news(keywords)
 
-        if not df_global_for_ai.empty:
-            asset_options.extend(
-                df_global_for_ai["name"].astype(str)
-                + " ("
-                + df_global_for_ai["ticker"].astype(str)
-                + ")"
-            )
-        if not df_crypto_for_ai.empty:
-            asset_options.extend(
-                df_crypto_for_ai["name"].astype(str)
-                + " ("
-                + df_crypto_for_ai["symbol"].astype(str)
-                + ")"
-            )
+                if news_items:
+                    st.session_state["news_items"] = news_items
+                    state = _load_fetch_state()
+                    now_utc = dt.datetime.utcnow()
+                    state["last_fetch_utc"] = now_utc.isoformat()
+                    state["last_group"] = slot
+                    state["fetch_count_today"] = state.get("fetch_count_today", 0) + 1
+                    state["last_date"] = now_utc.strftime("%Y-%m-%d")
+                    _save_fetch_state(state)
+                    st.success(f"Fetched group {slot} ({len(keywords)} keywords). {len(news_items)} articles.")
 
-        # Add the full S&P 500 universe + indices so the user can pick any
-        # of the ~500 companies for news-based focus, not just whatever
-        # happens to be in the global signal cache.
-        try:
-            dl.seed_universe()
-            for _r in dl.universe_all():
-                if _r.get("asset_type") in ("equity", "index", "commodity",
-                                              "fx_index", "vol_index", "rate_index"):
-                    asset_options.append(f"{_r['company_name']} ({_r['symbol']})")
-        except Exception:
-            pass
+            if force_fetch:
+                all_kw = []
+                for g in NEWS_KEYWORD_GROUPS.values():
+                    all_kw.extend(g)
+                news_items = aggregate_news(all_kw)
+                if news_items:
+                    st.session_state["news_items"] = news_items
+                    st.success(f"Force-fetched all groups. {len(news_items)} articles total.")
 
-        asset_options = sorted(set(asset_options))
-        current_focus = st.session_state.get("news_focus_asset", "Global macro view")
+            if rerun_forecast or manual_refresh or force_fetch:
+                news_items_for_run = st.session_state.get("news_items", [])
+                if news_items_for_run:
+                    news_forecast = run_news_forecast(
+                        df_global=df_global_for_ai,
+                        df_crypto=df_crypto_for_ai,
+                        latest_news_items=news_items_for_run,
+                        focus_asset=focus_asset,
+                    )
+                    st.session_state["news_forecast"] = news_forecast
+                    st.session_state["news_forecast_asset"] = focus_asset
 
-        focus_asset = st.selectbox(
-            "Asset to focus (news-based forecast):",
-            options=asset_options,
-            index=asset_options.index(current_focus)
-            if current_focus in asset_options
-            else 0,
-        )
-        st.session_state["news_focus_asset"] = focus_asset
+            news_items = st.session_state.get("news_items", [])
+            news_forecast = st.session_state.get("news_forecast")
+            news_forecast_asset = st.session_state.get("news_forecast_asset")
 
-        # ── BUTTONS ──
-        btn_col1, btn_col2, btn_col3 = st.columns(3)
-
-        with btn_col1:
-            manual_refresh = st.button("🔄 Manual Refresh (uses API quota)")
-        with btn_col2:
-            rerun_forecast = st.button("♻️ Re-run forecast (no API calls)")
-        with btn_col3:
-            force_fetch = st.button("⚡ Force fetch all groups (uses 3x quota)")
-
-        if manual_refresh:
-            # Fetch only the current rotation group (saves quota)
-            slot = _get_nearest_slot_group()
-            keywords = NEWS_KEYWORD_GROUPS.get(slot, NEWS_KEYWORD_GROUPS[0])
-            news_items = aggregate_news(keywords)
-
-            if news_items:
-                st.session_state["news_items"] = news_items
-                state = _load_fetch_state()
-                now_utc = dt.datetime.utcnow()
-                state["last_fetch_utc"] = now_utc.isoformat()
-                state["last_group"] = slot
-                state["fetch_count_today"] = state.get("fetch_count_today", 0) + 1
-                state["last_date"] = now_utc.strftime("%Y-%m-%d")
-                _save_fetch_state(state)
-                st.success(f"Fetched group {slot} ({len(keywords)} keywords). {len(news_items)} articles.")
-
-        if force_fetch:
-            all_kw = []
-            for g in NEWS_KEYWORD_GROUPS.values():
-                all_kw.extend(g)
-            news_items = aggregate_news(all_kw)
-            if news_items:
-                st.session_state["news_items"] = news_items
-                st.success(f"Force-fetched all groups. {len(news_items)} articles total.")
-
-        if rerun_forecast or manual_refresh or force_fetch:
-            news_items_for_run = st.session_state.get("news_items", [])
-            if news_items_for_run:
+            # This used to run by itself whenever the asset changed, and Streamlit
+            # executes every tab on every page load, so each visit spent an AI call.
+            if news_items and (not news_forecast or news_forecast_asset != focus_asset) and st.button(
+                    f"🤖 Run AI forecast for {focus_asset} (1 credit)", key="news_ai_run"):
                 news_forecast = run_news_forecast(
                     df_global=df_global_for_ai,
                     df_crypto=df_crypto_for_ai,
-                    latest_news_items=news_items_for_run,
+                    latest_news_items=news_items,
                     focus_asset=focus_asset,
                 )
                 st.session_state["news_forecast"] = news_forecast
                 st.session_state["news_forecast_asset"] = focus_asset
 
-        news_items = st.session_state.get("news_items", [])
-        news_forecast = st.session_state.get("news_forecast")
-        news_forecast_asset = st.session_state.get("news_forecast_asset")
+            st.markdown("### 🤖 AI News-driven forecast")
 
-        # Auto-run forecast if asset changed
-        if news_items and (not news_forecast or news_forecast_asset != focus_asset):
-            news_forecast = run_news_forecast(
-                df_global=df_global_for_ai,
-                df_crypto=df_crypto_for_ai,
-                latest_news_items=news_items,
-                focus_asset=focus_asset,
-            )
-            st.session_state["news_forecast"] = news_forecast
-            st.session_state["news_forecast_asset"] = focus_asset
+            if news_forecast:
+                st.markdown("---")
+                st.markdown(news_forecast)
+            else:
+                st.info(
+                    "No forecast yet. News will auto-fetch at the next scheduled window, "
+                    "or press 'Manual Refresh' to fetch now."
+                )
 
-        st.markdown("### 🤖 AI News-driven forecast")
-
-        if news_forecast:
             st.markdown("---")
-            st.markdown(news_forecast)
-        else:
-            st.info(
-                "No forecast yet. News will auto-fetch at the next scheduled window, "
-                "or press 'Manual Refresh' to fetch now."
-            )
+            st.markdown("### Latest raw headlines")
 
-        st.markdown("---")
-        st.markdown("### Latest raw headlines")
-
-        if not news_items:
-            st.warning("No news in history. Press 'Manual Refresh' or wait for the next scheduled fetch.")
-        else:
-            st.caption(f"Showing {min(20, len(news_items))} of {len(news_items)} articles in history.")
-            for item in news_items[:20]:
-                with st.container():
-                    st.markdown(f"**[{item['title']}]({item['url']})**")
-                    meta_line = (
-                        f"{item['source']} • {item['published_at']} • "
-                        f"keyword: _{item['keyword']}_"
-                    )
-                    st.caption(meta_line)
-                    if item["description"]:
-                        st.write(item["description"])
-                    st.markdown("---")
+            if not news_items:
+                st.warning("No news in history. Press 'Manual Refresh' or wait for the next scheduled fetch.")
+            else:
+                st.caption(f"Showing {min(20, len(news_items))} of {len(news_items)} articles in history.")
+                for item in news_items[:20]:
+                    with st.container():
+                        st.markdown(f"**[{item['title']}]({item['url']})**")
+                        meta_line = (
+                            f"{item['source']} • {item['published_at']} • "
+                            f"keyword: _{item['keyword']}_"
+                        )
+                        st.caption(meta_line)
+                        if item["description"]:
+                            st.write(item["description"])
+                        st.markdown("---")
+    else:
+        locked_tab("news")
 
                     
 # -------- QUANT TAB --------
 with tab_quant:
-    st.markdown("""
+    if access.tab_open(current_user(), "quant"):
+        st.markdown("""
     <div style="padding:12px 0 4px 0">
     <span style="font-size:28px;font-weight:800;letter-spacing:-1px">QUANT LAB</span>
     <span style="font-size:14px;color:#888;margin-left:12px">Regime · Structure · Momentum · Tail risk · Monte Carlo</span>
     </div>
     """, unsafe_allow_html=True)
 
-    with st.expander("What this panel does, and how to read it", expanded=False):
-        st.markdown("""
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
 This measures one price series six ways. It is **descriptive**: every number
 characterises what the series has already done, and none of it forecasts
 direction.
@@ -7189,212 +7259,212 @@ bearish reading preceded the *best* forward returns — so it was removed rather
 than tuned.
         """)
 
-    # ── ASSET SELECTOR (horizontal, compact) ──
-    # Build the asset pool from:
-    #   1. The full S&P 500 universe + indices (filterable by sector)
-    #   2. The dynamic Global/Binance tab signals (legacy)
-    try:
-        dl.seed_universe()
-    except Exception:
-        pass
-
-    sector_options_q = ["All"] + sorted(
-        [s for s in (dl.universe_sector_counts() or {}).keys()]
-    )
-    sec_filter = st.selectbox("Sector filter", options=sector_options_q,
-                                index=0, key="quant_sec_filter",
-                                label_visibility="collapsed")
-
-    asset_options_q: List[str] = []
-    try:
-        universe_rows = dl.universe_all()
-        if sec_filter and sec_filter != "All":
-            universe_rows = [r for r in universe_rows if r.get("sector") == sec_filter]
-        asset_options_q.extend(
-            f"{r['company_name']} ({r['symbol']})" for r in universe_rows
-        )
-    except Exception:
-        pass
-
-    df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
-    df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
-    if not df_global_for_q.empty:
-        asset_options_q.extend(
-            df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
-        )
-    if not df_crypto_for_q.empty:
-        asset_options_q.extend(
-            df_crypto_for_q["name"].astype(str) + " (" + df_crypto_for_q["symbol"].astype(str) + ")"
-        )
-    asset_options_q = ["(choose)"] + sorted(set(asset_options_q))
-
-    qc1, qc2, qc3, qc4, qc5 = st.columns([2.5, 1, 1.5, 1.5, 1])
-    with qc1:
-        focus_asset_q = st.selectbox(
-            f"Asset ({len(asset_options_q)-1} available)",
-            options=asset_options_q, index=0,
-            key="quant_asset", label_visibility="collapsed",
-        )
-    with qc2:
-        source_pref_q = st.selectbox("Src", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source", label_visibility="collapsed")
-    with qc3:
-        lookback_days_q = st.select_slider("Lookback", options=[90, 180, 365, 540, 730], value=365, key="quant_lookback", label_visibility="collapsed")
-    with qc4:
-        horizon_label_q = st.selectbox("Horizon", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon", label_visibility="collapsed")
-    with qc5:
-        run_quant_btn = st.button("▶ Run", type="primary", key="run_quant_btn", use_container_width=True)
-
-    # ── Free-text override: type any ticker or company name ──
-    # Lets the user analyse companies outside the S&P 500 (small caps,
-    # foreign tickers, etc.) by going straight to Yahoo.
-    custom_query = st.text_input(
-        "Or type any ticker / company name directly (overrides the dropdown above)",
-        value="",
-        key="quant_custom_query",
-        placeholder="e.g. PLTR  ·  Palantir  ·  ASML.AS  ·  RHM.DE",
-    )
-
-    # Say which constituent list is loaded. The index reconstitutes quarterly
-    # and the shipped snapshot goes stale in both directions, so a reader who
-    # cannot find a name deserves to know whether the list is current before
-    # concluding the app cannot see it.
-    try:
-        import symbol_universe as _su
-        _uni_src = _su.UNIVERSE_SOURCE
-        if str(_uni_src.get("source", "")).startswith("http"):
-            st.caption(
-                f"Universe: **{_uni_src.get('n')} S&P 500 constituents**, "
-                f"fetched {_uni_src.get('as_of')}. Anything outside it is "
-                "looked up directly on Yahoo."
-            )
-        else:
-            st.caption(
-                f"Universe: **{_uni_src.get('n')} S&P 500 constituents** from "
-                f"the built-in snapshot ({_uni_src.get('as_of')}) — the live "
-                "list could not be fetched, so recent index changes are "
-                "missing. Anything outside it is looked up directly on Yahoo."
-            )
-    except Exception:
-        pass
-
-    # Resolve the custom query → symbol.
-    #   Step 1: search our universe (the current S&P 500 + indices + ETFs)
-    #   Step 2: try the literal input as a Yahoo ticker (broader coverage)
-    #   Step 3: give up with a clear "no data" message
-    custom_symbol_resolved: Optional[str] = None
-    if custom_query.strip():
-        q = custom_query.strip()
-        # 1) universe search by ticker/name
+        # ── ASSET SELECTOR (horizontal, compact) ──
+        # Build the asset pool from:
+        #   1. The full S&P 500 universe + indices (filterable by sector)
+        #   2. The dynamic Global/Binance tab signals (legacy)
         try:
-            hits = dl.universe_search(q, limit=1)
+            dl.seed_universe()
         except Exception:
-            hits = []
-        if hits:
-            custom_symbol_resolved = hits[0]["symbol"]
-            st.success(
-                f"✅ Resolved **{q}** → `{custom_symbol_resolved}` "
-                f"({hits[0]['company_name']} · {hits[0].get('sector','—')})"
+            pass
+
+        sector_options_q = ["All"] + sorted(
+            [s for s in (dl.universe_sector_counts() or {}).keys()]
+        )
+        sec_filter = st.selectbox("Sector filter", options=sector_options_q,
+                                    index=0, key="quant_sec_filter",
+                                    label_visibility="collapsed")
+
+        asset_options_q: List[str] = []
+        try:
+            universe_rows = dl.universe_all()
+            if sec_filter and sec_filter != "All":
+                universe_rows = [r for r in universe_rows if r.get("sector") == sec_filter]
+            asset_options_q.extend(
+                f"{r['company_name']} ({r['symbol']})" for r in universe_rows
             )
-        else:
-            # 2) try literal as Yahoo ticker
-            try:
-                import sources as _src_probe
-                _probe = _src_probe.fetch_yahoo_quote(q.upper())
-            except Exception:
-                _probe = None
-            if _probe and _probe.get("price") is not None:
-                custom_symbol_resolved = q.upper()
-                st.info(
-                    f"ℹ️ **{q.upper()}** is not in our S&P 500 universe but "
-                    f"Yahoo returned a live quote (${float(_probe['price']):,.2f}). "
-                    f"Will analyse it directly."
+        except Exception:
+            pass
+
+        df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
+        df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
+        if not df_global_for_q.empty:
+            asset_options_q.extend(
+                df_global_for_q["name"].astype(str) + " (" + df_global_for_q["ticker"].astype(str) + ")"
+            )
+        if not df_crypto_for_q.empty:
+            asset_options_q.extend(
+                df_crypto_for_q["name"].astype(str) + " (" + df_crypto_for_q["symbol"].astype(str) + ")"
+            )
+        asset_options_q = ["(choose)"] + sorted(set(asset_options_q))
+
+        qc1, qc2, qc3, qc4, qc5 = st.columns([2.5, 1, 1.5, 1.5, 1])
+        with qc1:
+            focus_asset_q = st.selectbox(
+                f"Asset ({len(asset_options_q)-1} available)",
+                options=asset_options_q, index=0,
+                key="quant_asset", label_visibility="collapsed",
+            )
+        with qc2:
+            source_pref_q = st.selectbox("Src", options=["Auto", "Yahoo", "Binance"], index=0, key="quant_source", label_visibility="collapsed")
+        with qc3:
+            lookback_days_q = st.select_slider("Lookback", options=[90, 180, 365, 540, 730], value=365, key="quant_lookback", label_visibility="collapsed")
+        with qc4:
+            horizon_label_q = st.selectbox("Horizon", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon", label_visibility="collapsed")
+        with qc5:
+            run_quant_btn = st.button("▶ Run", type="primary", key="run_quant_btn", use_container_width=True)
+
+        # ── Free-text override: type any ticker or company name ──
+        # Lets the user analyse companies outside the S&P 500 (small caps,
+        # foreign tickers, etc.) by going straight to Yahoo.
+        custom_query = st.text_input(
+            "Or type any ticker / company name directly (overrides the dropdown above)",
+            value="",
+            key="quant_custom_query",
+            placeholder="e.g. PLTR  ·  Palantir  ·  ASML.AS  ·  RHM.DE",
+        )
+
+        # Say which constituent list is loaded. The index reconstitutes quarterly
+        # and the shipped snapshot goes stale in both directions, so a reader who
+        # cannot find a name deserves to know whether the list is current before
+        # concluding the app cannot see it.
+        try:
+            import symbol_universe as _su
+            _uni_src = _su.UNIVERSE_SOURCE
+            if str(_uni_src.get("source", "")).startswith("http"):
+                st.caption(
+                    f"Universe: **{_uni_src.get('n')} S&P 500 constituents**, "
+                    f"fetched {_uni_src.get('as_of')}. Anything outside it is "
+                    "looked up directly on Yahoo."
                 )
             else:
-                st.error(
-                    f"❌ No data found for **{q}**. We tried our S&P 500 "
-                    f"universe and a direct Yahoo lookup. Check the spelling "
-                    f"or use the exact Yahoo ticker (e.g. `BRK-B`, `ASML.AS`)."
+                st.caption(
+                    f"Universe: **{_uni_src.get('n')} S&P 500 constituents** from "
+                    f"the built-in snapshot ({_uni_src.get('as_of')}) — the live "
+                    "list could not be fetched, so recent index changes are "
+                    "missing. Anything outside it is looked up directly on Yahoo."
                 )
+        except Exception:
+            pass
 
-    with st.expander("⚙ Advanced", expanded=False):
-        ac1, ac2, ac3 = st.columns(3)
-        jump_z_q = ac1.slider("Jump threshold (z)", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
-        tf_binance_q = ac2.selectbox("Binance timeframe", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
-        mc_sims_q = ac3.number_input("Monte Carlo sims", min_value=1000, max_value=50000, value=10000, step=1000, key="quant_sims")
-
-    if run_quant_btn:
-        # Manual text input wins over the dropdown when it successfully resolves.
-        if custom_symbol_resolved:
-            sym = custom_symbol_resolved
-        else:
-            sym = parse_selected_asset_to_symbol(focus_asset_q)
-        if not sym:
-            st.warning(
-                "Select an asset from the dropdown above, OR type a ticker / "
-                "company name in the free-text field."
-            )
-        else:
-            source = detect_source_for_symbol(sym, preferred=source_pref_q)
-            mpd = bars_per_day_for_tf(source, tf_binance_q)
-            horizon_map = {"1 day": 1, "1 week": 7, "1 month": 30, "3 months": 90}
-            horizon_bars = horizon_map.get(horizon_label_q, 7) * mpd
-            tf_used = "1d" if source == "Yahoo" else tf_binance_q
-            bpy = bars_per_year_for_timeframe(source, tf_used)
-
-            with st.spinner("Crunching numbers..."):
+        # Resolve the custom query → symbol.
+        #   Step 1: search our universe (the current S&P 500 + indices + ETFs)
+        #   Step 2: try the literal input as a Yahoo ticker (broader coverage)
+        #   Step 3: give up with a clear "no data" message
+        custom_symbol_resolved: Optional[str] = None
+        if custom_query.strip():
+            q = custom_query.strip()
+            # 1) universe search by ticker/name
+            try:
+                hits = dl.universe_search(q, limit=1)
+            except Exception:
+                hits = []
+            if hits:
+                custom_symbol_resolved = hits[0]["symbol"]
+                st.success(
+                    f"✅ Resolved **{q}** → `{custom_symbol_resolved}` "
+                    f"({hits[0]['company_name']} · {hits[0].get('sector','—')})"
+                )
+            else:
+                # 2) try literal as Yahoo ticker
                 try:
-                    close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
-                    returns = np.log(close_series).diff().dropna()
-                    # One Monte Carlo draw for the whole page — the cards and the
-                    # histogram below both read from this sample.
-                    mc_result = monte_carlo_forward_distribution(
-                        close_series, horizon_bars=int(horizon_bars),
-                        sims=int(mc_sims_q), return_samples=True,
+                    import sources as _src_probe
+                    _probe = _src_probe.fetch_yahoo_quote(q.upper())
+                except Exception:
+                    _probe = None
+                if _probe and _probe.get("price") is not None:
+                    custom_symbol_resolved = q.upper()
+                    st.info(
+                        f"ℹ️ **{q.upper()}** is not in our S&P 500 universe but "
+                        f"Yahoo returned a live quote (${float(_probe['price']):,.2f}). "
+                        f"Will analyse it directly."
                     )
-                    qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q),
-                                               horizon_bars=int(horizon_bars), mc=mc_result)
-                    if "error" in qm:
-                        st.error(qm["error"])
-                    else:
-                        regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3), bars_per_year=bpy)
-                        mean_rev = compute_mean_reversion_signals(close_series)
-                        mom_feat = compute_momentum_features(close_series)
-                        tail_risk = compute_tail_risk_metrics(returns, bars_per_year=bpy)
-                        acf = compute_autocorrelation(returns, max_lag=5)
+                else:
+                    st.error(
+                        f"❌ No data found for **{q}**. We tried our S&P 500 "
+                        f"universe and a direct Yahoo lookup. Check the spelling "
+                        f"or use the exact Yahoo ticker (e.g. `BRK-B`, `ASML.AS`)."
+                    )
 
-                        last_p = qm.get("last_price", float(close_series.iloc[-1]))
-                        hurst = qm.get("hurst")
+        with st.expander("⚙ Advanced", expanded=False):
+            ac1, ac2, ac3 = st.columns(3)
+            jump_z_q = ac1.slider("Jump threshold (z)", 2.0, 5.0, 3.0, 0.25, key="quant_jumpz")
+            tf_binance_q = ac2.selectbox("Binance timeframe", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
+            mc_sims_q = ac3.number_input("Monte Carlo sims", min_value=1000, max_value=50000, value=10000, step=1000, key="quant_sims")
 
-                        # ═══════════════════════════════════════
-                        # ROW 1: STRUCTURE CARD + KEY METRICS
-                        # ═══════════════════════════════════════
-                        # A "QUANT VERDICT" card used to sit here, averaging Hurst,
-                        # momentum, the 20d z-score and the annualized return into a
-                        # BULLISH/BEARISH call. It was walk-forward tested on 457 S&P
-                        # names, 2012-2026, 78k non-overlapping observations against
-                        # forward 21d returns. It was not merely uninformative — it was
-                        # inverted: the STRONG BEARISH bucket averaged +5.10% forward
-                        # vs +1.53% for STRONG BULLISH (t=9.87), because a crashed name
-                        # scores bearish right before it bounces. A rebuilt version
-                        # (Hurst as a regime switch, self-normalized terms, annualized
-                        # return dropped) tested flat: STRONG BULLISH minus STRONG
-                        # BEARISH = -0.16% full period, -0.84% out-of-sample, not
-                        # monotonic, every |t| < 2. Neither earns a place on screen,
-                        # so this panel now states what IS, not what to do.
-                        _regime_now = str(regime.get("current_regime", "?")).replace("_", " ")
-                        _regime_pct = regime.get("regime_percentile")
-                        if hurst is None:
-                            _struct_txt, _struct_col, _hurst_txt = "Unknown", "#888", "insufficient data"
-                        elif hurst > 0.55:
-                            _struct_txt, _struct_col, _hurst_txt = "Trending", "#4488ff", f"Hurst {hurst:.3f}"
-                        elif hurst < 0.45:
-                            _struct_txt, _struct_col, _hurst_txt = "Mean-reverting", "#aa88ff", f"Hurst {hurst:.3f}"
+        if run_quant_btn:
+            # Manual text input wins over the dropdown when it successfully resolves.
+            if custom_symbol_resolved:
+                sym = custom_symbol_resolved
+            else:
+                sym = parse_selected_asset_to_symbol(focus_asset_q)
+            if not sym:
+                st.warning(
+                    "Select an asset from the dropdown above, OR type a ticker / "
+                    "company name in the free-text field."
+                )
+            else:
+                source = detect_source_for_symbol(sym, preferred=source_pref_q)
+                mpd = bars_per_day_for_tf(source, tf_binance_q)
+                horizon_map = {"1 day": 1, "1 week": 7, "1 month": 30, "3 months": 90}
+                horizon_bars = horizon_map.get(horizon_label_q, 7) * mpd
+                tf_used = "1d" if source == "Yahoo" else tf_binance_q
+                bpy = bars_per_year_for_timeframe(source, tf_used)
+
+                with st.spinner("Crunching numbers..."):
+                    try:
+                        close_series = fetch_close_series_for_quant(sym, source, tf_used, lookback_days_q)
+                        returns = np.log(close_series).diff().dropna()
+                        # One Monte Carlo draw for the whole page — the cards and the
+                        # histogram below both read from this sample.
+                        mc_result = monte_carlo_forward_distribution(
+                            close_series, horizon_bars=int(horizon_bars),
+                            sims=int(mc_sims_q), return_samples=True,
+                        )
+                        qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q),
+                                                   horizon_bars=int(horizon_bars), mc=mc_result)
+                        if "error" in qm:
+                            st.error(qm["error"])
                         else:
-                            _struct_txt, _struct_col, _hurst_txt = "Random walk", "#888", f"Hurst {hurst:.3f}"
+                            regime = compute_regime_hmm_simple(returns, window=min(63, len(returns) // 3), bars_per_year=bpy)
+                            mean_rev = compute_mean_reversion_signals(close_series)
+                            mom_feat = compute_momentum_features(close_series)
+                            tail_risk = compute_tail_risk_metrics(returns, bars_per_year=bpy)
+                            acf = compute_autocorrelation(returns, max_lag=5)
 
-                        v1, v2 = st.columns([1, 3])
-                        with v1:
-                            st.markdown(f"""
+                            last_p = qm.get("last_price", float(close_series.iloc[-1]))
+                            hurst = qm.get("hurst")
+
+                            # ═══════════════════════════════════════
+                            # ROW 1: STRUCTURE CARD + KEY METRICS
+                            # ═══════════════════════════════════════
+                            # A "QUANT VERDICT" card used to sit here, averaging Hurst,
+                            # momentum, the 20d z-score and the annualized return into a
+                            # BULLISH/BEARISH call. It was walk-forward tested on 457 S&P
+                            # names, 2012-2026, 78k non-overlapping observations against
+                            # forward 21d returns. It was not merely uninformative — it was
+                            # inverted: the STRONG BEARISH bucket averaged +5.10% forward
+                            # vs +1.53% for STRONG BULLISH (t=9.87), because a crashed name
+                            # scores bearish right before it bounces. A rebuilt version
+                            # (Hurst as a regime switch, self-normalized terms, annualized
+                            # return dropped) tested flat: STRONG BULLISH minus STRONG
+                            # BEARISH = -0.16% full period, -0.84% out-of-sample, not
+                            # monotonic, every |t| < 2. Neither earns a place on screen,
+                            # so this panel now states what IS, not what to do.
+                            _regime_now = str(regime.get("current_regime", "?")).replace("_", " ")
+                            _regime_pct = regime.get("regime_percentile")
+                            if hurst is None:
+                                _struct_txt, _struct_col, _hurst_txt = "Unknown", "#888", "insufficient data"
+                            elif hurst > 0.55:
+                                _struct_txt, _struct_col, _hurst_txt = "Trending", "#4488ff", f"Hurst {hurst:.3f}"
+                            elif hurst < 0.45:
+                                _struct_txt, _struct_col, _hurst_txt = "Mean-reverting", "#aa88ff", f"Hurst {hurst:.3f}"
+                            else:
+                                _struct_txt, _struct_col, _hurst_txt = "Random walk", "#888", f"Hurst {hurst:.3f}"
+
+                            v1, v2 = st.columns([1, 3])
+                            with v1:
+                                st.markdown(f"""
                             <div style="background:#111;border:1px solid #333;border-radius:12px;padding:18px;text-align:center">
                             <div style="font-size:12px;color:#888">PRICE STRUCTURE</div>
                             <div style="font-size:26px;font-weight:800;color:{_struct_col}">{_struct_txt}</div>
@@ -7404,820 +7474,843 @@ than tuned.
                             <div style="font-size:12px;color:#666;margin-top:12px">{sym} · {tf_used} · {qm.get('n_bars', 0)} bars</div>
                             </div>
                             """, unsafe_allow_html=True)
-                            st.caption("Descriptive. This panel measures the series; "
-                                       "it does not forecast it.")
+                                st.caption("Descriptive. This panel measures the series; "
+                                           "it does not forecast it.")
 
-                        with v2:
-                            m1, m2, m3, m4, m5, m6 = st.columns(6)
-                            m1.metric("Price", f"${last_p:,.2f}")
-                            m2.metric("Ann. Vol", f"{regime.get('current_vol_annualized', 0):.1%}")
-                            m3.metric("Ann. Return", f"{tail_risk.get('annualized_return_pct', 'N/A')}%")
-                            m4.metric("Max DD", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
-                            m5.metric("Sharpe", f"{qm.get('sharpe', 'N/A')}" if qm.get('sharpe') else f"{(float(tail_risk.get('annualized_return_pct',0)) / max(float(regime.get('current_vol_annualized',1))*100, 1)):.2f}")
-                            m6.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
+                            with v2:
+                                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                                m1.metric("Price", f"${last_p:,.2f}")
+                                m2.metric("Ann. Vol", f"{regime.get('current_vol_annualized', 0):.1%}")
+                                m3.metric("Ann. Return", f"{tail_risk.get('annualized_return_pct', 'N/A')}%")
+                                m4.metric("Max DD", f"{tail_risk.get('max_drawdown_pct', 'N/A')}%")
+                                m5.metric("Sharpe", f"{qm.get('sharpe', 'N/A')}" if qm.get('sharpe') else f"{(float(tail_risk.get('annualized_return_pct',0)) / max(float(regime.get('current_vol_annualized',1))*100, 1)):.2f}")
+                                m6.metric("Win Rate", f"{tail_risk.get('win_rate_pct', 'N/A')}%")
+                                st.caption(
+                                    "**Ann. Vol** is realised volatility annualised to the bar size — "
+                                    "how much the price actually moved, not an option-implied forecast. "
+                                    "**Max DD** is the deepest peak-to-trough loss in the window, the "
+                                    "number that decides whether a position is survivable. **Sharpe** "
+                                    "here is return over volatility with no risk-free rate deducted, so "
+                                    "it flatters everything equally. **Win Rate** counts up-bars and says "
+                                    "nothing about their size: a 70% win rate with one catastrophic loss "
+                                    "still loses money."
+                                )
+
+                            # ═══════════════════════════════════════
+                            # ROW 2: PRICE CHART + BOLLINGER + VOLUME-like indicator
+                            # ═══════════════════════════════════════
+                            st.markdown("---")
+                            _cs = close_series.reset_index(drop=True)
+                            _sma20 = _cs.rolling(20).mean()
+                            _sma50 = _cs.rolling(50).mean()
+                            _bb = compute_bollinger_bands(_cs)
+
+                            fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                                      row_heights=[0.75, 0.25], vertical_spacing=0.03)
+                            fig_price.add_trace(go.Scatter(y=_cs, name="Close", line=dict(color="#00cc66", width=1.5)), row=1, col=1)
+                            fig_price.add_trace(go.Scatter(y=_sma20, name="SMA 20", line=dict(color="#ffaa00", width=1, dash="dot")), row=1, col=1)
+                            fig_price.add_trace(go.Scatter(y=_sma50, name="SMA 50", line=dict(color="#ff5566", width=1, dash="dot")), row=1, col=1)
+                            fig_price.add_trace(go.Scatter(y=_bb["upper"], name="BB Upper", line=dict(color="#444", width=0.5), showlegend=False), row=1, col=1)
+                            fig_price.add_trace(go.Scatter(y=_bb["lower"], name="BB Lower", line=dict(color="#444", width=0.5), fill="tonexty", fillcolor="rgba(100,100,100,0.1)", showlegend=False), row=1, col=1)
+                            # RSI subplot
+                            _rsi = compute_rsi(_cs)
+                            fig_price.add_trace(go.Scatter(y=_rsi, name="RSI(14)", line=dict(color="#aa88ff", width=1)), row=2, col=1)
+                            fig_price.add_hline(y=70, line_dash="dash", line_color="#ff4444", line_width=0.5, row=2, col=1)
+                            fig_price.add_hline(y=30, line_dash="dash", line_color="#44ff44", line_width=0.5, row=2, col=1)
+                            fig_price.update_layout(
+                                template="plotly_dark", height=440,
+                                margin=dict(l=0, r=0, t=46, b=0),
+                                legend=dict(orientation="h", y=1.10, x=0, xanchor="left",
+                                            font=dict(size=10)),
+                                paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                hovermode="x unified",
+                            )
+                            fig_price.update_yaxes(title_text="Price", row=1, col=1, gridcolor="#1a1a1a")
+                            fig_price.update_yaxes(title_text="RSI", row=2, col=1, gridcolor="#1a1a1a", range=[0, 100])
+                            fig_price.update_xaxes(gridcolor="#1a1a1a")
+                            st.plotly_chart(fig_price, use_container_width=True)
                             st.caption(
-                                "**Ann. Vol** is realised volatility annualised to the bar size — "
-                                "how much the price actually moved, not an option-implied forecast. "
-                                "**Max DD** is the deepest peak-to-trough loss in the window, the "
-                                "number that decides whether a position is survivable. **Sharpe** "
-                                "here is return over volatility with no risk-free rate deducted, so "
-                                "it flatters everything equally. **Win Rate** counts up-bars and says "
-                                "nothing about their size: a 70% win rate with one catastrophic loss "
-                                "still loses money."
+                                "Bollinger bands are two standard deviations around the 20-bar mean, so "
+                                "roughly 5% of bars close outside them by construction — touching a band "
+                                "is normal, not a signal. RSI compares average gains to average losses "
+                                "over 14 bars; the 70/30 lines are convention, and in a strong trend RSI "
+                                "can sit above 70 for weeks without the trend ending."
                             )
 
-                        # ═══════════════════════════════════════
-                        # ROW 2: PRICE CHART + BOLLINGER + VOLUME-like indicator
-                        # ═══════════════════════════════════════
-                        st.markdown("---")
-                        _cs = close_series.reset_index(drop=True)
-                        _sma20 = _cs.rolling(20).mean()
-                        _sma50 = _cs.rolling(50).mean()
-                        _bb = compute_bollinger_bands(_cs)
+                            # ═══════════════════════════════════════
+                            # ROW 3: REGIME | MOMENTUM | MEAN REVERSION (3 columns, visual)
+                            # ═══════════════════════════════════════
+                            qt1, qt2, qt3 = st.tabs(["📊 Regime & Structure", "🚀 Momentum", "🔄 Mean Reversion"])
 
-                        fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                                  row_heights=[0.75, 0.25], vertical_spacing=0.03)
-                        fig_price.add_trace(go.Scatter(y=_cs, name="Close", line=dict(color="#00cc66", width=1.5)), row=1, col=1)
-                        fig_price.add_trace(go.Scatter(y=_sma20, name="SMA 20", line=dict(color="#ffaa00", width=1, dash="dot")), row=1, col=1)
-                        fig_price.add_trace(go.Scatter(y=_sma50, name="SMA 50", line=dict(color="#ff5566", width=1, dash="dot")), row=1, col=1)
-                        fig_price.add_trace(go.Scatter(y=_bb["upper"], name="BB Upper", line=dict(color="#444", width=0.5), showlegend=False), row=1, col=1)
-                        fig_price.add_trace(go.Scatter(y=_bb["lower"], name="BB Lower", line=dict(color="#444", width=0.5), fill="tonexty", fillcolor="rgba(100,100,100,0.1)", showlegend=False), row=1, col=1)
-                        # RSI subplot
-                        _rsi = compute_rsi(_cs)
-                        fig_price.add_trace(go.Scatter(y=_rsi, name="RSI(14)", line=dict(color="#aa88ff", width=1)), row=2, col=1)
-                        fig_price.add_hline(y=70, line_dash="dash", line_color="#ff4444", line_width=0.5, row=2, col=1)
-                        fig_price.add_hline(y=30, line_dash="dash", line_color="#44ff44", line_width=0.5, row=2, col=1)
-                        fig_price.update_layout(
-                            template="plotly_dark", height=440,
-                            margin=dict(l=0, r=0, t=46, b=0),
-                            legend=dict(orientation="h", y=1.10, x=0, xanchor="left",
-                                        font=dict(size=10)),
-                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                            hovermode="x unified",
-                        )
-                        fig_price.update_yaxes(title_text="Price", row=1, col=1, gridcolor="#1a1a1a")
-                        fig_price.update_yaxes(title_text="RSI", row=2, col=1, gridcolor="#1a1a1a", range=[0, 100])
-                        fig_price.update_xaxes(gridcolor="#1a1a1a")
-                        st.plotly_chart(fig_price, use_container_width=True)
-                        st.caption(
-                            "Bollinger bands are two standard deviations around the 20-bar mean, so "
-                            "roughly 5% of bars close outside them by construction — touching a band "
-                            "is normal, not a signal. RSI compares average gains to average losses "
-                            "over 14 bars; the 70/30 lines are convention, and in a strong trend RSI "
-                            "can sit above 70 for weeks without the trend ending."
-                        )
+                            with qt1:
+                                rc1, rc2 = st.columns([1, 1])
+                                with rc1:
+                                    # Regime gauge
+                                    vol_pct = regime.get("regime_percentile", 50)
+                                    fig_gauge = go.Figure(go.Indicator(
+                                        mode="gauge+number+delta",
+                                        value=vol_pct,
+                                        title={"text": "Volatility Regime Percentile", "font": {"size": 14}},
+                                        delta={"reference": 50, "increasing": {"color": "#ff4444"}, "decreasing": {"color": "#44ff44"}},
+                                        gauge={
+                                            "axis": {"range": [0, 100], "tickcolor": "#888"},
+                                            "bar": {"color": "#00cc66" if vol_pct < 40 else "#ffaa00" if vol_pct < 70 else "#ff4444"},
+                                            "bgcolor": "#111",
+                                            "steps": [
+                                                {"range": [0, 33], "color": "#0a2a0a"},
+                                                {"range": [33, 66], "color": "#2a2a0a"},
+                                                {"range": [66, 100], "color": "#2a0a0a"},
+                                            ],
+                                        }
+                                    ))
+                                    fig_gauge.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=50, b=10),
+                                                            paper_bgcolor="#000", plot_bgcolor="#000")
+                                    st.plotly_chart(fig_gauge, use_container_width=True)
+                                    st.caption(
+                                        "Where current 63-bar volatility sits against this asset's own "
+                                        "history. High percentile means the market is moving more than "
+                                        "usual for *this* asset — it says nothing about direction, and "
+                                        "the level is not comparable across assets."
+                                    )
 
-                        # ═══════════════════════════════════════
-                        # ROW 3: REGIME | MOMENTUM | MEAN REVERSION (3 columns, visual)
-                        # ═══════════════════════════════════════
-                        qt1, qt2, qt3 = st.tabs(["📊 Regime & Structure", "🚀 Momentum", "🔄 Mean Reversion"])
-
-                        with qt1:
-                            rc1, rc2 = st.columns([1, 1])
-                            with rc1:
-                                # Regime gauge
-                                vol_pct = regime.get("regime_percentile", 50)
-                                fig_gauge = go.Figure(go.Indicator(
-                                    mode="gauge+number+delta",
-                                    value=vol_pct,
-                                    title={"text": "Volatility Regime Percentile", "font": {"size": 14}},
-                                    delta={"reference": 50, "increasing": {"color": "#ff4444"}, "decreasing": {"color": "#44ff44"}},
-                                    gauge={
-                                        "axis": {"range": [0, 100], "tickcolor": "#888"},
-                                        "bar": {"color": "#00cc66" if vol_pct < 40 else "#ffaa00" if vol_pct < 70 else "#ff4444"},
-                                        "bgcolor": "#111",
-                                        "steps": [
-                                            {"range": [0, 33], "color": "#0a2a0a"},
-                                            {"range": [33, 66], "color": "#2a2a0a"},
-                                            {"range": [66, 100], "color": "#2a0a0a"},
-                                        ],
+                                with rc2:
+                                    st.markdown("##### Market Structure")
+                                    _struct_data = {
+                                        "Metric": ["Vol Regime", "Ann. Volatility", "Regime Duration", "Hurst Exponent", "Hurst Signal", "Skewness", "Excess Kurtosis", "VaR 95%", "CVaR 95%"],
+                                        "Value": [
+                                            regime.get("current_regime", "?"),
+                                            f"{regime.get('current_vol_annualized', 0):.1%}",
+                                            f"{regime.get('regime_duration_bars', 0)} bars",
+                                            f"{hurst:.3f}" if hurst else "N/A",
+                                            "🟢 Trending" if (hurst and hurst > 0.55) else ("🔵 Mean-Reverting" if (hurst and hurst < 0.45) else "⚪ Random Walk"),
+                                            f"{qm.get('skew', 'N/A')}",
+                                            f"{qm.get('kurtosis', 'N/A')}",
+                                            f"{qm.get('VaR_95_logret', 'N/A')}",
+                                            f"{qm.get('CVaR_95_logret', 'N/A')}",
+                                        ]
                                     }
-                                ))
-                                fig_gauge.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=50, b=10),
-                                                        paper_bgcolor="#000", plot_bgcolor="#000")
-                                st.plotly_chart(fig_gauge, use_container_width=True)
+                                    st.dataframe(pd.DataFrame(_struct_data).set_index("Metric"), use_container_width=True)
+                                    st.caption(
+                                        "**Hurst** measures whether moves persist or reverse: above 0.5 "
+                                        "the series trends, below 0.5 it mean-reverts, 0.5 is a random "
+                                        "walk. It is direction-agnostic — a crashing market trends too. "
+                                        "**Skew** below zero means losses arrive in bigger single moves "
+                                        "than gains. **Excess kurtosis** above zero means fat tails: "
+                                        "extreme moves happen far more often than a normal distribution "
+                                        "implies, which is why the Monte Carlo below understates risk. "
+                                        "**VaR 95%** is the loss the worst 5% of bars exceed; **CVaR** is "
+                                        "the average loss once you are in that 5% — the more honest of "
+                                        "the two, because VaR says nothing about how bad the tail gets."
+                                    )
+
+                                # Rolling vol chart
+                                _rvol_20 = returns.rolling(20).std() * np.sqrt(bpy)
+                                _rvol_60 = returns.rolling(60).std() * np.sqrt(bpy)
+                                fig_rvol = go.Figure()
+                                fig_rvol.add_trace(go.Scatter(y=_rvol_20 * 100, name="20d Rolling Vol %", line=dict(color="#ff8800", width=1)))
+                                fig_rvol.add_trace(go.Scatter(y=_rvol_60 * 100, name="60d Rolling Vol %", line=dict(color="#4488ff", width=1)))
+                                fig_rvol.update_layout(template="plotly_dark", height=230,
+                                                        margin=dict(l=0, r=0, t=34, b=0),
+                                                        title=dict(text="Rolling volatility, annualised",
+                                                                   font=dict(size=13)),
+                                                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                        yaxis_title="% annualised",
+                                                        xaxis_title="Bars (oldest to newest)",
+                                                        hovermode="x unified",
+                                                        legend=dict(orientation="h", font=dict(size=10)))
+                                fig_rvol.update_yaxes(gridcolor="#1a1a1a")
+                                fig_rvol.update_xaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_rvol, use_container_width=True)
                                 st.caption(
-                                    "Where current 63-bar volatility sits against this asset's own "
-                                    "history. High percentile means the market is moving more than "
-                                    "usual for *this* asset — it says nothing about direction, and "
-                                    "the level is not comparable across assets."
+                                    "Short-window volatility rising above the long window is the market "
+                                    "repricing risk now rather than drifting; the two converging is a "
+                                    "regime settling down."
                                 )
 
-                            with rc2:
-                                st.markdown("##### Market Structure")
-                                _struct_data = {
-                                    "Metric": ["Vol Regime", "Ann. Volatility", "Regime Duration", "Hurst Exponent", "Hurst Signal", "Skewness", "Excess Kurtosis", "VaR 95%", "CVaR 95%"],
-                                    "Value": [
-                                        regime.get("current_regime", "?"),
-                                        f"{regime.get('current_vol_annualized', 0):.1%}",
-                                        f"{regime.get('regime_duration_bars', 0)} bars",
-                                        f"{hurst:.3f}" if hurst else "N/A",
-                                        "🟢 Trending" if (hurst and hurst > 0.55) else ("🔵 Mean-Reverting" if (hurst and hurst < 0.45) else "⚪ Random Walk"),
-                                        f"{qm.get('skew', 'N/A')}",
-                                        f"{qm.get('kurtosis', 'N/A')}",
-                                        f"{qm.get('VaR_95_logret', 'N/A')}",
-                                        f"{qm.get('CVaR_95_logret', 'N/A')}",
-                                    ]
-                                }
-                                st.dataframe(pd.DataFrame(_struct_data).set_index("Metric"), use_container_width=True)
-                                st.caption(
-                                    "**Hurst** measures whether moves persist or reverse: above 0.5 "
-                                    "the series trends, below 0.5 it mean-reverts, 0.5 is a random "
-                                    "walk. It is direction-agnostic — a crashing market trends too. "
-                                    "**Skew** below zero means losses arrive in bigger single moves "
-                                    "than gains. **Excess kurtosis** above zero means fat tails: "
-                                    "extreme moves happen far more often than a normal distribution "
-                                    "implies, which is why the Monte Carlo below understates risk. "
-                                    "**VaR 95%** is the loss the worst 5% of bars exceed; **CVaR** is "
-                                    "the average loss once you are in that 5% — the more honest of "
-                                    "the two, because VaR says nothing about how bad the tail gets."
-                                )
+                                # Autocorrelation bar chart
+                                if acf:
+                                    acf_lags = list(acf.keys())
+                                    acf_vals = list(acf.values())
+                                    acf_colors = ["#44ff44" if v > 0.05 else "#ff4444" if v < -0.05 else "#888" for v in acf_vals]
+                                    fig_acf = go.Figure(go.Bar(x=[f"Lag {k.split('_')[1]}" for k in acf_lags], y=acf_vals,
+                                                                marker_color=acf_colors))
+                                    fig_acf.add_hline(y=0.05, line_dash="dash", line_color="#444", line_width=0.5)
+                                    fig_acf.add_hline(y=-0.05, line_dash="dash", line_color="#444", line_width=0.5)
+                                    fig_acf.update_layout(template="plotly_dark", height=230,
+                                                           margin=dict(l=0, r=0, t=34, b=0),
+                                                           title=dict(text="Return autocorrelation by lag",
+                                                                      font=dict(size=13)),
+                                                           paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                           yaxis_title="Correlation coefficient",
+                                                           xaxis_title="Lag (bars)")
+                                    fig_acf.update_yaxes(gridcolor="#1a1a1a")
+                                    st.plotly_chart(fig_acf, use_container_width=True)
+                                    lag1 = acf.get("lag_1", 0)
+                                    if lag1 > 0.05:
+                                        _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: an up "
+                                                     "bar has been followed by another up bar "
+                                                     "slightly more often than chance.")
+                                    elif lag1 < -0.05:
+                                        _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: bars "
+                                                     "have tended to alternate rather than "
+                                                     "follow through.")
+                                    else:
+                                        _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}, close "
+                                                     "to zero: one bar has said essentially "
+                                                     "nothing about the next.")
+                                    st.caption(
+                                        _acf_read + " Correlation of each bar's return with the "
+                                        "return n bars earlier. Daily financial returns sit near "
+                                        "zero at every lag — values under about 0.1 are within "
+                                        "the range you would see in random data over this many "
+                                        "observations, so read the direction, not the presence of "
+                                        "a bar. This describes the measured window; it is not a "
+                                        "reason to favour a strategy."
+                                    )
 
-                            # Rolling vol chart
-                            _rvol_20 = returns.rolling(20).std() * np.sqrt(bpy)
-                            _rvol_60 = returns.rolling(60).std() * np.sqrt(bpy)
-                            fig_rvol = go.Figure()
-                            fig_rvol.add_trace(go.Scatter(y=_rvol_20 * 100, name="20d Rolling Vol %", line=dict(color="#ff8800", width=1)))
-                            fig_rvol.add_trace(go.Scatter(y=_rvol_60 * 100, name="60d Rolling Vol %", line=dict(color="#4488ff", width=1)))
-                            fig_rvol.update_layout(template="plotly_dark", height=230,
-                                                    margin=dict(l=0, r=0, t=34, b=0),
-                                                    title=dict(text="Rolling volatility, annualised",
-                                                               font=dict(size=13)),
-                                                    paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                    yaxis_title="% annualised",
-                                                    xaxis_title="Bars (oldest to newest)",
-                                                    hovermode="x unified",
-                                                    legend=dict(orientation="h", font=dict(size=10)))
-                            fig_rvol.update_yaxes(gridcolor="#1a1a1a")
-                            fig_rvol.update_xaxes(gridcolor="#1a1a1a")
-                            st.plotly_chart(fig_rvol, use_container_width=True)
-                            st.caption(
-                                "Short-window volatility rising above the long window is the market "
-                                "repricing risk now rather than drifting; the two converging is a "
-                                "regime settling down."
-                            )
+                            with qt2:
+                                # Momentum visual
+                                if mom_feat:
+                                    _mom_periods = ["5d", "21d", "63d", "126d", "252d"]
+                                    _mom_keys = ["return_5d_pct", "return_21d_pct", "return_63d_pct", "return_126d_pct", "return_252d_pct"]
+                                    _mom_vals = [float(mom_feat.get(k, 0) or 0) for k in _mom_keys]
+                                    _mom_colors = ["#00cc44" if v > 0 else "#ff4444" for v in _mom_vals]
 
-                            # Autocorrelation bar chart
-                            if acf:
-                                acf_lags = list(acf.keys())
-                                acf_vals = list(acf.values())
-                                acf_colors = ["#44ff44" if v > 0.05 else "#ff4444" if v < -0.05 else "#888" for v in acf_vals]
-                                fig_acf = go.Figure(go.Bar(x=[f"Lag {k.split('_')[1]}" for k in acf_lags], y=acf_vals,
-                                                            marker_color=acf_colors))
-                                fig_acf.add_hline(y=0.05, line_dash="dash", line_color="#444", line_width=0.5)
-                                fig_acf.add_hline(y=-0.05, line_dash="dash", line_color="#444", line_width=0.5)
-                                fig_acf.update_layout(template="plotly_dark", height=230,
-                                                       margin=dict(l=0, r=0, t=34, b=0),
-                                                       title=dict(text="Return autocorrelation by lag",
-                                                                  font=dict(size=13)),
-                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                       yaxis_title="Correlation coefficient",
-                                                       xaxis_title="Lag (bars)")
-                                fig_acf.update_yaxes(gridcolor="#1a1a1a")
-                                st.plotly_chart(fig_acf, use_container_width=True)
-                                lag1 = acf.get("lag_1", 0)
-                                if lag1 > 0.05:
-                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: an up "
-                                                 "bar has been followed by another up bar "
-                                                 "slightly more often than chance.")
-                                elif lag1 < -0.05:
-                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}: bars "
-                                                 "have tended to alternate rather than "
-                                                 "follow through.")
-                                else:
-                                    _acf_read = (f"Lag-1 autocorrelation is {lag1:+.3f}, close "
-                                                 "to zero: one bar has said essentially "
-                                                 "nothing about the next.")
-                                st.caption(
-                                    _acf_read + " Correlation of each bar's return with the "
-                                    "return n bars earlier. Daily financial returns sit near "
-                                    "zero at every lag — values under about 0.1 are within "
-                                    "the range you would see in random data over this many "
-                                    "observations, so read the direction, not the presence of "
-                                    "a bar. This describes the measured window; it is not a "
-                                    "reason to favour a strategy."
-                                )
+                                    fig_mom = go.Figure(go.Bar(x=_mom_periods, y=_mom_vals, marker_color=_mom_colors,
+                                                                text=[f"{v:+.1f}%" for v in _mom_vals], textposition="outside"))
+                                    fig_mom.update_layout(template="plotly_dark", height=280, margin=dict(l=0, r=0, t=40, b=0),
+                                                           title=dict(text="Multi-Timeframe Returns", font=dict(size=14)),
+                                                           paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                           yaxis_title="%")
+                                    fig_mom.update_yaxes(gridcolor="#1a1a1a")
+                                    st.plotly_chart(fig_mom, use_container_width=True)
+                                    st.caption(
+                                        "Return over each lookback, measured to now. Agreement across "
+                                        "horizons means one regime has held; disagreement — say 252d "
+                                        "positive but 21d negative — means the longer trend is being "
+                                        "challenged, which is usually the more informative reading."
+                                    )
 
-                        with qt2:
-                            # Momentum visual
-                            if mom_feat:
-                                _mom_periods = ["5d", "21d", "63d", "126d", "252d"]
-                                _mom_keys = ["return_5d_pct", "return_21d_pct", "return_63d_pct", "return_126d_pct", "return_252d_pct"]
-                                _mom_vals = [float(mom_feat.get(k, 0) or 0) for k in _mom_keys]
-                                _mom_colors = ["#00cc44" if v > 0 else "#ff4444" for v in _mom_vals]
-
-                                fig_mom = go.Figure(go.Bar(x=_mom_periods, y=_mom_vals, marker_color=_mom_colors,
-                                                            text=[f"{v:+.1f}%" for v in _mom_vals], textposition="outside"))
-                                fig_mom.update_layout(template="plotly_dark", height=280, margin=dict(l=0, r=0, t=40, b=0),
-                                                       title=dict(text="Multi-Timeframe Returns", font=dict(size=14)),
-                                                       paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                       yaxis_title="%")
-                                fig_mom.update_yaxes(gridcolor="#1a1a1a")
-                                st.plotly_chart(fig_mom, use_container_width=True)
-                                st.caption(
-                                    "Return over each lookback, measured to now. Agreement across "
-                                    "horizons means one regime has held; disagreement — say 252d "
-                                    "positive but 21d negative — means the longer trend is being "
-                                    "challenged, which is usually the more informative reading."
-                                )
-
-                                mom_score_v = mom_feat.get("momentum_composite_score")
-                                if mom_score_v is not None:
-                                    # Describes the trailing move only. Tested on 457
-                                    # S&P names 2012-2026, this score's rank IC against
-                                    # forward 21d returns is -0.004 (t=-0.24) — so it
-                                    # gets past-tense wording, not BULLISH/BEARISH.
-                                    if mom_score_v > 5: mom_label = "strong uptrend"
-                                    elif mom_score_v > 1: mom_label = "uptrend"
-                                    elif mom_score_v > -1: mom_label = "flat"
-                                    elif mom_score_v > -5: mom_label = "downtrend"
-                                    else: mom_label = "strong downtrend"
-                                    _mc = "#00cc66" if mom_score_v > 1 else "#ff4444" if mom_score_v < -1 else "#cccc00"
-                                    st.markdown(f"""
+                                    mom_score_v = mom_feat.get("momentum_composite_score")
+                                    if mom_score_v is not None:
+                                        # Describes the trailing move only. Tested on 457
+                                        # S&P names 2012-2026, this score's rank IC against
+                                        # forward 21d returns is -0.004 (t=-0.24) — so it
+                                        # gets past-tense wording, not BULLISH/BEARISH.
+                                        if mom_score_v > 5: mom_label = "strong uptrend"
+                                        elif mom_score_v > 1: mom_label = "uptrend"
+                                        elif mom_score_v > -1: mom_label = "flat"
+                                        elif mom_score_v > -5: mom_label = "downtrend"
+                                        else: mom_label = "strong downtrend"
+                                        _mc = "#00cc66" if mom_score_v > 1 else "#ff4444" if mom_score_v < -1 else "#cccc00"
+                                        st.markdown(f"""
                                     <div style="text-align:center;padding:10px;background:#111;border-radius:8px;border:1px solid {_mc}">
                                     <span style="font-size:14px;color:#888">Composite Momentum Score — trailing</span><br>
                                     <span style="font-size:36px;font-weight:900;color:{_mc}">{mom_score_v:+.2f}</span>
                                     <span style="font-size:16px;color:{_mc};margin-left:10px">{mom_label}</span>
                                     </div>
                                     """, unsafe_allow_html=True)
-                                    st.caption("Weighted 5/21/63/126/252-bar return. "
-                                               "Describes what the price did, not what it will do.")
-                            else:
-                                st.info("Not enough data for momentum (need 252+ bars).")
+                                        st.caption("Weighted 5/21/63/126/252-bar return. "
+                                                   "Describes what the price did, not what it will do.")
+                                else:
+                                    st.info("Not enough data for momentum (need 252+ bars).")
 
-                        with qt3:
-                            # Mean reversion dashboard
-                            if mean_rev:
-                                zc1, zc2 = st.columns(2)
-                                z20v = mean_rev.get("z_score_20")
-                                z50v = mean_rev.get("z_score_50")
-                                hlv = mean_rev.get("ou_half_life")
+                            with qt3:
+                                # Mean reversion dashboard
+                                if mean_rev:
+                                    zc1, zc2 = st.columns(2)
+                                    z20v = mean_rev.get("z_score_20")
+                                    z50v = mean_rev.get("z_score_50")
+                                    hlv = mean_rev.get("ou_half_life")
 
-                                with zc1:
-                                    # Z-score gauge
-                                    _zval = float(z20v) if z20v is not None else 0
-                                    fig_z = go.Figure(go.Indicator(
-                                        mode="gauge+number",
-                                        value=_zval,
-                                        title={"text": "Z-Score (20d)", "font": {"size": 14}},
-                                        gauge={
-                                            "axis": {"range": [-3, 3], "tickcolor": "#888"},
-                                            "bar": {"color": "#00cc66" if abs(_zval) < 1 else "#ffaa00" if abs(_zval) < 2 else "#ff4444"},
-                                            "bgcolor": "#111",
-                                            "steps": [
-                                                {"range": [-3, -2], "color": "#0a2a0a"},
-                                                {"range": [-2, -1], "color": "#1a2a1a"},
-                                                {"range": [-1, 1], "color": "#1a1a1a"},
-                                                {"range": [1, 2], "color": "#2a1a1a"},
-                                                {"range": [2, 3], "color": "#2a0a0a"},
-                                            ],
+                                    with zc1:
+                                        # Z-score gauge
+                                        _zval = float(z20v) if z20v is not None else 0
+                                        fig_z = go.Figure(go.Indicator(
+                                            mode="gauge+number",
+                                            value=_zval,
+                                            title={"text": "Z-Score (20d)", "font": {"size": 14}},
+                                            gauge={
+                                                "axis": {"range": [-3, 3], "tickcolor": "#888"},
+                                                "bar": {"color": "#00cc66" if abs(_zval) < 1 else "#ffaa00" if abs(_zval) < 2 else "#ff4444"},
+                                                "bgcolor": "#111",
+                                                "steps": [
+                                                    {"range": [-3, -2], "color": "#0a2a0a"},
+                                                    {"range": [-2, -1], "color": "#1a2a1a"},
+                                                    {"range": [-1, 1], "color": "#1a1a1a"},
+                                                    {"range": [1, 2], "color": "#2a1a1a"},
+                                                    {"range": [2, 3], "color": "#2a0a0a"},
+                                                ],
+                                            }
+                                        ))
+                                        fig_z.update_layout(template="plotly_dark", height=220, margin=dict(l=20, r=20, t=50, b=0),
+                                                             paper_bgcolor="#000", plot_bgcolor="#000")
+                                        st.plotly_chart(fig_z, use_container_width=True)
+
+                                    with zc2:
+                                        st.markdown("##### Mean Reversion Measures")
+                                        _mr_data = {
+                                            "Metric": ["Z-Score (20d)", "Z-Score (50d)", "O-U Half-Life",
+                                                        "BB %B", "RSI(14)"],
+                                            "Value": [
+                                                f"{z20v}" if z20v is not None else "N/A",
+                                                f"{z50v}" if z50v is not None else "N/A",
+                                                f"{hlv:.0f} bars" if hlv else "N/A (trending)",
+                                                f"{mean_rev.get('bb_pct')}" if mean_rev.get('bb_pct') is not None else "N/A",
+                                                f"{mean_rev.get('rsi_14')}" if mean_rev.get('rsi_14') is not None else "N/A",
+                                            ]
                                         }
-                                    ))
-                                    fig_z.update_layout(template="plotly_dark", height=220, margin=dict(l=20, r=20, t=50, b=0),
-                                                         paper_bgcolor="#000", plot_bgcolor="#000")
-                                    st.plotly_chart(fig_z, use_container_width=True)
+                                        st.dataframe(pd.DataFrame(_mr_data).set_index("Metric"), use_container_width=True)
+                                        st.caption(
+                                            "A 'Signal' row used to sit here reading BUY/SELL. "
+                                            "It was wired to a key the calculation never "
+                                            "returned, so it was always blank — and a plain "
+                                            "z-score rule tests at IC 0.017 (t=1.51), which "
+                                            "is not significant. Removed rather than faked."
+                                        )
 
-                                with zc2:
-                                    st.markdown("##### Mean Reversion Measures")
-                                    _mr_data = {
-                                        "Metric": ["Z-Score (20d)", "Z-Score (50d)", "O-U Half-Life",
-                                                    "BB %B", "RSI(14)"],
+                            # ═══════════════════════════════════════
+                            # ROW 4: TAIL RISK + JUMP DIFFUSION
+                            # ═══════════════════════════════════════
+                            st.markdown("---")
+                            tl1, tl2 = st.columns(2)
+
+                            with tl1:
+                                st.markdown("##### 🛡 Tail Risk & Performance")
+                                if tail_risk:
+                                    _tr_data = {
+                                        "Metric": ["Sortino", "Calmar", "Tail Ratio", "Gain/Pain", "Win Rate",
+                                                    "Max Drawdown", "Ann. Return", "VaR 95%"],
                                         "Value": [
-                                            f"{z20v}" if z20v is not None else "N/A",
-                                            f"{z50v}" if z50v is not None else "N/A",
-                                            f"{hlv:.0f} bars" if hlv else "N/A (trending)",
-                                            f"{mean_rev.get('bb_pct')}" if mean_rev.get('bb_pct') is not None else "N/A",
-                                            f"{mean_rev.get('rsi_14')}" if mean_rev.get('rsi_14') is not None else "N/A",
+                                            tail_risk.get("sortino_ratio", "N/A"),
+                                            tail_risk.get("calmar_ratio", "N/A"),
+                                            tail_risk.get("tail_ratio", "N/A"),
+                                            tail_risk.get("gain_pain_ratio", "N/A"),
+                                            f"{tail_risk.get('win_rate_pct', 'N/A')}%",
+                                            f"{tail_risk.get('max_drawdown_pct', 'N/A')}%",
+                                            f"{tail_risk.get('annualized_return_pct', 'N/A')}%",
+                                            f"{qm.get('VaR_95_logret', 'N/A')}",
                                         ]
                                     }
-                                    st.dataframe(pd.DataFrame(_mr_data).set_index("Metric"), use_container_width=True)
+                                    st.dataframe(pd.DataFrame(_tr_data).set_index("Metric"), use_container_width=True)
                                     st.caption(
-                                        "A 'Signal' row used to sit here reading BUY/SELL. "
-                                        "It was wired to a key the calculation never "
-                                        "returned, so it was always blank — and a plain "
-                                        "z-score rule tests at IC 0.017 (t=1.51), which "
-                                        "is not significant. Removed rather than faked."
+                                        "**Sortino** is Sharpe with only downside deviation in the "
+                                        "denominator, so upside volatility is not punished. **Calmar** "
+                                        "is annual return over max drawdown — return per unit of worst "
+                                        "pain. **Tail ratio** compares the size of the best 5% of bars "
+                                        "to the worst 5%; below 1 means losses arrive larger than gains. "
+                                        "**Gain/pain** is total gains over total losses. All are "
+                                        "backward-looking descriptions of the window shown, not "
+                                        "expectations."
                                     )
 
-                        # ═══════════════════════════════════════
-                        # ROW 4: TAIL RISK + JUMP DIFFUSION
-                        # ═══════════════════════════════════════
-                        st.markdown("---")
-                        tl1, tl2 = st.columns(2)
+                                    # Returns distribution histogram
+                                    fig_hist = go.Figure()
+                                    fig_hist.add_trace(go.Histogram(x=returns * 100, nbinsx=80, marker_color="#00cc66",
+                                                                     name="Daily Returns %", opacity=0.7))
+                                    var95v = qm.get("VaR_95_logret")
+                                    if var95v:
+                                        fig_hist.add_vline(x=float(var95v) * 100, line_dash="dash", line_color="#ff4444",
+                                                            annotation_text="VaR 95%", annotation_position="top left")
+                                    fig_hist.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                            title=dict(text="Returns Distribution", font=dict(size=13)),
+                                                            paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                            xaxis_title="Return per bar (%)",
+                                                            yaxis_title="Number of bars")
+                                    fig_hist.update_yaxes(gridcolor="#1a1a1a")
+                                    fig_hist.update_xaxes(gridcolor="#1a1a1a")
+                                    st.plotly_chart(fig_hist, use_container_width=True)
+                                    st.caption(
+                                        "The shape matters more than the spread. Real return "
+                                        "distributions have fatter tails and a longer left side than a "
+                                        "bell curve, which is precisely the risk that volatility alone "
+                                        "does not capture."
+                                    )
 
-                        with tl1:
-                            st.markdown("##### 🛡 Tail Risk & Performance")
-                            if tail_risk:
-                                _tr_data = {
-                                    "Metric": ["Sortino", "Calmar", "Tail Ratio", "Gain/Pain", "Win Rate",
-                                                "Max Drawdown", "Ann. Return", "VaR 95%"],
+                            with tl2:
+                                st.markdown("##### ⚡ Jump-Diffusion (Merton)")
+                                _jd_data = {
+                                    "Metric": ["Jumps/Year (λ)", "Avg Jump Size", "Jump Volatility", "Jump Risk Score",
+                                                "Diffusion Vol", "Jumps Detected"],
                                     "Value": [
-                                        tail_risk.get("sortino_ratio", "N/A"),
-                                        tail_risk.get("calmar_ratio", "N/A"),
-                                        tail_risk.get("tail_ratio", "N/A"),
-                                        tail_risk.get("gain_pain_ratio", "N/A"),
-                                        f"{tail_risk.get('win_rate_pct', 'N/A')}%",
-                                        f"{tail_risk.get('max_drawdown_pct', 'N/A')}%",
-                                        f"{tail_risk.get('annualized_return_pct', 'N/A')}%",
-                                        f"{qm.get('VaR_95_logret', 'N/A')}",
+                                        qm.get("lambda_year", "N/A"),
+                                        f"{qm.get('avg_jump_pct', 'N/A')}%",
+                                        f"{qm.get('jump_vol_pct', 'N/A')}%",
+                                        qm.get("jump_risk_score", "N/A"),
+                                        f"{qm.get('sigma_diffusion_pct', 'N/A')}%",
+                                        qm.get("jumps_count", 0),
                                     ]
                                 }
-                                st.dataframe(pd.DataFrame(_tr_data).set_index("Metric"), use_container_width=True)
+                                st.dataframe(pd.DataFrame(_jd_data).set_index("Metric"), use_container_width=True)
                                 st.caption(
-                                    "**Sortino** is Sharpe with only downside deviation in the "
-                                    "denominator, so upside volatility is not punished. **Calmar** "
-                                    "is annual return over max drawdown — return per unit of worst "
-                                    "pain. **Tail ratio** compares the size of the best 5% of bars "
-                                    "to the worst 5%; below 1 means losses arrive larger than gains. "
-                                    "**Gain/pain** is total gains over total losses. All are "
-                                    "backward-looking descriptions of the window shown, not "
-                                    "expectations."
+                                    "Merton's model splits price action into ordinary diffusion and "
+                                    "discrete jumps, separating bars beyond the z-threshold set in "
+                                    "**Advanced**. **λ** is how many such jumps a year this asset has "
+                                    "produced, **Diffusion vol** is the volatility left once they are "
+                                    "removed. A high λ with low diffusion vol describes an asset that is "
+                                    "calm until it gaps — the profile that breaks stop-losses and makes "
+                                    "the Gaussian Monte Carlo below too optimistic."
                                 )
 
-                                # Returns distribution histogram
-                                fig_hist = go.Figure()
-                                fig_hist.add_trace(go.Histogram(x=returns * 100, nbinsx=80, marker_color="#00cc66",
-                                                                 name="Daily Returns %", opacity=0.7))
-                                var95v = qm.get("VaR_95_logret")
-                                if var95v:
-                                    fig_hist.add_vline(x=float(var95v) * 100, line_dash="dash", line_color="#ff4444",
-                                                        annotation_text="VaR 95%", annotation_position="top left")
-                                fig_hist.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
-                                                        title=dict(text="Returns Distribution", font=dict(size=13)),
-                                                        paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                        xaxis_title="Return per bar (%)",
-                                                        yaxis_title="Number of bars")
-                                fig_hist.update_yaxes(gridcolor="#1a1a1a")
-                                fig_hist.update_xaxes(gridcolor="#1a1a1a")
-                                st.plotly_chart(fig_hist, use_container_width=True)
+                                # Drawdown chart
+                                _cum = (1 + returns).cumprod()
+                                _peak = _cum.cummax()
+                                _dd = (_cum / _peak - 1) * 100
+                                fig_dd = go.Figure()
+                                fig_dd.add_trace(go.Scatter(y=_dd, fill="tozeroy", fillcolor="rgba(255,68,68,0.2)",
+                                                             line=dict(color="#ff4444", width=1), name="Drawdown %"))
+                                fig_dd.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                      title=dict(text="Drawdown Curve", font=dict(size=13)),
+                                                      paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                      yaxis_title="Drawdown %")
+                                fig_dd.update_yaxes(gridcolor="#1a1a1a")
+                                fig_dd.update_xaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_dd, use_container_width=True)
                                 st.caption(
-                                    "The shape matters more than the spread. Real return "
-                                    "distributions have fatter tails and a longer left side than a "
-                                    "bell curve, which is precisely the risk that volatility alone "
-                                    "does not capture."
+                                    "Distance below the running peak. The width of a trough — how long "
+                                    "recovery took — is usually the harder constraint to hold through "
+                                    "than its depth."
                                 )
 
-                        with tl2:
-                            st.markdown("##### ⚡ Jump-Diffusion (Merton)")
-                            _jd_data = {
-                                "Metric": ["Jumps/Year (λ)", "Avg Jump Size", "Jump Volatility", "Jump Risk Score",
-                                            "Diffusion Vol", "Jumps Detected"],
-                                "Value": [
-                                    qm.get("lambda_year", "N/A"),
-                                    f"{qm.get('avg_jump_pct', 'N/A')}%",
-                                    f"{qm.get('jump_vol_pct', 'N/A')}%",
-                                    qm.get("jump_risk_score", "N/A"),
-                                    f"{qm.get('sigma_diffusion_pct', 'N/A')}%",
-                                    qm.get("jumps_count", 0),
-                                ]
-                            }
-                            st.dataframe(pd.DataFrame(_jd_data).set_index("Metric"), use_container_width=True)
+                            # ═══════════════════════════════════════
+                            # ROW 5: MONTE CARLO
+                            # ═══════════════════════════════════════
+                            st.markdown("---")
+                            st.markdown(f"##### 🎲 Monte Carlo Scenarios — {horizon_label_q} ahead ({mc_sims_q:,} sims)")
                             st.caption(
-                                "Merton's model splits price action into ordinary diffusion and "
-                                "discrete jumps, separating bars beyond the z-threshold set in "
-                                "**Advanced**. **λ** is how many such jumps a year this asset has "
-                                "produced, **Diffusion vol** is the volatility left once they are "
-                                "removed. A high λ with low diffusion vol describes an asset that is "
-                                "calm until it gaps — the profile that breaks stop-losses and makes "
-                                "the Gaussian Monte Carlo below too optimistic."
+                                "Simulated forward prices, drawing the drift and volatility of the "
+                                "window above and compounding them over the horizon. **P10 and P90 are "
+                                "not a forecast range** — they are where 10% and 90% of paths landed "
+                                "*if the future resembles the past*. Two limits worth stating out loud: "
+                                "shocks are drawn from a normal distribution, so the fat tails and jumps "
+                                "measured on the left are absent and the downside is understated; and "
+                                "the drift is simply the window's own average return, so a strong "
+                                "trailing run is projected forward as if it continues."
                             )
 
-                            # Drawdown chart
-                            _cum = (1 + returns).cumprod()
-                            _peak = _cum.cummax()
-                            _dd = (_cum / _peak - 1) * 100
-                            fig_dd = go.Figure()
-                            fig_dd.add_trace(go.Scatter(y=_dd, fill="tozeroy", fillcolor="rgba(255,68,68,0.2)",
-                                                         line=dict(color="#ff4444", width=1), name="Drawdown %"))
-                            fig_dd.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
-                                                  title=dict(text="Drawdown Curve", font=dict(size=13)),
-                                                  paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                  yaxis_title="Drawdown %")
-                            fig_dd.update_yaxes(gridcolor="#1a1a1a")
-                            fig_dd.update_xaxes(gridcolor="#1a1a1a")
-                            st.plotly_chart(fig_dd, use_container_width=True)
-                            st.caption(
-                                "Distance below the running peak. The width of a trough — how long "
-                                "recovery took — is usually the harder constraint to hold through "
-                                "than its depth."
-                            )
+                            # mc_result was drawn once above, before compute_quant_metrics.
+                            mc_p10 = mc_result.get("mc_p10")
+                            mc_p50 = mc_result.get("mc_p50")
+                            mc_p90 = mc_result.get("mc_p90")
+                            mc_mean = mc_result.get("mc_mean")
 
-                        # ═══════════════════════════════════════
-                        # ROW 5: MONTE CARLO
-                        # ═══════════════════════════════════════
-                        st.markdown("---")
-                        st.markdown(f"##### 🎲 Monte Carlo Scenarios — {horizon_label_q} ahead ({mc_sims_q:,} sims)")
-                        st.caption(
-                            "Simulated forward prices, drawing the drift and volatility of the "
-                            "window above and compounding them over the horizon. **P10 and P90 are "
-                            "not a forecast range** — they are where 10% and 90% of paths landed "
-                            "*if the future resembles the past*. Two limits worth stating out loud: "
-                            "shocks are drawn from a normal distribution, so the fat tails and jumps "
-                            "measured on the left are absent and the downside is understated; and "
-                            "the drift is simply the window's own average return, so a strong "
-                            "trailing run is projected forward as if it continues."
-                        )
-
-                        # mc_result was drawn once above, before compute_quant_metrics.
-                        mc_p10 = mc_result.get("mc_p10")
-                        mc_p50 = mc_result.get("mc_p50")
-                        mc_p90 = mc_result.get("mc_p90")
-                        mc_mean = mc_result.get("mc_mean")
-
-                        if mc_p10 is not None and last_p:
-                            mc1, mc2, mc3, mc4 = st.columns(4)
-                            mc1.markdown(f"""
+                            if mc_p10 is not None and last_p:
+                                mc1, mc2, mc3, mc4 = st.columns(4)
+                                mc1.markdown(f"""
                             <div style="background:#1a0a0a;border:1px solid #ff4444;border-radius:8px;padding:12px;text-align:center">
                             <div style="color:#888;font-size:12px">🔴 BEAR (P10)</div>
                             <div style="color:#ff4444;font-size:24px;font-weight:900">${mc_p10:,.2f}</div>
                             <div style="color:#ff4444;font-size:14px">{((mc_p10/last_p)-1)*100:+.1f}%</div>
                             </div>""", unsafe_allow_html=True)
-                            mc2.markdown(f"""
+                                mc2.markdown(f"""
                             <div style="background:#1a1a1a;border:1px solid #888;border-radius:8px;padding:12px;text-align:center">
                             <div style="color:#888;font-size:12px">⚪ BASE (P50)</div>
                             <div style="color:#fff;font-size:24px;font-weight:900">${mc_p50:,.2f}</div>
                             <div style="color:#888;font-size:14px">{((mc_p50/last_p)-1)*100:+.1f}%</div>
                             </div>""", unsafe_allow_html=True)
-                            mc3.markdown(f"""
+                                mc3.markdown(f"""
                             <div style="background:#0a1a0a;border:1px solid #00cc44;border-radius:8px;padding:12px;text-align:center">
                             <div style="color:#888;font-size:12px">🟢 BULL (P90)</div>
                             <div style="color:#00cc44;font-size:24px;font-weight:900">${mc_p90:,.2f}</div>
                             <div style="color:#00cc44;font-size:14px">{((mc_p90/last_p)-1)*100:+.1f}%</div>
                             </div>""", unsafe_allow_html=True)
-                            mc4.markdown(f"""
+                                mc4.markdown(f"""
                             <div style="background:#0a0a1a;border:1px solid #4488ff;border-radius:8px;padding:12px;text-align:center">
                             <div style="color:#888;font-size:12px">📊 EXPECTED</div>
                             <div style="color:#4488ff;font-size:24px;font-weight:900">${mc_mean:,.2f}</div>
                             <div style="color:#4488ff;font-size:14px">{((mc_mean/last_p)-1)*100:+.1f}%</div>
                             </div>""", unsafe_allow_html=True)
 
-                            # MC distribution chart — same sample the cards above report.
-                            _final_prices = mc_result.get("mc_samples")
-                            fig_mc = go.Figure()
-                            fig_mc.add_trace(go.Histogram(x=_final_prices, nbinsx=100, marker_color="#4488ff", opacity=0.7, name="Simulated Prices"))
-                            fig_mc.add_vline(x=last_p, line_dash="solid", line_color="#ffffff", annotation_text="Current", line_width=2)
-                            fig_mc.add_vline(x=mc_p10, line_dash="dash", line_color="#ff4444", annotation_text="P10")
-                            fig_mc.add_vline(x=mc_p90, line_dash="dash", line_color="#00cc44", annotation_text="P90")
-                            fig_mc.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
-                                                  title=dict(text="Monte Carlo Price Distribution", font=dict(size=13)),
-                                                  paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
-                                                  xaxis_title="Simulated price at horizon",
-                                                  yaxis_title="Number of paths")
-                            fig_mc.update_yaxes(gridcolor="#1a1a1a")
-                            fig_mc.update_xaxes(gridcolor="#1a1a1a")
-                            st.plotly_chart(fig_mc, use_container_width=True)
-                            st.caption(
-                                "The full distribution behind the four cards, from the same single "
-                                "draw. Its width is the useful part: a narrow spread means the "
-                                "horizon is short relative to volatility, a wide one means the "
-                                "central estimate carries little information."
-                            )
+                                # MC distribution chart — same sample the cards above report.
+                                _final_prices = mc_result.get("mc_samples")
+                                fig_mc = go.Figure()
+                                fig_mc.add_trace(go.Histogram(x=_final_prices, nbinsx=100, marker_color="#4488ff", opacity=0.7, name="Simulated Prices"))
+                                fig_mc.add_vline(x=last_p, line_dash="solid", line_color="#ffffff", annotation_text="Current", line_width=2)
+                                fig_mc.add_vline(x=mc_p10, line_dash="dash", line_color="#ff4444", annotation_text="P10")
+                                fig_mc.add_vline(x=mc_p90, line_dash="dash", line_color="#00cc44", annotation_text="P90")
+                                fig_mc.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=30, b=0),
+                                                      title=dict(text="Monte Carlo Price Distribution", font=dict(size=13)),
+                                                      paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                                      xaxis_title="Simulated price at horizon",
+                                                      yaxis_title="Number of paths")
+                                fig_mc.update_yaxes(gridcolor="#1a1a1a")
+                                fig_mc.update_xaxes(gridcolor="#1a1a1a")
+                                st.plotly_chart(fig_mc, use_container_width=True)
+                                st.caption(
+                                    "The full distribution behind the four cards, from the same single "
+                                    "draw. Its width is the useful part: a narrow spread means the "
+                                    "horizon is short relative to volatility, a wide one means the "
+                                    "central estimate carries little information."
+                                )
 
-                        # ═══════════════════════════════════════
-                        # ROW 6: FULL METRICS + AI ANALYSIS
-                        # ═══════════════════════════════════════
-                        with st.expander("📋 Full Quant Metrics (raw data)"):
-                            st.caption("Every value computed for this asset, unformatted — for "
-                                       "checking a number or exporting it.")
-                            all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
-                            st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
+                            # ═══════════════════════════════════════
+                            # ROW 6: FULL METRICS + AI ANALYSIS
+                            # ═══════════════════════════════════════
+                            with st.expander("📋 Full Quant Metrics (raw data)"):
+                                st.caption("Every value computed for this asset, unformatted — for "
+                                           "checking a number or exporting it.")
+                                all_metrics = {**qm, **regime, **mean_rev, **mom_feat, **tail_risk, **acf}
+                                st.dataframe(pd.DataFrame([all_metrics]), use_container_width=True)
 
-                except Exception as e:
-                    st.error(f"Quant Lab error: {type(e).__name__}: {e}")
+                    except Exception as e:
+                        st.error(f"Quant Lab error: {type(e).__name__}: {e}")
+    else:
+        locked_tab("quant")
 
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:
-    st.subheader("🤖 Analizator — Conversational Agent")
-    st.caption(
-        f"Claude with tool access to this app's data: news (NewsAPI plus "
-        f"{len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} RSS feeds), market quotes "
-        "(Yahoo, Binance), technical indicator state, company fundamentals with "
-        "sector comparison, FRED macro series, the economic calendar, SEC filings "
-        "for ten large institutions, Finnhub analyst estimates, and the crypto "
-        "market aggregate. It reads live data rather than answering from memory, "
-        "and will tell you when a tool returns nothing."
-    )
+    if access.tab_open(current_user(), "ai"):
+        st.subheader("🤖 Analizator — Conversational Agent")
+        st.caption(
+            f"Claude with tool access to this app's data: news (NewsAPI plus "
+            f"{len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} RSS feeds), market quotes "
+            "(Yahoo, Binance), technical indicator state, company fundamentals with "
+            "sector comparison, FRED macro series, the economic calendar, SEC filings "
+            "for ten large institutions, Finnhub analyst estimates, and the crypto "
+            "market aggregate. It reads live data rather than answering from memory, "
+            "and will tell you when a tool returns nothing."
+        )
 
-    if not _HAS_AGENT:
-        st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
+        if not _HAS_AGENT:
+            st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
+        else:
+            # Status row
+            col_s1, col_s2, col_s3 = st.columns(3)
+            try:
+                health = dl.db_health()
+                sched_st = bg_scheduler.scheduler_status()
+                col_s1.metric("News stored", health.get("news_count", 0))
+                col_s2.metric("Market snapshots", health.get("market_count", 0))
+                col_s3.metric("SEC filings", health.get("sec_filings", 0))
+                with st.expander("Background scheduler"):
+                    st.json(sched_st)
+                    st.json(health)
+                    col_a, col_b, col_c, col_d = st.columns(4)
+                    if col_a.button("🔄 Refresh news now"):
+                        bg_scheduler.job_refresh_news()
+                        bg_scheduler.job_refresh_rss()
+                        st.success("Done")
+                    if col_b.button("💹 Refresh quotes now"):
+                        bg_scheduler.job_refresh_quotes()
+                        st.success("Done")
+                    if col_c.button("🪙 Refresh crypto now"):
+                        bg_scheduler.job_refresh_crypto_market()
+                        st.success("Done")
+                    if col_d.button("🏛 Refresh SEC now"):
+                        bg_scheduler.job_refresh_sec()
+                        st.success("Done")
+            except Exception as e:
+                st.warning(f"Status unavailable: {e}")
+
+            # Chat session
+            if "agent_session_id" not in st.session_state:
+                st.session_state["agent_session_id"] = uuid.uuid4().hex
+            if "agent_messages" not in st.session_state:
+                st.session_state["agent_messages"] = []
+            # display_history: list of {"q": str, "a": str, "tools": list}
+            if "agent_display_history" not in st.session_state:
+                st.session_state["agent_display_history"] = []
+
+            col_clear, _ = st.columns([1, 5])
+            if col_clear.button("🧹 Clear chat"):
+                st.session_state["agent_messages"] = []
+                st.session_state["agent_display_history"] = []
+                st.session_state["agent_session_id"] = uuid.uuid4().hex
+                st.rerun()
+
+            # Render old Q&As as collapsed expanders
+            history = st.session_state["agent_display_history"]
+            for i, entry in enumerate(history):
+                q = entry.get("q", "")
+                a = entry.get("a", "")
+                tools = entry.get("tools", [])
+                # Truncate question for expander label
+                label = q[:80] + ("..." if len(q) > 80 else "")
+                with st.expander(f"💬 {label}", expanded=False):
+                    st.markdown(f"**You:** {q}")
+                    st.markdown("---")
+                    st.markdown(a)
+                    if tools:
+                        with st.expander(f"🔧 Tools used ({len(tools)})", expanded=False):
+                            for tc in tools:
+                                st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
+
+            # Input
+            user_input = st.chat_input("Ask the agent anything about markets, macro, news, or institutions...")
+            _ai_block = ai_unavailable("analyst") if user_input else None
+            if user_input and _ai_block:
+                st.warning(_ai_block)
+            elif user_input:
+                st.session_state["agent_messages"].append({"role": "user", "content": user_input})
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        try:
+                            result = ai_agent.run_agent_turn(st.session_state["agent_messages"])
+                            if result["text"].startswith("⚠️"):
+                                access.refund(current_user(), "analyst")
+                            st.session_state["agent_messages"] = result["messages"]
+                            answer_text = result["text"]
+                            tool_calls = result.get("tool_calls", [])
+                            # Save to display history
+                            st.session_state["agent_display_history"].append({
+                                "q": user_input,
+                                "a": answer_text,
+                                "tools": tool_calls,
+                            })
+                            # Show the latest answer fully visible
+                            st.markdown(answer_text)
+                            if tool_calls:
+                                with st.expander(f"🔧 Tools used ({len(tool_calls)})"):
+                                    for tc in tool_calls:
+                                        st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
+                        except Exception as e:
+                            access.refund(current_user(), "analyst")
+                            st.error(f"Agent error: {e}")
     else:
-        # Status row
-        col_s1, col_s2, col_s3 = st.columns(3)
-        try:
-            health = dl.db_health()
-            sched_st = bg_scheduler.scheduler_status()
-            col_s1.metric("News stored", health.get("news_count", 0))
-            col_s2.metric("Market snapshots", health.get("market_count", 0))
-            col_s3.metric("SEC filings", health.get("sec_filings", 0))
-            with st.expander("Background scheduler"):
-                st.json(sched_st)
-                st.json(health)
-                col_a, col_b, col_c, col_d = st.columns(4)
-                if col_a.button("🔄 Refresh news now"):
-                    bg_scheduler.job_refresh_news()
-                    bg_scheduler.job_refresh_rss()
-                    st.success("Done")
-                if col_b.button("💹 Refresh quotes now"):
-                    bg_scheduler.job_refresh_quotes()
-                    st.success("Done")
-                if col_c.button("🪙 Refresh crypto now"):
-                    bg_scheduler.job_refresh_crypto_market()
-                    st.success("Done")
-                if col_d.button("🏛 Refresh SEC now"):
-                    bg_scheduler.job_refresh_sec()
-                    st.success("Done")
-        except Exception as e:
-            st.warning(f"Status unavailable: {e}")
-
-        # Chat session
-        if "agent_session_id" not in st.session_state:
-            st.session_state["agent_session_id"] = uuid.uuid4().hex
-        if "agent_messages" not in st.session_state:
-            st.session_state["agent_messages"] = []
-        # display_history: list of {"q": str, "a": str, "tools": list}
-        if "agent_display_history" not in st.session_state:
-            st.session_state["agent_display_history"] = []
-
-        col_clear, _ = st.columns([1, 5])
-        if col_clear.button("🧹 Clear chat"):
-            st.session_state["agent_messages"] = []
-            st.session_state["agent_display_history"] = []
-            st.session_state["agent_session_id"] = uuid.uuid4().hex
-            st.rerun()
-
-        # Render old Q&As as collapsed expanders
-        history = st.session_state["agent_display_history"]
-        for i, entry in enumerate(history):
-            q = entry.get("q", "")
-            a = entry.get("a", "")
-            tools = entry.get("tools", [])
-            # Truncate question for expander label
-            label = q[:80] + ("..." if len(q) > 80 else "")
-            with st.expander(f"💬 {label}", expanded=False):
-                st.markdown(f"**You:** {q}")
-                st.markdown("---")
-                st.markdown(a)
-                if tools:
-                    with st.expander(f"🔧 Tools used ({len(tools)})", expanded=False):
-                        for tc in tools:
-                            st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
-
-        # Input
-        user_input = st.chat_input("Ask the agent anything about markets, macro, news, or institutions...")
-        if user_input:
-            st.session_state["agent_messages"].append({"role": "user", "content": user_input})
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        result = ai_agent.run_agent_turn(st.session_state["agent_messages"])
-                        st.session_state["agent_messages"] = result["messages"]
-                        answer_text = result["text"]
-                        tool_calls = result.get("tool_calls", [])
-                        # Save to display history
-                        st.session_state["agent_display_history"].append({
-                            "q": user_input,
-                            "a": answer_text,
-                            "tools": tool_calls,
-                        })
-                        # Show the latest answer fully visible
-                        st.markdown(answer_text)
-                        if tool_calls:
-                            with st.expander(f"🔧 Tools used ({len(tool_calls)})"):
-                                for tc in tool_calls:
-                                    st.code(f"{tc['name']}({tc['args']})\n→ {tc['result_preview']}")
-                    except Exception as e:
-                        st.error(f"Agent error: {e}")
+        locked_tab("ai")
 
 # -------- FOMC TAB --------
 with tab_fomc:
-    show_fomc_lab()
+    if access.tab_open(current_user(), "fomc"):
+        show_fomc_lab()
+    else:
+        locked_tab("fomc")
 
 # -------- DEEP BRIEF TAB (multi-agent orchestrator) --------
 with tab_brief:
-    st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
-    st.caption(
-        f"{len(orch.SUBAGENT_SPECS)} specialist sub-agents run in parallel, each "
-        "with its own tool subset and its own brief. A synthesiser then reconciles "
-        "their findings into one note — including where they contradict each "
-        "other, which is usually the most informative part. Deselect any below to "
-        "cut cost and time; the synthesiser is told which ones ran."
-    )
-
-    if not _HAS_ORCH:
-        st.error(f"Orchestrator failed to load: {_ORCH_IMPORT_ERROR}")
-    elif not _HAS_AGENT:
-        st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
-    else:
-        # Hydrate session_state from SQLite cache (survives page reloads)
-        if "last_deep_brief" not in st.session_state:
-            cached = orch.load_cached_brief()
-            if cached:
-                st.session_state["last_deep_brief"] = cached
-
-        # Whether anything will refresh this on its own, said on the face of
-        # the panel rather than inside a collapsed expander. An age alone reads
-        # as a staleness warning, which implies something is due to clear it —
-        # and when nothing is scheduled, that implication is the misleading part.
-        _brief_jobs = bg_scheduler.scheduler_status().get("jobs", [])
-        _brief_scheduled = next((j for j in _brief_jobs
-                                 if j.get("id") == "deep_brief"), None)
-
-        cache_age_min = orch.cached_brief_age_minutes()
-        if cache_age_min is not None:
-            age_label = (f"{cache_age_min:.0f} min ago" if cache_age_min < 60
-                         else f"{cache_age_min/60:.1f} h ago")
-            freshness_emoji = "🟢" if cache_age_min < 30 else "🟡" if cache_age_min < 180 else "🔴"
-            st.caption(f"{freshness_emoji} Last cached brief: **{age_label}** "
-                       f"(persisted in SQLite, survives reloads)")
-
-        if _brief_scheduled:
-            st.caption(
-                "🔁 Refreshes on a schedule — next run "
-                f"`{_brief_scheduled.get('next_run')}` UTC."
-            )
-        else:
-            st.caption(
-                "⏸ **This does not refresh on its own.** No brief is scheduled, "
-                "so the cached one above stays as it is until you press "
-                "**Run Fresh Brief**. See ⏰ Scheduled brief below to turn "
-                "scheduling on."
-            )
-
-        # Scheduled brief status
-        with st.expander("⏰ Scheduled brief", expanded=False):
-            sched_status = bg_scheduler.scheduler_status()
-            jobs = sched_status.get("jobs", [])
-            brief_job = next((j for j in jobs if j.get("id") == "deep_brief"), None)
-            # Read the same way the scheduler does. Reading only os.environ
-            # here meant a value set in st.secrets showed as disabled while the
-            # job was in fact registered, so the panel contradicted itself.
-            scheduling_enabled = ((get_secret("ENABLE_SCHEDULED_BRIEF") or "").lower()
-                                  in ("1", "true", "yes", "on"))
-            cron_setting = get_secret("DEEP_BRIEF_CRON") or "0 7 * * 1-5 (default)"
-
-            colA, colB = st.columns(2)
-            colA.markdown(f"**Enabled:** {'✅ yes' if scheduling_enabled else '❌ no'}")
-            colB.markdown(f"**Cron:** `{cron_setting}`")
-
-            if brief_job:
-                next_run = brief_job.get("next_run") or brief_job.get("next_run_time")
-                st.markdown(f"**Next scheduled run:** `{next_run}` (UTC)")
-            else:
-                st.info("No scheduled brief job is currently registered. "
-                        "To enable: set `ENABLE_SCHEDULED_BRIEF=true` (and "
-                        "optionally `DEEP_BRIEF_CRON=0 7 * * 1-5` or `07:00`) "
-                        "in Render env vars, then redeploy. Default schedule "
-                        "is 07:00 UTC weekdays.")
-
-            if st.button("▶️ Run scheduled brief now (manual trigger)",
-                         key="brief_sched_runnow"):
-                with st.spinner("Running scheduled brief in background — refresh in ~60-90s…"):
-                    import threading
-                    threading.Thread(target=bg_scheduler.job_generate_deep_brief,
-                                     daemon=True).start()
-                    st.success("Triggered. The brief is generating in the "
-                               "background and will appear in the cache when "
-                               "complete. Refresh the page to see it.")
-
-        all_specs = orch.list_subagents()
-
-        with st.expander("⚙️ Configure brief", expanded=False):
-            st.markdown("**Active sub-agents** (uncheck to exclude — saves cost/time):")
-            cols = st.columns(len(all_specs))
-            selected_ids: list[str] = []
-            for col, spec in zip(cols, all_specs):
-                with col:
-                    if st.checkbox(spec["title"], value=True, key=f"brief_inc_{spec['id']}"):
-                        selected_ids.append(spec["id"])
-                    st.caption(f"tools: {spec['tools']}")
-
-        user_focus = st.text_area(
-            "Optional focus / question (leave blank for a general briefing):",
-            value="",
-            height=80,
-            placeholder="e.g. 'Focus on Fed rate path and BTC structure this week' "
-                        "or 'What should I watch ahead of next week's CPI?'",
-            key="brief_focus",
+    if access.tab_open(current_user(), "brief"):
+        st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
+        st.caption(
+            f"{len(orch.SUBAGENT_SPECS)} specialist sub-agents run in parallel, each "
+            "with its own tool subset and its own brief. A synthesiser then reconciles "
+            "their findings into one note — including where they contradict each "
+            "other, which is usually the most informative part. Deselect any below to "
+            "cut cost and time; the synthesiser is told which ones ran."
         )
 
-        run_col, load_col, _ = st.columns([1, 1, 3])
-        run_clicked = run_col.button("🚀 Run Fresh Brief", type="primary", key="brief_run")
-        load_clicked = load_col.button("📂 Load Cached", key="brief_load",
-                                       disabled=(cache_age_min is None))
+        if not _HAS_ORCH:
+            st.error(f"Orchestrator failed to load: {_ORCH_IMPORT_ERROR}")
+        elif not _HAS_AGENT:
+            st.error(f"Agent module failed to load: {_AGENT_IMPORT_ERROR}")
+        else:
+            # Hydrate session_state from SQLite cache (survives page reloads)
+            if "last_deep_brief" not in st.session_state:
+                cached = orch.load_cached_brief()
+                if cached:
+                    st.session_state["last_deep_brief"] = cached
 
-        if load_clicked:
-            cached = orch.load_cached_brief()
-            if cached:
-                st.session_state["last_deep_brief"] = cached
-                st.success(f"Loaded cached brief from {cache_age_min:.0f} min ago. "
-                           f"Saved one Opus run.")
+            # Whether anything will refresh this on its own, said on the face of
+            # the panel rather than inside a collapsed expander. An age alone reads
+            # as a staleness warning, which implies something is due to clear it —
+            # and when nothing is scheduled, that implication is the misleading part.
+            _brief_jobs = bg_scheduler.scheduler_status().get("jobs", [])
+            _brief_scheduled = next((j for j in _brief_jobs
+                                     if j.get("id") == "deep_brief"), None)
+
+            cache_age_min = orch.cached_brief_age_minutes()
+            if cache_age_min is not None:
+                age_label = (f"{cache_age_min:.0f} min ago" if cache_age_min < 60
+                             else f"{cache_age_min/60:.1f} h ago")
+                freshness_emoji = "🟢" if cache_age_min < 30 else "🟡" if cache_age_min < 180 else "🔴"
+                st.caption(f"{freshness_emoji} Last cached brief: **{age_label}** "
+                           f"(persisted in SQLite, survives reloads)")
+
+            if _brief_scheduled:
+                st.caption(
+                    "🔁 Refreshes on a schedule — next run "
+                    f"`{_brief_scheduled.get('next_run')}` UTC."
+                )
             else:
-                st.warning("No cached brief found.")
+                st.caption(
+                    "⏸ **This does not refresh on its own.** No brief is scheduled, "
+                    "so the cached one above stays as it is until you press "
+                    "**Run Fresh Brief**. See ⏰ Scheduled brief below to turn "
+                    "scheduling on."
+                )
 
-        if run_clicked:
-            if not selected_ids:
-                st.warning("Pick at least one sub-agent.")
-            else:
-                placeholders: dict = {}
-                status_holder = st.empty()
-                progress_bar = st.progress(0.0, text="Spawning specialist agents…")
+            # Scheduled brief status
+            with st.expander("⏰ Scheduled brief", expanded=False):
+                sched_status = bg_scheduler.scheduler_status()
+                jobs = sched_status.get("jobs", [])
+                brief_job = next((j for j in jobs if j.get("id") == "deep_brief"), None)
+                # Read the same way the scheduler does. Reading only os.environ
+                # here meant a value set in st.secrets showed as disabled while the
+                # job was in fact registered, so the panel contradicted itself.
+                scheduling_enabled = ((get_secret("ENABLE_SCHEDULED_BRIEF") or "").lower()
+                                      in ("1", "true", "yes", "on"))
+                cron_setting = get_secret("DEEP_BRIEF_CRON") or "0 7 * * 1-5 (default)"
 
-                # pre-create placeholders so we can fill them as agents complete
-                specs_lookup = {s["id"]: s for s in all_specs}
-                cols_grid = st.columns(min(len(selected_ids), 3))
-                for i, sid in enumerate(selected_ids):
-                    with cols_grid[i % len(cols_grid)]:
-                        placeholders[sid] = st.empty()
-                        placeholders[sid].info(f"⏳ {specs_lookup[sid]['title']} — running…")
+                colA, colB = st.columns(2)
+                colA.markdown(f"**Enabled:** {'✅ yes' if scheduling_enabled else '❌ no'}")
+                colB.markdown(f"**Cron:** `{cron_setting}`")
 
-                completed = {"n": 0}
-                total = len(selected_ids)
+                if brief_job:
+                    next_run = brief_job.get("next_run") or brief_job.get("next_run_time")
+                    st.markdown(f"**Next scheduled run:** `{next_run}` (UTC)")
+                else:
+                    st.info("No scheduled brief job is currently registered. "
+                            "To enable: set `ENABLE_SCHEDULED_BRIEF=true` (and "
+                            "optionally `DEEP_BRIEF_CRON=0 7 * * 1-5` or `07:00`) "
+                            "in Render env vars, then redeploy. Default schedule "
+                            "is 07:00 UTC weekdays.")
 
-                def _on_progress(agent_id: str, result: dict) -> None:
-                    completed["n"] += 1
-                    progress_bar.progress(
-                        completed["n"] / total,
-                        text=f"{completed['n']}/{total} agents done — synthesizing…"
-                              if completed["n"] == total else
-                              f"{completed['n']}/{total} agents done…",
-                    )
-                    r = result.get("result") or {}
-                    headline = r.get("headline") or "(no headline)"
-                    confidence = r.get("confidence", "?")
-                    ph = placeholders.get(agent_id)
-                    if ph is not None:
-                        ph.success(
-                            f"✅ **{result.get('title','')}** — data coverage: "
-                            f"`{confidence}`\n\n"
-                            f"{headline}"
-                        )
+                if st.button("▶️ Run scheduled brief now (manual trigger)",
+                             key="brief_sched_runnow"):
+                    with st.spinner("Running scheduled brief in background — refresh in ~60-90s…"):
+                        import threading
+                        threading.Thread(target=bg_scheduler.job_generate_deep_brief,
+                                         daemon=True).start()
+                        st.success("Triggered. The brief is generating in the "
+                                   "background and will appear in the cache when "
+                                   "complete. Refresh the page to see it.")
 
-                status_holder.info(
-                    f"🧠 Running {len(selected_ids)} specialist"
-                    f"{'s' if len(selected_ids) != 1 else ''} in parallel…")
-                try:
-                    brief = orch.run_deep_brief(
-                        user_query=user_focus,
-                        subagent_ids=selected_ids,
-                        progress_callback=_on_progress,
-                    )
-                    st.session_state["last_deep_brief"] = brief
-                    status_holder.success(
-                        f"Done — generated at {brief['generated_at']} UTC"
-                    )
-                    progress_bar.progress(1.0, text="✅ Complete")
-                except Exception as e:
-                    status_holder.error(f"Deep brief failed: {e}")
+            all_specs = orch.list_subagents()
 
-        brief = st.session_state.get("last_deep_brief")
-        if brief:
-            st.markdown("---")
-            st.markdown("### 📋 Executive Brief")
-            st.markdown(brief.get("synthesis", "(no synthesis)"))
+            with st.expander("⚙️ Configure brief", expanded=False):
+                st.markdown("**Active sub-agents** (uncheck to exclude — saves cost/time):")
+                cols = st.columns(len(all_specs))
+                selected_ids: list[str] = []
+                for col, spec in zip(cols, all_specs):
+                    with col:
+                        if st.checkbox(spec["title"], value=True, key=f"brief_inc_{spec['id']}"):
+                            selected_ids.append(spec["id"])
+                        st.caption(f"tools: {spec['tools']}")
 
-            st.markdown("---")
-            st.markdown("### 🔬 Specialist Briefings")
-            st.caption(
-                "**Data coverage** reports whether each agent's tools actually "
-                "returned what its brief needed — high means everything arrived "
-                "and was current, low means a tool failed or the data was too "
-                "stale to lean on. It is not the model's confidence in its own "
-                "conclusions, which would not be calibrated and is not worth "
-                "showing."
+            user_focus = st.text_area(
+                "Optional focus / question (leave blank for a general briefing):",
+                value="",
+                height=80,
+                placeholder="e.g. 'Focus on Fed rate path and BTC structure this week' "
+                            "or 'What should I watch ahead of next week's CPI?'",
+                key="brief_focus",
             )
-            for sid, r in brief.get("subagents", {}).items():
-                res = r.get("result") or {}
-                title = r.get("title", sid)
-                conf = res.get("confidence", "?")
-                headline = res.get("headline", "")
-                with st.expander(f"{title} — data coverage: `{conf}` — {headline}",
-                                 expanded=False):
-                    if res.get("_parse_failed"):
-                        st.warning("This agent's response could not be parsed as JSON. Raw output below.")
-                        st.code(r.get("raw", ""), language="text")
-                    else:
-                        if res.get("key_findings"):
-                            st.markdown("**Key findings:**")
-                            for kf in res["key_findings"]:
-                                st.markdown(f"- {kf}")
-                        if res.get("data_points"):
-                            st.markdown("**Data points:**")
-                            st.json(res["data_points"])
-                        if res.get("outlook"):
-                            st.markdown(f"**Outlook:** {res['outlook']}")
-                        if res.get("risks"):
-                            st.markdown("**Risks:**")
-                            for rk in res["risks"]:
-                                st.markdown(f"- {rk}")
-                    tlog = r.get("tool_log") or []
-                    if tlog:
-                        with st.expander(f"🔧 Tool calls ({len(tlog)})", expanded=False):
-                            for t in tlog:
-                                st.markdown(f"- `{t['name']}` args=`{t.get('args')}`")
-                                st.caption(t.get("result_preview", ""))
 
-            with st.expander("📦 Raw brief JSON"):
-                st.json(brief)
+            run_col, load_col, _ = st.columns([1, 1, 3])
+            run_clicked = run_col.button("🚀 Run Fresh Brief", type="primary", key="brief_run")
+            load_clicked = load_col.button("📂 Load Cached", key="brief_load",
+                                           disabled=(cache_age_min is None))
+
+            if load_clicked:
+                cached = orch.load_cached_brief()
+                if cached:
+                    st.session_state["last_deep_brief"] = cached
+                    st.success(f"Loaded cached brief from {cache_age_min:.0f} min ago. "
+                               f"Saved one Opus run.")
+                else:
+                    st.warning("No cached brief found.")
+
+            if run_clicked:
+                if not selected_ids:
+                    st.warning("Pick at least one sub-agent.")
+                else:
+                    placeholders: dict = {}
+                    status_holder = st.empty()
+                    progress_bar = st.progress(0.0, text="Spawning specialist agents…")
+
+                    # pre-create placeholders so we can fill them as agents complete
+                    specs_lookup = {s["id"]: s for s in all_specs}
+                    cols_grid = st.columns(min(len(selected_ids), 3))
+                    for i, sid in enumerate(selected_ids):
+                        with cols_grid[i % len(cols_grid)]:
+                            placeholders[sid] = st.empty()
+                            placeholders[sid].info(f"⏳ {specs_lookup[sid]['title']} — running…")
+
+                    completed = {"n": 0}
+                    total = len(selected_ids)
+
+                    def _on_progress(agent_id: str, result: dict) -> None:
+                        completed["n"] += 1
+                        progress_bar.progress(
+                            completed["n"] / total,
+                            text=f"{completed['n']}/{total} agents done — synthesizing…"
+                                  if completed["n"] == total else
+                                  f"{completed['n']}/{total} agents done…",
+                        )
+                        r = result.get("result") or {}
+                        headline = r.get("headline") or "(no headline)"
+                        confidence = r.get("confidence", "?")
+                        ph = placeholders.get(agent_id)
+                        if ph is not None:
+                            ph.success(
+                                f"✅ **{result.get('title','')}** — data coverage: "
+                                f"`{confidence}`\n\n"
+                                f"{headline}"
+                            )
+
+                    status_holder.info(
+                        f"🧠 Running {len(selected_ids)} specialist"
+                        f"{'s' if len(selected_ids) != 1 else ''} in parallel…")
+                    _cost = access.brief_cost(len(selected_ids))
+                    _block = ai_unavailable() or access.charge(current_user(), "brief", _cost)
+                    if _block:
+                        status_holder.warning(_block)
+                    else:
+                        try:
+                            brief = orch.run_deep_brief(
+                                user_query=user_focus,
+                                subagent_ids=selected_ids,
+                                progress_callback=_on_progress,
+                            )
+                            st.session_state["last_deep_brief"] = brief
+                            status_holder.success(
+                                f"Done — generated at {brief['generated_at']} UTC"
+                            )
+                            progress_bar.progress(1.0, text="✅ Complete")
+                        except Exception as e:
+                            access.refund(current_user(), "brief", _cost)
+                            status_holder.error(f"Deep brief failed: {e}")
+
+            brief = st.session_state.get("last_deep_brief")
+            if brief:
+                st.markdown("---")
+                st.markdown("### 📋 Executive Brief")
+                st.markdown(brief.get("synthesis", "(no synthesis)"))
+
+                st.markdown("---")
+                st.markdown("### 🔬 Specialist Briefings")
+                st.caption(
+                    "**Data coverage** reports whether each agent's tools actually "
+                    "returned what its brief needed — high means everything arrived "
+                    "and was current, low means a tool failed or the data was too "
+                    "stale to lean on. It is not the model's confidence in its own "
+                    "conclusions, which would not be calibrated and is not worth "
+                    "showing."
+                )
+                for sid, r in brief.get("subagents", {}).items():
+                    res = r.get("result") or {}
+                    title = r.get("title", sid)
+                    conf = res.get("confidence", "?")
+                    headline = res.get("headline", "")
+                    with st.expander(f"{title} — data coverage: `{conf}` — {headline}",
+                                     expanded=False):
+                        if res.get("_parse_failed"):
+                            st.warning("This agent's response could not be parsed as JSON. Raw output below.")
+                            st.code(r.get("raw", ""), language="text")
+                        else:
+                            if res.get("key_findings"):
+                                st.markdown("**Key findings:**")
+                                for kf in res["key_findings"]:
+                                    st.markdown(f"- {kf}")
+                            if res.get("data_points"):
+                                st.markdown("**Data points:**")
+                                st.json(res["data_points"])
+                            if res.get("outlook"):
+                                st.markdown(f"**Outlook:** {res['outlook']}")
+                            if res.get("risks"):
+                                st.markdown("**Risks:**")
+                                for rk in res["risks"]:
+                                    st.markdown(f"- {rk}")
+                        tlog = r.get("tool_log") or []
+                        if tlog:
+                            with st.expander(f"🔧 Tool calls ({len(tlog)})", expanded=False):
+                                for t in tlog:
+                                    st.markdown(f"- `{t['name']}` args=`{t.get('args')}`")
+                                    st.caption(t.get("result_preview", ""))
+
+                with st.expander("📦 Raw brief JSON"):
+                    st.json(brief)
+    else:
+        locked_tab("brief")
 
 # ================= END OF APP LAYOUT =================
 
@@ -8229,66 +8322,67 @@ with tab_brief:
 # none, because it is read as a guarantee.
 
 with tab_method:
-    st.markdown("""
+    if access.tab_open(current_user(), "method"):
+        st.markdown("""
     <div style="padding:12px 0 4px 0">
     <span style="font-size:28px;font-weight:800;letter-spacing:-1px">METHODOLOGY</span>
     <span style="font-size:14px;color:#888;margin-left:12px">Where every number comes from, how it is computed, and what has been tested</span>
     </div>
     """, unsafe_allow_html=True)
 
-    st.info(
-        "**What this application does.** It measures markets and describes what "
-        "it finds. It does not forecast, and it does not rank securities into "
-        "recommendations. Where a directional score was once shown, it was tested "
-        "and removed — the results are below."
-    )
+        st.info(
+            "**What this application does.** It measures markets and describes what "
+            "it finds. It does not forecast, and it does not rank securities into "
+            "recommendations. Where a directional score was once shown, it was tested "
+            "and removed — the results are below."
+        )
 
-    m1, m2, m3, m4, m5 = st.tabs([
-        "📥 Data sources", "🧮 How each number is computed",
-        "🔬 What has been tested", "🤖 The AI layer", "⚠️ Limitations",
-    ])
+        m1, m2, m3, m4, m5 = st.tabs([
+            "📥 Data sources", "🧮 How each number is computed",
+            "🔬 What has been tested", "🤖 The AI layer", "⚠️ Limitations",
+        ])
 
-    # ═══════════════════════════════════════════════════════════
-    with m1:
-        st.markdown("##### Where the data comes from")
-        st.caption("Refresh cadences are set by the background scheduler; a "
-                   "source without a key degrades to a message rather than "
-                   "silently returning zeros.")
+        # ═══════════════════════════════════════════════════════════
+        with m1:
+            st.markdown("##### Where the data comes from")
+            st.caption("Refresh cadences are set by the background scheduler; a "
+                       "source without a key degrades to a message rather than "
+                       "silently returning zeros.")
 
-        _rows = [
-            {"Source": "Yahoo Finance", "Provides": "Daily OHLC for equities, FX, "
-             "indices, futures; company fundamentals", "Key needed": "No",
-             "Refresh": "Quotes every 5 min; history on demand, cached 15-60 min"},
-            {"Source": "Binance", "Provides": "Crypto spot prices and klines",
-             "Key needed": "Optional — public endpoints used without one",
-             "Refresh": "Every 5 min"},
-            {"Source": "FRED (St. Louis Fed)", "Provides": "US macro series and "
-             f"policy rates for {', '.join(fxa.FRED_POLICY_SERIES)}",
-             "Key needed": "Yes — FRED_API_KEY", "Refresh": "Daily"},
-            {"Source": "NewsAPI", "Provides": "Headline search across major outlets",
-             "Key needed": "Yes — NEWSAPI_KEY",
-             "Refresh": "3 scheduled windows per day, keyword groups rotated"},
-            {"Source": f"RSS ({len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} feeds)",
-             "Provides": "Reuters, Bloomberg, FT, CNBC, the Fed, the ECB and others",
-             "Key needed": "No", "Refresh": "Every 15 min"},
-            {"Source": "Finnhub", "Provides": "Economic calendar, earnings calendar, "
-             "analyst estimates", "Key needed": "Yes — FINNHUB_API_KEY",
-             "Refresh": "Daily"},
-            {"Source": "SEC EDGAR",
-             "Provides": f"13F, Form 4 and 8-K filings for {len(src_mod.SEC_INSTITUTIONS) if _HAS_SRC else 10} institutions",
-             "Key needed": "No", "Refresh": "Daily"},
-            {"Source": "CoinGecko", "Provides": "Crypto market cap, dominance, trending",
-             "Key needed": "No", "Refresh": "Every 15 min"},
-            {"Source": "Alternative.me / CNN", "Provides": "Published fear & greed indices",
-             "Key needed": "No", "Refresh": "Every 10 min"},
-            {"Source": "Federal Reserve (fed.gov)",
-             "Provides": "FOMC statements and press conference transcripts",
-             "Key needed": "No", "Refresh": "On demand"},
-        ]
-        st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+            _rows = [
+                {"Source": "Yahoo Finance", "Provides": "Daily OHLC for equities, FX, "
+                 "indices, futures; company fundamentals", "Key needed": "No",
+                 "Refresh": "Quotes every 5 min; history on demand, cached 15-60 min"},
+                {"Source": "Binance", "Provides": "Crypto spot prices and klines",
+                 "Key needed": "Optional — public endpoints used without one",
+                 "Refresh": "Every 5 min"},
+                {"Source": "FRED (St. Louis Fed)", "Provides": "US macro series and "
+                 f"policy rates for {', '.join(fxa.FRED_POLICY_SERIES)}",
+                 "Key needed": "Yes — FRED_API_KEY", "Refresh": "Daily"},
+                {"Source": "NewsAPI", "Provides": "Headline search across major outlets",
+                 "Key needed": "Yes — NEWSAPI_KEY",
+                 "Refresh": "3 scheduled windows per day, keyword groups rotated"},
+                {"Source": f"RSS ({len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} feeds)",
+                 "Provides": "Reuters, Bloomberg, FT, CNBC, the Fed, the ECB and others",
+                 "Key needed": "No", "Refresh": "Every 15 min"},
+                {"Source": "Finnhub", "Provides": "Economic calendar, earnings calendar, "
+                 "analyst estimates", "Key needed": "Yes — FINNHUB_API_KEY",
+                 "Refresh": "Daily"},
+                {"Source": "SEC EDGAR",
+                 "Provides": f"13F, Form 4 and 8-K filings for {len(src_mod.SEC_INSTITUTIONS) if _HAS_SRC else 10} institutions",
+                 "Key needed": "No", "Refresh": "Daily"},
+                {"Source": "CoinGecko", "Provides": "Crypto market cap, dominance, trending",
+                 "Key needed": "No", "Refresh": "Every 15 min"},
+                {"Source": "Alternative.me / CNN", "Provides": "Published fear & greed indices",
+                 "Key needed": "No", "Refresh": "Every 10 min"},
+                {"Source": "Federal Reserve (fed.gov)",
+                 "Provides": "FOMC statements and press conference transcripts",
+                 "Key needed": "No", "Refresh": "On demand"},
+            ]
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
 
-        st.markdown("##### Two things about this data worth knowing")
-        st.markdown("""
+            st.markdown("##### Two things about this data worth knowing")
+            st.markdown("""
 - **Company fundamentals are unaudited and as current as the last filing.**
   Trailing multiples are meaningless where earnings are negative; forward
   multiples rest on sell-side estimates, which skew optimistic.
@@ -8296,8 +8390,8 @@ with tab_method:
   as current holdings, and neither should any read built on them be.
         """)
 
-        st.markdown("##### Policy rates — the one hand-maintained input")
-        st.markdown(f"""
+            st.markdown("##### Policy rates — the one hand-maintained input")
+            st.markdown(f"""
 FRED publishes clean daily series for **{len(fxa.FRED_POLICY_SERIES)} of the
 {len(fxa.CURRENCIES)} currencies** here ({', '.join(fxa.FRED_POLICY_SERIES)}).
 Its other policy-rate entries are monthly interbank proxies rather than the rate
@@ -8310,19 +8404,19 @@ never used to draw a conclusion. Most central banks meet eight times a year, so
 a quarter is already a meeting or two of drift. Any rate can be corrected
 in-app from the Carry panel, which recomputes every carry figure against it.
         """)
-        try:
-            _r = fxa.policy_rates(get_secret("FRED_API_KEY"),
-                                  st.session_state.get("fx_rate_overrides") or {})
-            _counts = _r["status"].value_counts().to_dict()
-            st.caption("Current state: " + " · ".join(
-                f"**{v}** {k}" for k, v in _counts.items()))
-        except Exception:
-            pass
+            try:
+                _r = fxa.policy_rates(get_secret("FRED_API_KEY"),
+                                      st.session_state.get("fx_rate_overrides") or {})
+                _counts = _r["status"].value_counts().to_dict()
+                st.caption("Current state: " + " · ".join(
+                    f"**{v}** {k}" for k, v in _counts.items()))
+            except Exception:
+                pass
 
-    # ═══════════════════════════════════════════════════════════
-    with m2:
-        st.markdown("##### Price and risk")
-        st.markdown("""
+        # ═══════════════════════════════════════════════════════════
+        with m2:
+            st.markdown("##### Price and risk")
+            st.markdown("""
 | Quantity | How it is computed | Notes |
 |---|---|---|
 | Realised volatility | Standard deviation of log returns over the window, × √(bars per year) | Bars per year follows the market: 252 for equities and FX, 365 for crypto. Annualising intraday crypto with 252 understated it by roughly an order of magnitude until this was fixed. |
@@ -8336,8 +8430,8 @@ in-app from the Carry panel, which recomputes every carry figure against it.
 | Monte Carlo | GBM, shocks drawn iid normal, drift and vol from the measured window | Normal shocks, so it understates the fat tails the same panel measures. Drawn once per render and reused, so the cards and the histogram agree. |
         """)
 
-        st.markdown("##### FX")
-        st.markdown(f"""
+            st.markdown("##### FX")
+            st.markdown(f"""
 Every currency is normalised to **the USD value of one unit**, and every pair,
 cross and ranking is derived from that single quantity — so a pair, a cross and
 a strength ranking cannot disagree with each other. Crosses the feed never
@@ -8362,8 +8456,8 @@ supplies (EUR/JPY) are rebuilt from the two dollar legs.
   the raw timestamp yields no overlapping rows at all.
         """)
 
-        st.markdown("##### Fundamentals")
-        st.markdown(f"""
+            st.markdown("##### Fundamentals")
+            st.markdown(f"""
 {len(fnd.METRICS)} metrics across valuation, profitability, growth, balance
 sheet, shareholder returns and market sensitivity — each reported against its
 **sector median and percentile**, because a multiple in isolation carries almost
@@ -8386,22 +8480,22 @@ There is **no composite fundamental score**, deliberately. Compressing these int
 one number would look authoritative with nothing measuring whether it predicts.
         """)
 
-        st.markdown("##### The technical composite")
-        st.caption(ALIGNMENT_NOTE)
+            st.markdown("##### The technical composite")
+            st.caption(ALIGNMENT_NOTE)
 
-    # ═══════════════════════════════════════════════════════════
-    with m3:
-        st.markdown("##### What was tested, and what the tests found")
-        st.markdown("""
+        # ═══════════════════════════════════════════════════════════
+        with m3:
+            st.markdown("##### What was tested, and what the tests found")
+            st.markdown("""
 Two directional scores shipped in this app. Both were tested walk-forward,
 against forward returns, on non-overlapping samples. Both failed, and both were
 removed rather than tuned. The results are here because a reader deciding how
 much weight to give this application is entitled to them.
         """)
 
-        st.markdown("**1. The technical composite** (RSI, MACD, moving averages, "
-                    "Bollinger, Stochastic)")
-        st.markdown("""
+            st.markdown("**1. The technical composite** (RSI, MACD, moving averages, "
+                        "Bollinger, Stochastic)")
+            st.markdown("""
 25,128 signals · 12 assets · 2018-2026 daily · walk-forward
 
 | Test | Result | Usable threshold |
@@ -8422,9 +8516,9 @@ descriptions of indicator alignment, and the measured record shown beside every
 table that displays it.
         """)
 
-        st.markdown("**2. The Quant Lab verdict** (Hurst, momentum, z-score, "
-                    "annualised return)")
-        st.markdown("""
+            st.markdown("**2. The Quant Lab verdict** (Hurst, momentum, z-score, "
+                        "annualised return)")
+            st.markdown("""
 457 S&P 500 names · 2012-2026 · 78,473 non-overlapping observations · forward 21-day returns
 
 | Label shown | Mean forward return | vs baseline (+1.41%) | t |
@@ -8446,20 +8540,20 @@ every |t| below 2).
 there is no overall verdict anywhere in the Quant Lab.
         """)
 
-        st.warning(
-            "**What has not been tested.** The AI-written analyses cannot be "
-            "backtested — the model has seen the outcomes of any historical "
-            "period you would test it on, so a retrospective score would be "
-            "meaningless. Judging them requires a forward-looking record kept "
-            "from today onward. Until that exists, read them as reasoning over "
-            "the supplied data, checkable against the figures they cite, and "
-            "nothing more."
-        )
+            st.warning(
+                "**What has not been tested.** The AI-written analyses cannot be "
+                "backtested — the model has seen the outcomes of any historical "
+                "period you would test it on, so a retrospective score would be "
+                "meaningless. Judging them requires a forward-looking record kept "
+                "from today onward. Until that exists, read them as reasoning over "
+                "the supplied data, checkable against the figures they cite, and "
+                "nothing more."
+            )
 
-    # ═══════════════════════════════════════════════════════════
-    with m4:
-        st.markdown("##### What the AI layer is, and what constrains it")
-        st.markdown(f"""
+        # ═══════════════════════════════════════════════════════════
+        with m4:
+            st.markdown("##### What the AI layer is, and what constrains it")
+            st.markdown(f"""
 Analyses are written by Claude. Two shapes are used:
 
 - **The conversational analyst and the Deep Brief specialists** hold
@@ -8481,8 +8575,8 @@ Every prompt in the application enforces the same rules:
 - Where the evidence is thin, say so rather than padding it into a confident note.
         """)
 
-        st.markdown("##### Deep Brief")
-        st.markdown(f"""
+            st.markdown("##### Deep Brief")
+            st.markdown(f"""
 {len(orch.SUBAGENT_SPECS) if _HAS_ORCH else 6} specialists run in parallel, each
 with its own tool subset, then a synthesiser reconciles them — including where
 they contradict one another, which is usually the most informative part. You
@@ -8494,18 +8588,18 @@ what it needed. That is an observable fact. It is not the model's confidence in
 its own conclusions, which would not be calibrated.
         """)
 
-        st.markdown("##### One thing the model cannot see")
-        st.markdown("""
+            st.markdown("##### One thing the model cannot see")
+            st.markdown("""
 There is no market-implied data anywhere in this application: no options
 surface, no fed funds futures, no positioning. So the FOMC panel gives a
 qualitative read of the statement's language and points at CME FedWatch for the
 odds, rather than printing a number it would have had to invent.
         """)
 
-    # ═══════════════════════════════════════════════════════════
-    with m5:
-        st.markdown("##### Limitations worth stating before you rely on anything here")
-        st.markdown(f"""
+        # ═══════════════════════════════════════════════════════════
+        with m5:
+            st.markdown("##### Limitations worth stating before you rely on anything here")
+            st.markdown(f"""
 **Measurement, not prediction.** Every quantity describes a window that has
 already happened. Nothing here forecasts, and the two things that tried were
 tested and removed.
@@ -8544,8 +8638,10 @@ plus NewsAPI on a rotating keyword schedule. Absence of a story here is not
 evidence the story does not exist.
         """)
 
-        st.caption(
-            "If something in this application is unclear, contradicts itself, or "
-            "cannot be traced back to a source on this page, that is a defect "
-            "worth reporting rather than a nuance worth interpreting."
-        )
+            st.caption(
+                "If something in this application is unclear, contradicts itself, or "
+                "cannot be traced back to a source on this page, that is a defect "
+                "worth reporting rather than a nuance worth interpreting."
+            )
+    else:
+        locked_tab("method")

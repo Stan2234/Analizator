@@ -165,6 +165,14 @@ CREATE TABLE IF NOT EXISTS kv_store (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ai_credits (
+    customer   TEXT NOT NULL,          -- Stripe customer id from the AI Bubble pass
+    period     TEXT NOT NULL,          -- calendar month, UTC, e.g. 2026-10
+    used       INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (customer, period)
+);
+
 CREATE TABLE IF NOT EXISTS chat_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
@@ -547,6 +555,36 @@ def latest_crypto_market() -> Optional[Dict[str, Any]]:
 
 
 # ---------------- KV ----------------
+
+def credits_used(customer: str, period: str) -> int:
+    conn = get_conn()
+    with _DB_LOCK:
+        row = conn.execute("SELECT used FROM ai_credits WHERE customer=? AND period=?",
+                           (customer, period)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def spend_credits(customer: str, period: str, n: int, allowance: int) -> bool:
+    """Atomically add n to the month's usage if it stays within the allowance."""
+    conn = get_conn()
+    with _DB_LOCK:
+        conn.execute("INSERT OR IGNORE INTO ai_credits (customer, period, used, updated_at) VALUES (?,?,0,?)",
+                     (customer, period, now_utc_iso()))
+        cur = conn.execute(
+            "UPDATE ai_credits SET used = used + ?, updated_at = ? "
+            "WHERE customer=? AND period=? AND used + ? <= ?",
+            (n, now_utc_iso(), customer, period, n, allowance))
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def refund_credits(customer: str, period: str, n: int) -> None:
+    conn = get_conn()
+    with _DB_LOCK:
+        conn.execute("UPDATE ai_credits SET used = MAX(0, used - ?), updated_at = ? "
+                     "WHERE customer=? AND period=?", (n, now_utc_iso(), customer, period))
+        conn.commit()
+
 
 def kv_set(key: str, value: Any) -> None:
     conn = get_conn()

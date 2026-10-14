@@ -18,8 +18,11 @@ import base64
 import datetime as dt
 import hashlib
 import hmac
+import json
 import os
 import time
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, Optional
 
 import data_layer as dl
@@ -47,9 +50,15 @@ def _sign(payload: str) -> str:
 
 
 def verify_pass(token: str) -> Optional[Dict[str, Any]]:
-    """The subscriber behind a pass, or None if it is forged, malformed or expired."""
-    if not SSO_SECRET or not token or "." not in token:
+    """The subscriber behind a pass, or None if it is forged, malformed or expired.
+
+    With ANALIZATOR_SSO_SECRET set the signature is checked here; without it (the
+    normal production setup) AI Bubble Tracker, which signed the pass, is asked.
+    """
+    if not token or "." not in token:
         return None
+    if not SSO_SECRET:
+        return _verify_remote(token)
     payload, sig = token.rsplit(".", 1)
     if not hmac.compare_digest(_sign(payload), sig):
         return None
@@ -61,6 +70,20 @@ def verify_pass(token: str) -> Optional[Dict[str, Any]]:
     if tier not in TIERS or not customer.startswith("cus_") or exp < time.time():
         return None
     return {"customer": customer, "tier": tier, "expires": exp}
+
+
+def _verify_remote(token: str) -> Optional[Dict[str, Any]]:
+    url = f"{AI_BUBBLE_URL}/api/analizator/verify?" + urllib.parse.urlencode({"t": token})
+    try:   # AI Bubble's free Render plan can be waking up, hence the long timeout
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "analizator"}), timeout=60) as r:
+            d = json.loads(r.read())
+    except Exception:
+        return None
+    if d.get("plan") not in TIERS or not str(d.get("customer", "")).startswith("cus_"):
+        return None
+    if int(d.get("expires", 0)) < time.time():
+        return None
+    return {"customer": d["customer"], "tier": d["plan"], "expires": int(d["expires"])}
 
 
 def owner() -> Dict[str, Any]:

@@ -92,7 +92,33 @@ if _HAS_AGENT and "scheduler_started" not in st.session_state:
 if "yahoo_live_errors" not in st.session_state:
     st.session_state["yahoo_live_errors"] = {}
 def current_user():
-    return st.session_state.get("user")
+    """The signed-in user, or, when the owner previews a plan, a stand-in on that plan."""
+    u = st.session_state.get("user")
+    view = st.session_state.get("view_as", "owner")
+    if u and u.get("tier") == "owner" and view in access.TIERS:
+        return {"customer": f"cus_owner_preview_{view}", "tier": view, "preview": True}
+    return u
+
+
+def plans_panel() -> None:
+    """The three plans with checkout buttons; buying returns straight to Macro Analyzer."""
+    cols = st.columns(3)
+    for col, plan in zip(cols, access.TIERS):
+        p = access.PLANS[plan]
+        with col:
+            st.markdown(f"#### {access.TIER_NAMES[plan]}")
+            # "$" starts LaTeX in Streamlit markdown, so it is escaped
+            st.markdown(f"**\\${p['month']}** / month · \\${p['year']} / year")
+            for point in p["points"]:
+                st.markdown(f"- {point}")
+            st.link_button(f"{access.TIER_NAMES[plan]} monthly", access.checkout_url(plan, "month"),
+                           type="primary" if plan == "plus" else "secondary", use_container_width=True)
+            st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free",
+                           access.checkout_url(plan, "year"), use_container_width=True)
+    st.caption("Secure checkout by Stripe. Every plan also unlocks all of AI Bubble Tracker. "
+               "Prices exclude VAT where it applies. Cancel any time; 14-day refund on your first "
+               "payment. AI credits reset monthly. Not financial advice. "
+               f"[Terms]({access.AI_BUBBLE_URL}/terms.html) · [Privacy]({access.AI_BUBBLE_URL}/privacy.html)")
 
 
 def password_gate():
@@ -111,30 +137,36 @@ def password_gate():
 
     if not st.session_state.auth:
         st.title("Macro Analyzer")
+        st.caption("Cross-asset market data with an AI analyst: currencies, carry, central banks, "
+                   "metals, crypto, fundamentals, news, the Fed and multi-agent briefs.")
         if token:
-            st.warning("This sign-in link has expired or is not valid. Open Macro Analyzer again from AI Bubble Tracker.")
-        st.markdown(f"**Subscribers:** open Macro Analyzer from your account on "
-                    f"[AI Bubble Tracker]({access.AI_BUBBLE_URL}/#account).")
+            st.warning("This sign-in link has expired or is not valid. Sign in again below.")
+        st.markdown("**Already subscribed?**")
+        st.link_button("Sign in with your AI Bubble Tracker subscription", access.signin_url())
         st.markdown("---")
-        pwd = st.text_input("Owner password", type="password")
+        st.markdown("### Choose a plan")
+        plans_panel()
+        st.markdown("---")
+        with st.expander("Owner sign-in"):
+            pwd = st.text_input("Owner password", type="password")
 
-        # Read APP_PASSWORD from env first (Render), then Streamlit secrets (Streamlit Cloud)
-        expected = os.environ.get("APP_PASSWORD", "")
-        if not expected:
-            try:
-                if "APP_PASSWORD" in st.secrets:
-                    expected = str(st.secrets["APP_PASSWORD"])
-            except Exception:
-                expected = ""
+            # Read APP_PASSWORD from env first (Render), then Streamlit secrets (Streamlit Cloud)
+            expected = os.environ.get("APP_PASSWORD", "")
+            if not expected:
+                try:
+                    if "APP_PASSWORD" in st.secrets:
+                        expected = str(st.secrets["APP_PASSWORD"])
+                except Exception:
+                    expected = ""
 
-        if pwd and expected and pwd == expected:
-            st.session_state.auth = True
-            st.session_state.user = access.owner()
-            st.rerun()
-        elif pwd:
-            st.error("Wrong password")
-        elif not expected:
-            st.warning("APP_PASSWORD not configured on the server.")
+            if pwd and expected and pwd == expected:
+                st.session_state.auth = True
+                st.session_state.user = access.owner()
+                st.rerun()
+            elif pwd:
+                st.error("Wrong password")
+            elif not expected:
+                st.warning("APP_PASSWORD not configured on the server.")
 
         st.stop()
 
@@ -145,19 +177,27 @@ if st.session_state.get("auth") and not current_user():
 def locked_tab(tab: str) -> None:
     need = access.TIER_NAMES[access.TAB_TIER[tab]]
     st.info(f"🔒 This tab is part of the {need} plan" + (" and above." if need != "Pro" else "."))
-    st.markdown(f"[See the plans on AI Bubble Tracker]({access.upgrade_url()})")
+    if (current_user() or {}).get("preview"):
+        st.caption("(Owner preview: a customer on this plan sees an upgrade link here.)")
+    else:
+        st.link_button(f"Upgrade to {need}", access.upgrade_url(), type="primary")
 
 
 with st.sidebar:
-    _u = current_user()
     st.markdown(f"[← AI Bubble Tracker]({access.AI_BUBBLE_URL})")
-    st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}")
+    if (st.session_state.get("user") or {}).get("tier") == "owner":
+        st.selectbox("View as", ["owner", *access.TIERS], key="view_as",
+                     format_func=lambda t: "Owner (everything)" if t == "owner" else f"{access.TIER_NAMES[t]} customer",
+                     help="See exactly what a subscriber on that plan sees. AI calls still run "
+                          "for real and cost API money; credits are counted on a separate preview account.")
+    _u = current_user()
+    st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}" + (" (preview)" if _u.get("preview") else ""))
     _left = access.credits_left(_u)
     if _left is not None:
         st.markdown(f"**AI credits:** {_left} of {access.CREDITS[_u['tier']]} left · reset {access.next_reset():%d %b}")
         st.caption("AI read 1 · news forecast 1 · analyst question 3 · FOMC read 3 · Deep Brief up to 10")
-        if _u["tier"] != "pro":
-            st.markdown(f"[Upgrade for more tabs and credits]({access.upgrade_url()})")
+        if not _u.get("preview"):
+            st.markdown(f"[{'Change plan' if _u['tier'] == 'pro' else 'Upgrade for more tabs and credits'}]({access.upgrade_url()})")
 
 
 def inject_secrets_to_env():
@@ -3535,39 +3575,91 @@ def _load_sentiments():
     except Exception as _e:
         return {"error": str(_e)}
 
-_sents = _load_sentiments()
-sc1, sc2, sc3, sc4 = st.columns(4)
-def _render_fg(col, title, data):
-    if not data:
-        col.metric(title, "—", "no data")
-        return
-    v = data.get("value")
-    lbl = data.get("label") or ""
-    # The computed scores clamp their z-score at +/-2, so 0 and 100 mean the
-    # scale ran out rather than "the maximum possible reading". Shown next to
-    # CNN's genuinely bounded index, an unmarked 100 reads as the latter.
-    cap_note = ""
-    if v in (0, 100):
-        cap_note = ("<span style='font-size:11px;color:#888;font-weight:normal'>"
-                    " · capped</span>")
-    shown = v if v is not None else "—"
-    col.markdown(
-        f"<div style='padding:8px;border-radius:8px;background:#0a0a0a;border:1px solid #222'>"
-        f"<div style='font-size:12px;color:#aaa'>{title}</div>"
-        f"<div style='font-size:28px;font-weight:bold;color:{_fg_color(v)}'>{shown}{cap_note}</div>"
-        f"<div style='font-size:13px;color:{_fg_color(v)}'>{lbl}</div>"
-        f"</div>", unsafe_allow_html=True)
+with st.expander("Data source diagnostics"):
+    _errs = st.session_state.get("yahoo_live_errors", {})
+    if _errs:
+        st.caption("Symbols whose live Yahoo fetch failed this session. "
+                   "Panels using them fall back to the cached snapshot.")
+        st.write(_errs)
+    else:
+        st.caption("All live fetches succeeded this session.")
 
-# Two of these four are published indices and two are computed here. Shown side
-# by side without saying so, a reader reasonably assumes all four are external
-# benchmarks — so the source is on the label.
-_render_fg(sc1, "🪙 Crypto F&G · published",   _sents.get("crypto"))
-_render_fg(sc2, "📈 Stocks F&G · CNN",         _sents.get("stocks"))
-_render_fg(sc3, "🛢 Commodities · computed",   _sents.get("commodities"))
-_render_fg(sc4, "🌍 Macro risk · computed",    _sents.get("macro"))
 
-with st.expander("What these four numbers are"):
-    st.markdown("""
+
+# ===== REST OF HEADER =====
+# (The 11 major indices are now part of the LIVE_TICKER_SYMBOLS row above —
+# same bordered-card style, same scroll-arrow navigation as gold/silver/FX.)
+
+now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+st.caption(f"Last update time (UTC): {now}")
+st.markdown("---")
+
+(tab_global, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
+ tab_news, tab_quant, tab_ai, tab_fomc, tab_brief) = st.tabs(
+    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🏦 Central Banks",
+     "🥇 Metals", "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro",
+     "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief",
+]
+)
+
+# -------- GLOBAL TAB (Bloomberg-style dashboard) --------
+with tab_global:
+    if access.tab_open(current_user(), "global"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+The market at a glance, starting from the S&P 500.
+
+- **The four sentiment readings** at the top: two published indices (Crypto
+  Fear & Greed and CNN's Stocks Fear & Greed) and two scores computed here for
+  commodities and macro risk. The panel under them explains each one.
+- **Sector heatmap**: the average move of the stocks in each GICS sector since the
+  previous close, equal-weighted, so one mega-cap cannot carry a sector on its
+  own. The up/down counts next to each figure show whether the move was broad
+  or narrow.
+- **Biggest movers**: the S&P 500 stocks that moved most since the previous
+  close. Moves beyond ±50% are left out as probable splits or bad prints.
+- **Universe browser**: search the index by ticker or company name, or filter by sector. The
+  *alignment* column summarises how far the usual technical indicators agree
+  right now. It describes the present state and does not predict returns.
+
+Prices come from Yahoo Finance and refresh every few minutes; a stock with no
+fresh quote is shown with its last cached one.
+""")
+
+        # The four sentiment readings and their explanation live on this tab only.
+        _sents = _load_sentiments()
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        def _render_fg(col, title, data):
+            if not data:
+                col.metric(title, "—", "no data")
+                return
+            v = data.get("value")
+            lbl = data.get("label") or ""
+            # The computed scores clamp their z-score at +/-2, so 0 and 100 mean the
+            # scale ran out rather than "the maximum possible reading". Shown next to
+            # CNN's genuinely bounded index, an unmarked 100 reads as the latter.
+            cap_note = ""
+            if v in (0, 100):
+                cap_note = ("<span style='font-size:11px;color:#888;font-weight:normal'>"
+                            " · capped</span>")
+            shown = v if v is not None else "—"
+            col.markdown(
+                f"<div style='padding:8px;border-radius:8px;background:#0a0a0a;border:1px solid #222'>"
+                f"<div style='font-size:12px;color:#aaa'>{title}</div>"
+                f"<div style='font-size:28px;font-weight:bold;color:{_fg_color(v)}'>{shown}{cap_note}</div>"
+                f"<div style='font-size:13px;color:{_fg_color(v)}'>{lbl}</div>"
+                f"</div>", unsafe_allow_html=True)
+
+        # Two of these four are published indices and two are computed here. Shown side
+        # by side without saying so, a reader reasonably assumes all four are external
+        # benchmarks — so the source is on the label.
+        _render_fg(sc1, "🪙 Crypto F&G · published",   _sents.get("crypto"))
+        _render_fg(sc2, "📈 Stocks F&G · CNN",         _sents.get("stocks"))
+        _render_fg(sc3, "🛢 Commodities · computed",   _sents.get("commodities"))
+        _render_fg(sc4, "🌍 Macro risk · computed",    _sents.get("macro"))
+
+        with st.expander("What these four numbers are"):
+            st.markdown("""
 All four run 0-100, where 0 is extreme fear and 100 extreme greed. **Two are
 published indices and two are computed inside this app**, which is why the
 labels differ — they are not equivalent benchmarks.
@@ -3591,49 +3683,20 @@ against anything. Read them as a summary of the inputs listed, not as an
 independent measure — and never quote them as if they were a published index.
     """)
 
-    _det_rows = []
-    for _k, _lbl in (("commodities", "Commodities"), ("macro", "Macro risk")):
-        _d = (_sents.get(_k) or {}).get("details") or {}
-        for _n, _v in _d.items():
-            _det_rows.append({"Score": _lbl, "Input": _n, "Current value": _v})
-    if _det_rows:
-        st.markdown("**What the two computed scores are reading right now:**")
-        st.dataframe(pd.DataFrame(_det_rows), use_container_width=True,
-                     hide_index=True)
-        st.caption("Commodity figures are 14-day percentage returns. Macro "
-                   "inputs are shown in their own units — VIX in points, the "
-                   "curve and spreads in percentage points.")
-
-with st.expander("Data source diagnostics"):
-    _errs = st.session_state.get("yahoo_live_errors", {})
-    if _errs:
-        st.caption("Symbols whose live Yahoo fetch failed this session. "
-                   "Panels using them fall back to the cached snapshot.")
-        st.write(_errs)
-    else:
-        st.caption("All live fetches succeeded this session.")
+            _det_rows = []
+            for _k, _lbl in (("commodities", "Commodities"), ("macro", "Macro risk")):
+                _d = (_sents.get(_k) or {}).get("details") or {}
+                for _n, _v in _d.items():
+                    _det_rows.append({"Score": _lbl, "Input": _n, "Current value": _v})
+            if _det_rows:
+                st.markdown("**What the two computed scores are reading right now:**")
+                st.dataframe(pd.DataFrame(_det_rows), use_container_width=True,
+                             hide_index=True)
+                st.caption("Commodity figures are 14-day percentage returns. Macro "
+                           "inputs are shown in their own units — VIX in points, the "
+                           "curve and spreads in percentage points.")
 
 
-
-# ===== REST OF HEADER =====
-# (The 11 major indices are now part of the LIVE_TICKER_SYMBOLS row above —
-# same bordered-card style, same scroll-arrow navigation as gold/silver/FX.)
-
-now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-st.caption(f"Last update time (UTC): {now}")
-st.markdown("---")
-
-(tab_global, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
- tab_news, tab_quant, tab_ai, tab_fomc, tab_brief, tab_method) = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🏦 Central Banks",
-     "🥇 Metals", "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro",
-     "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief",
-     "📖 Methodology"]
-)
-
-# -------- GLOBAL TAB (Bloomberg-style dashboard) --------
-with tab_global:
-    if access.tab_open(current_user(), "global"):
         # ensure universe is loaded before any query
         try:
             dl.seed_universe()
@@ -3939,6 +4002,30 @@ def fx_heat_col(s: pd.Series, invert: bool = False) -> List[str]:
 
 with tab_fx:
     if access.tab_open(current_user(), "fx"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+The currency market measured from five angles, one sub-tab each.
+
+- **Strength Board**: how every major currency did against every other one and
+  against the dollar over several horizons. Read across a row to see whether a
+  pair is moving because of its base or its quote currency.
+- **Carry**: what each currency pays over the dollar (the policy-rate
+  differential) and what that carry actually returned once the spot move is
+  netted off. Carry against risk shows whether the yield was worth the swings.
+- **Vol & Correlation**: realised volatility and its percentile against its own
+  history, and which pairs move together. Highly correlated positions are
+  effectively the same trade.
+- **Drivers**: the measured correlation of each pair to macro drivers (US yields,
+  the S&P 500, VIX, gold, oil, copper and the dollar index) and which one is in control.
+  Below roughly |ρ| = 0.3 no driver is in control.
+- **Pair Deep Dive**: one pair in detail, with its driver ranking, carry and
+  the central-bank and data events in the next 14 days. The AI desk read
+  (1 credit) turns those numbers into a short note.
+
+Correlation is not causation, and relationships change; everything here
+describes the recent past.
+""")
+
         if not _HAS_FXA:
             st.error(f"FX analytics module failed to load: {_FXA_IMPORT_ERROR}")
         else:
@@ -7021,6 +7108,25 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
 # -------- NEWS TAB --------
 with tab_news:
     if access.tab_open(current_user(), "news"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Headlines from NewsAPI and around thirty RSS feeds, collected in the background
+and filtered for the asset you pick.
+
+- **Focus asset**: choose what you want news for; the headlines and the
+  forecast follow that choice.
+- **AI news-driven forecast** (1 credit, runs only when you press the button):
+  the model reads the recent headlines for the asset together with the current
+  market context and writes what the news flow implies and what would change
+  the picture. It is a reading of the news, not a tested prediction, and it can
+  be wrong.
+- **Latest raw headlines**: the underlying articles with their source and time,
+  so you can check what the forecast was based on.
+
+Refreshing pulls new articles from NewsAPI and uses its daily quota; the RSS
+feeds update on their own every 20 minutes.
+""")
+
         st.subheader("Global News & Macro Context")
 
         if not NEWSAPI_KEY:
@@ -7960,6 +8066,25 @@ than tuned.
 # -------- AI AGENT TAB (Claude with tool access to all data) --------
 with tab_ai:
     if access.tab_open(current_user(), "ai"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+A conversation with Claude (Anthropic's model) that can look things up in this
+app's data instead of answering from memory: news, live quotes, technical
+indicator state, company fundamentals, FRED macro series, the economic
+calendar, institutional filings, analyst estimates and the crypto market.
+
+- **Each question costs 3 credits**, however many lookups the agent needs. A
+  question that fails is refunded.
+- **Ask specific questions** ("what is driving gold this week and what would
+  break it?") rather than "what should I buy?". The agent is instructed to
+  describe, cite the data it fetched and say what would make it wrong, and it
+  does not give investment advice.
+- **Tools used** under each answer lists every lookup, so you can see which
+  numbers the answer rests on.
+
+The conversation stays in this browser tab; a refresh starts a new one.
+""")
+
         st.subheader("🤖 Analizator — Conversational Agent")
         st.caption(
             f"Claude with tool access to this app's data: news (NewsAPI plus "
@@ -8072,6 +8197,23 @@ with tab_ai:
 # -------- FOMC TAB --------
 with tab_fomc:
     if access.tab_open(current_user(), "fomc"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Reads a Federal Reserve policy statement against the previous one.
+
+- **Load the statements** with the fetch button, or paste them in: the current
+  statement, the previous one and, optionally, the press-conference text.
+- **Analyze** (3 credits) produces a hawk-dove reading of the tone, the wording
+  that changed and why it matters, an outlook for the rate path, and how the
+  change usually transmits to rates, the dollar, equities, gold and crypto.
+- **The press conference**, if provided, is read separately for the topics
+  the chair spent time on.
+
+The Fed changes a few words between meetings and the market reacts to those
+words; this tab exists to find them quickly. The cross-market section
+describes typical transmission, not a forecast of what will happen this time.
+""")
+
         show_fomc_lab()
     else:
         locked_tab("fomc")
@@ -8079,6 +8221,25 @@ with tab_fomc:
 # -------- DEEP BRIEF TAB (multi-agent orchestrator) --------
 with tab_brief:
     if access.tab_open(current_user(), "brief"):
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+Six specialist AI agents, each with its own data and its own brief (news,
+macro, crypto, equities, the Fed and sentiment), run in parallel. A seventh
+then reconciles what they found into one note, including where they disagree,
+which is usually the most informative part.
+
+- **Cost**: up to 10 credits for all six specialists; deselect the ones you
+  don't need to spend less (one specialist costs 3). A brief that fails is
+  refunded.
+- **Executive Brief** is the reconciled note; **Specialist Briefings** below
+  it show each agent's own findings and the data it used.
+- **A cached brief**, when one exists, is shown with its age; reading it costs
+  nothing.
+
+It takes one to three minutes. Like every AI output here it describes the data
+it was given; it does not predict prices or give investment advice.
+""")
+
         st.subheader("🎯 Deep Brief — Multi-Agent Cross-Market Analysis")
         st.caption(
             f"{len(orch.SUBAGENT_SPECS)} specialist sub-agents run in parallel, each "
@@ -8321,327 +8482,3 @@ with tab_brief:
 # actually does. A methodology page that has quietly gone stale is worse than
 # none, because it is read as a guarantee.
 
-with tab_method:
-    if access.tab_open(current_user(), "method"):
-        st.markdown("""
-    <div style="padding:12px 0 4px 0">
-    <span style="font-size:28px;font-weight:800;letter-spacing:-1px">METHODOLOGY</span>
-    <span style="font-size:14px;color:#888;margin-left:12px">Where every number comes from, how it is computed, and what has been tested</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-        st.info(
-            "**What this application does.** It measures markets and describes what "
-            "it finds. It does not forecast, and it does not rank securities into "
-            "recommendations. Where a directional score was once shown, it was tested "
-            "and removed — the results are below."
-        )
-
-        m1, m2, m3, m4, m5 = st.tabs([
-            "📥 Data sources", "🧮 How each number is computed",
-            "🔬 What has been tested", "🤖 The AI layer", "⚠️ Limitations",
-        ])
-
-        # ═══════════════════════════════════════════════════════════
-        with m1:
-            st.markdown("##### Where the data comes from")
-            st.caption("Refresh cadences are set by the background scheduler; a "
-                       "source without a key degrades to a message rather than "
-                       "silently returning zeros.")
-
-            _rows = [
-                {"Source": "Yahoo Finance", "Provides": "Daily OHLC for equities, FX, "
-                 "indices, futures; company fundamentals", "Key needed": "No",
-                 "Refresh": "Quotes every 5 min; history on demand, cached 15-60 min"},
-                {"Source": "Binance", "Provides": "Crypto spot prices and klines",
-                 "Key needed": "Optional — public endpoints used without one",
-                 "Refresh": "Every 5 min"},
-                {"Source": "FRED (St. Louis Fed)", "Provides": "US macro series and "
-                 f"policy rates for {', '.join(fxa.FRED_POLICY_SERIES)}",
-                 "Key needed": "Yes — FRED_API_KEY", "Refresh": "Daily"},
-                {"Source": "NewsAPI", "Provides": "Headline search across major outlets",
-                 "Key needed": "Yes — NEWSAPI_KEY",
-                 "Refresh": "3 scheduled windows per day, keyword groups rotated"},
-                {"Source": f"RSS ({len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} feeds)",
-                 "Provides": "Reuters, Bloomberg, FT, CNBC, the Fed, the ECB and others",
-                 "Key needed": "No", "Refresh": "Every 15 min"},
-                {"Source": "Finnhub", "Provides": "Economic calendar, earnings calendar, "
-                 "analyst estimates", "Key needed": "Yes — FINNHUB_API_KEY",
-                 "Refresh": "Daily"},
-                {"Source": "SEC EDGAR",
-                 "Provides": f"13F, Form 4 and 8-K filings for {len(src_mod.SEC_INSTITUTIONS) if _HAS_SRC else 10} institutions",
-                 "Key needed": "No", "Refresh": "Daily"},
-                {"Source": "CoinGecko", "Provides": "Crypto market cap, dominance, trending",
-                 "Key needed": "No", "Refresh": "Every 15 min"},
-                {"Source": "Alternative.me / CNN", "Provides": "Published fear & greed indices",
-                 "Key needed": "No", "Refresh": "Every 10 min"},
-                {"Source": "Federal Reserve (fed.gov)",
-                 "Provides": "FOMC statements and press conference transcripts",
-                 "Key needed": "No", "Refresh": "On demand"},
-            ]
-            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
-
-            st.markdown("##### Two things about this data worth knowing")
-            st.markdown("""
-- **Company fundamentals are unaudited and as current as the last filing.**
-  Trailing multiples are meaningless where earnings are negative; forward
-  multiples rest on sell-side estimates, which skew optimistic.
-- **13F positions lag by 45 days** under SEC rule. They are never described here
-  as current holdings, and neither should any read built on them be.
-        """)
-
-            st.markdown("##### Policy rates — the one hand-maintained input")
-            st.markdown(f"""
-FRED publishes clean daily series for **{len(fxa.FRED_POLICY_SERIES)} of the
-{len(fxa.CURRENCIES)} currencies** here ({', '.join(fxa.FRED_POLICY_SERIES)}).
-Its other policy-rate entries are monthly interbank proxies rather than the rate
-a desk funds at, so the remaining rates are seeded by hand and each records the
-date it was last confirmed against the central bank.
-
-A rate unconfirmed for more than **{fxa.VERIFICATION_MAX_AGE_DAYS} days** is
-published as `unverified`: still shown, ranked last in the carry table, and
-never used to draw a conclusion. Most central banks meet eight times a year, so
-a quarter is already a meeting or two of drift. Any rate can be corrected
-in-app from the Carry panel, which recomputes every carry figure against it.
-        """)
-            try:
-                _r = fxa.policy_rates(get_secret("FRED_API_KEY"),
-                                      st.session_state.get("fx_rate_overrides") or {})
-                _counts = _r["status"].value_counts().to_dict()
-                st.caption("Current state: " + " · ".join(
-                    f"**{v}** {k}" for k, v in _counts.items()))
-            except Exception:
-                pass
-
-        # ═══════════════════════════════════════════════════════════
-        with m2:
-            st.markdown("##### Price and risk")
-            st.markdown("""
-| Quantity | How it is computed | Notes |
-|---|---|---|
-| Realised volatility | Standard deviation of log returns over the window, × √(bars per year) | Bars per year follows the market: 252 for equities and FX, 365 for crypto. Annualising intraday crypto with 252 understated it by roughly an order of magnitude until this was fixed. |
-| Volatility percentile | Current 21-bar volatility against the same series' own history | The level alone is not comparable across assets; the percentile is. |
-| VaR 95% | 5th percentile of the return distribution in the window | Says nothing about how bad the tail gets beyond it. |
-| CVaR 95% | Mean of returns at or below VaR | The more honest of the two. |
-| Max drawdown | Deepest peak-to-trough fall of the cumulative return | Duration usually binds harder than depth. |
-| Hurst exponent | Rescaled-range slope over lags 2-20 | Above 0.5 persists, below reverts. Direction-agnostic — a collapse trends too. |
-| O-U half-life | Regression of the change in the spread on its lag; −ln2/β | Absent means the series trended rather than reverted in the window. |
-| Jump diffusion (Merton) | Bars beyond the z-threshold split from the diffusion component | λ is jumps per year; diffusion vol is what remains once they are removed. |
-| Monte Carlo | GBM, shocks drawn iid normal, drift and vol from the measured window | Normal shocks, so it understates the fat tails the same panel measures. Drawn once per render and reused, so the cards and the histogram agree. |
-        """)
-
-            st.markdown("##### FX")
-            st.markdown(f"""
-Every currency is normalised to **the USD value of one unit**, and every pair,
-cross and ranking is derived from that single quantity — so a pair, a cross and
-a strength ranking cannot disagree with each other. Crosses the feed never
-supplies (EUR/JPY) are rebuilt from the two dollar legs.
-
-- **Currency strength** — each currency's average move against all the others in
-  the selected universe. A pair alone cannot say whether the base rose or the
-  quote fell; this can.
-- **Cross-rate matrix** — computed on sessions where every currency in the
-  universe printed, so each cell covers the same calendar window.
-- **Carry** — the policy rate differential. Reported alongside the realised spot
-  drift and the total of the two, because a currency that pays 35% and falls 15%
-  did not pay 35%.
-- **Managed-regime flag** — when the absolute annualised drift exceeds twice the
-  realised volatility, the currency is being steered rather than traded. Its
-  volatility understates the risk and carry-to-vol flatters it, which is the
-  shape of most carry blow-ups.
-- **Drivers** — measured correlation of the pair's daily returns against
-  {len(fxa.DRIVERS)} macro series over 63 sessions, rather than assumed
-  relationships. Instruments are aligned on the calendar date first: Yahoo
-  stamps each daily bar with that instrument's own close time, and joining on
-  the raw timestamp yields no overlapping rows at all.
-        """)
-
-            st.markdown("##### Fundamentals")
-            st.markdown(f"""
-{len(fnd.METRICS)} metrics across valuation, profitability, growth, balance
-sheet, shareholder returns and market sensitivity — each reported against its
-**sector median and percentile**, because a multiple in isolation carries almost
-no information.
-
-Percentiles are oriented so **100 is always the favourable end**: a low P/E and
-a high margin both score high. Metrics with no favourable end — leverage, beta,
-payout — are shown as a plain rank with no colour, since calling debt "bad" is a
-judgement about the business rather than a fact about the number. A peer set
-below **{fnd.MIN_PEERS}** companies gives a meaningless median, so percentiles
-are withheld entirely.
-
-**DuPont** splits return on equity into margin × asset turnover × leverage. Two
-companies can post the same ROE by opposite routes, and the leveraged one is far
-more fragile. Asset turnover is derived from the identity rather than reported,
-so it absorbs any inconsistency between the three inputs and is labelled as
-derived.
-
-There is **no composite fundamental score**, deliberately. Compressing these into
-one number would look authoritative with nothing measuring whether it predicts.
-        """)
-
-            st.markdown("##### The technical composite")
-            st.caption(ALIGNMENT_NOTE)
-
-        # ═══════════════════════════════════════════════════════════
-        with m3:
-            st.markdown("##### What was tested, and what the tests found")
-            st.markdown("""
-Two directional scores shipped in this app. Both were tested walk-forward,
-against forward returns, on non-overlapping samples. Both failed, and both were
-removed rather than tuned. The results are here because a reader deciding how
-much weight to give this application is entitled to them.
-        """)
-
-            st.markdown("**1. The technical composite** (RSI, MACD, moving averages, "
-                        "Bollinger, Stochastic)")
-            st.markdown("""
-25,128 signals · 12 assets · 2018-2026 daily · walk-forward
-
-| Test | Result | Usable threshold |
-|---|---|---|
-| Rank correlation with forward returns, 1 day | −0.003 | ≈ 0.03 |
-| Rank correlation, 5 days | −0.002 | ≈ 0.03 |
-| Rank correlation, 20 days | +0.019 | ≈ 0.03 |
-| Decile monotonicity | Non-monotonic — decile 3 beat decile 8 | Monotonic |
-| Assets with positive correlation | 5 of 12; SPY inverted at −0.088 | Most |
-
-It also carried hardcoded confidence figures — 92% for its strongest reading.
-The measured 5-day hit rate was **56.2%**, against a **58.5% base rate** from
-market drift alone. The bearish end was worse: mean 20-day return after the most
-bearish signal was **+1.15%**, so acting on it lost money.
-
-*Outcome:* confidence figures deleted, labels changed from BUY/SELL to
-descriptions of indicator alignment, and the measured record shown beside every
-table that displays it.
-        """)
-
-            st.markdown("**2. The Quant Lab verdict** (Hurst, momentum, z-score, "
-                        "annualised return)")
-            st.markdown("""
-457 S&P 500 names · 2012-2026 · 78,473 non-overlapping observations · forward 21-day returns
-
-| Label shown | Mean forward return | vs baseline (+1.41%) | t |
-|---|---|---|---|
-| STRONG BEARISH | **+5.10%** | +3.69 | 9.87 |
-| BEARISH | +2.00% | +0.58 | 5.28 |
-| NEUTRAL | +1.26% | −0.16 | −3.34 |
-| BULLISH | +1.07% | −0.35 | −8.08 |
-| STRONG BULLISH | +1.53% | +0.12 | 1.42 |
-
-The score was not merely uninformative — it was **inverted**. Its most bearish
-reading preceded the best forward returns, because a crashed asset scores
-bearish on both momentum and z-score at the same moment it is most likely to
-bounce. A rebuilt version using Hurst as a regime switch with normalised terms
-tested flat (strongest minus weakest: −0.16% full period, −0.84% out of sample,
-every |t| below 2).
-
-*Outcome:* removed. The panel shows a descriptive structure card instead, and
-there is no overall verdict anywhere in the Quant Lab.
-        """)
-
-            st.warning(
-                "**What has not been tested.** The AI-written analyses cannot be "
-                "backtested — the model has seen the outcomes of any historical "
-                "period you would test it on, so a retrospective score would be "
-                "meaningless. Judging them requires a forward-looking record kept "
-                "from today onward. Until that exists, read them as reasoning over "
-                "the supplied data, checkable against the figures they cite, and "
-                "nothing more."
-            )
-
-        # ═══════════════════════════════════════════════════════════
-        with m4:
-            st.markdown("##### What the AI layer is, and what constrains it")
-            st.markdown(f"""
-Analyses are written by Claude. Two shapes are used:
-
-- **The conversational analyst and the Deep Brief specialists** hold
-  {len(ai_agent.TOOLS) if _HAS_AGENT else 18} tools and query this application's own
-  data — quotes, signals, fundamentals with peer context, FRED series, the
-  calendar, filings, news. They read live data rather than answering from
-  memory.
-- **The panel write-ups** (Quant Lab, FX, news, FOMC) receive a fixed brief of
-  measured numbers and interpret it.
-
-Every prompt in the application enforces the same rules:
-
-- Use only the supplied data. Never invent a price, level, holding or figure.
-- Separate what the data shows from what is being inferred, and say which.
-- **No percentage probabilities on scenarios.** Nothing here produces one, so a
-  "60% likely" would be fabricated. Scenarios are ranked, with the observable
-  that would confirm each one early.
-- Say what would falsify the read, and what data is missing that would change it.
-- Where the evidence is thin, say so rather than padding it into a confident note.
-        """)
-
-            st.markdown("##### Deep Brief")
-            st.markdown(f"""
-{len(orch.SUBAGENT_SPECS) if _HAS_ORCH else 6} specialists run in parallel, each
-with its own tool subset, then a synthesiser reconciles them — including where
-they contradict one another, which is usually the most informative part. You
-choose which run; the synthesiser is told which ones did and is instructed not
-to reason about a perspective it never received.
-
-Each specialist reports **data coverage** — whether its tools actually returned
-what it needed. That is an observable fact. It is not the model's confidence in
-its own conclusions, which would not be calibrated.
-        """)
-
-            st.markdown("##### One thing the model cannot see")
-            st.markdown("""
-There is no market-implied data anywhere in this application: no options
-surface, no fed funds futures, no positioning. So the FOMC panel gives a
-qualitative read of the statement's language and points at CME FedWatch for the
-odds, rather than printing a number it would have had to invent.
-        """)
-
-        # ═══════════════════════════════════════════════════════════
-        with m5:
-            st.markdown("##### Limitations worth stating before you rely on anything here")
-            st.markdown(f"""
-**Measurement, not prediction.** Every quantity describes a window that has
-already happened. Nothing here forecasts, and the two things that tried were
-tested and removed.
-
-**Survivorship bias.** The equity universe is today's S&P 500 constituents.
-Anything that was removed from the index is absent, which flatters any
-historical statistic computed across it.
-
-**Policy rates are partly hand-maintained.** {len(fxa.FRED_POLICY_SERIES)} of
-{len(fxa.CURRENCIES)} update themselves; the rest carry a confirmation date and
-are marked unverified once stale. Check the Carry panel's vintage table before
-quoting a carry figure.
-
-**Fundamentals are unaudited and lag the filing.** Sector comparisons only hold
-within a sector: financials and REITs are not comparable to industrials on price
-to book or EV/EBITDA.
-
-**Correlation is not causation.** The FX driver panel measures which macro series
-a pair has tracked recently. It cannot tell you why, and the relationship can
-lapse for quarters at a time.
-
-**The Monte Carlo understates the downside.** It draws normally distributed
-shocks, so the fat tails and jumps measured elsewhere on the same page are
-absent from it by construction.
-
-**Two of the four sentiment gauges are computed here**, from scaling constants
-chosen by hand rather than fitted. They are marked *computed*, and a reading of
-0 or 100 is marked *capped* because the scale saturates rather than the emotion.
-
-**Free data sources.** Yahoo, CoinGecko and the rest carry occasional bad prints
-and gaps. Obvious outliers are filtered — moves beyond ±50% are dropped from the
-movers list as probable splits — but no vendor-grade cleaning is applied.
-
-**News coverage is partial.** {len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} feeds
-plus NewsAPI on a rotating keyword schedule. Absence of a story here is not
-evidence the story does not exist.
-        """)
-
-            st.caption(
-                "If something in this application is unclear, contradicts itself, or "
-                "cannot be traced back to a source on this page, that is a defect "
-                "worth reporting rather than a nuance worth interpreting."
-            )
-    else:
-        locked_tab("method")

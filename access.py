@@ -37,9 +37,18 @@ COST = {"read": 1, "news": 1, "analyst": 3, "fomc": 3, "brief": 10}
 ACTION_NAMES = {"read": "an AI read", "news": "the AI news forecast", "analyst": "an analyst question",
                 "fomc": "an FOMC read", "brief": "a Deep Brief"}
 
+PLANS = {
+    "basic": {"month": 9, "year": 90, "points": [
+        "Global Signals, Currencies, Central Banks, Metals", "10 AI credits a month", "All of AI Bubble Tracker"]},
+    "plus": {"month": 24, "year": 240, "points": [
+        "Everything in Basic", "Adds Crypto, Fundamentals, News & Macro, Quant Lab, AI Analyst", "60 AI credits a month"]},
+    "pro": {"month": 49, "year": 490, "points": [
+        "Everything in Plus", "Adds Deep Brief, Carry Trade, FOMC Lab", "180 AI credits a month"]},
+}
+
 # The lowest plan that opens each tab.
 TAB_TIER = {
-    "global": "basic", "fx": "basic", "cb": "basic", "metals": "basic", "method": "basic",
+    "global": "basic", "fx": "basic", "cb": "basic", "metals": "basic",
     "crypto": "plus", "fund": "plus", "news": "plus", "quant": "plus", "ai": "plus",
     "carry": "pro", "fomc": "pro", "brief": "pro",
 }
@@ -141,4 +150,14 @@ def refund(user: Optional[Dict[str, Any]], action: str, cost: Optional[int] = No
 
 
 def upgrade_url() -> str:
-    return AI_BUBBLE_URL + "/#account"
+    """Plan changes go through Stripe's portal (a second checkout would mean two subscriptions)."""
+    return AI_BUBBLE_URL + "/api/portal/start?next=analizator"
+
+
+def checkout_url(plan: str, interval: str) -> str:
+    return f"{AI_BUBBLE_URL}/api/checkout/start?plan={plan}&interval={interval}&next=analizator"
+
+
+def signin_url() -> str:
+    """AI Bubble Tracker recognises the subscriber by its cookie and sends a fresh pass back."""
+    return AI_BUBBLE_URL + "/api/analizator"

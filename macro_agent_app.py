@@ -74,6 +74,9 @@ import access
 import billing
 import hmac
 import time
+import write_secrets
+
+write_secrets.write()   # before the first st.secrets read, which caches the file
 
 try:
     import orchestrator as orch
@@ -94,7 +97,7 @@ if _HAS_AGENT and "scheduler_started" not in st.session_state:
         st.session_state["scheduler_error"] = str(_e)
 if "yahoo_live_errors" not in st.session_state:
     st.session_state["yahoo_live_errors"] = {}
-APP_URL = os.environ.get("PUBLIC_URL", "http://localhost:8502").rstrip("/")
+APP_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:8502").rstrip("/")
 
 
 def _auth_configured() -> bool:

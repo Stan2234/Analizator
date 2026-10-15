@@ -19,11 +19,17 @@ import urllib.request
 from typing import Any, Dict, Optional
 
 STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-_env = lambda k: os.environ.get(k, "").strip()
+# The live price ids, used with a live key when the environment doesn't name them
+# (a Render service not created from the blueprint skips render.yaml's envVars).
+_LIVE = STRIPE_KEY.startswith(("sk_live_", "rk_live_"))
+_env = lambda k, live: (os.environ.get(k) or (live if _LIVE else "")).strip()
 PRICES = {   # plan -> interval -> price id (Basic kept its original variable names)
-    "basic": {"month": _env("STRIPE_PRICE_MONTH"), "year": _env("STRIPE_PRICE_YEAR")},
-    "plus": {"month": _env("STRIPE_PRICE_PLUS_MONTH"), "year": _env("STRIPE_PRICE_PLUS_YEAR")},
-    "pro": {"month": _env("STRIPE_PRICE_PRO_MONTH"), "year": _env("STRIPE_PRICE_PRO_YEAR")},
+    "basic": {"month": _env("STRIPE_PRICE_MONTH", "price_1UPn4fFvzDXAEXwv6G4iPrE0"),
+              "year": _env("STRIPE_PRICE_YEAR", "price_1UPn4dFvzDXAEXwv7ltRExsE")},
+    "plus": {"month": _env("STRIPE_PRICE_PLUS_MONTH", "price_1UQMn1FvzDXAEXwv8O30RCW0"),
+             "year": _env("STRIPE_PRICE_PLUS_YEAR", "price_1UQMn1FvzDXAEXwvaVxJRx5j")},
+    "pro": {"month": _env("STRIPE_PRICE_PRO_MONTH", "price_1UQMn2FvzDXAEXwva0gtwbzX"),
+            "year": _env("STRIPE_PRICE_PRO_YEAR", "price_1UQMn3FvzDXAEXwvUcoLj1vm")},
 }
 PRICE_PLAN = {pid: plan for plan, ps in PRICES.items() for pid in ps.values() if pid}
 ENABLED = bool(STRIPE_KEY and all(all(ps.values()) for ps in PRICES.values()))

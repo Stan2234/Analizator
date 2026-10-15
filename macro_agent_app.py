@@ -71,6 +71,9 @@ except Exception as _e:
     _AGENT_IMPORT_ERROR = str(_e)
 
 import access
+import billing
+import hmac
+import time
 
 try:
     import orchestrator as orch
@@ -91,17 +94,111 @@ if _HAS_AGENT and "scheduler_started" not in st.session_state:
         st.session_state["scheduler_error"] = str(_e)
 if "yahoo_live_errors" not in st.session_state:
     st.session_state["yahoo_live_errors"] = {}
+APP_URL = os.environ.get("PUBLIC_URL", "http://localhost:8502").rstrip("/")
+
+
+def _auth_configured() -> bool:
+    """Log in / sign up runs on Auth0 through Streamlit's built-in OIDC support;
+    write_secrets.py puts the [auth] section in place from the environment."""
+    try:
+        return "auth" in st.secrets
+    except Exception:
+        return False
+
+
+AUTH_ENABLED = _auth_configured()
+
+
+def _claims() -> Dict[str, Any]:
+    if not (AUTH_ENABLED and st.user.is_logged_in):
+        return {}
+    try:
+        return st.user.to_dict()
+    except Exception:
+        return dict(st.user)
+
+
+def resolve_user() -> None:
+    """Work out who is here on every run: the owner, an account (plan found by its
+    verified email in Stripe), a subscriber arriving with an AI Bubble pass, or a
+    visitor without a plan. Everyone gets in; the plan decides which tabs open."""
+    s = st.session_state
+    if (s.get("user") or {}).get("tier") == "owner":
+        return
+    token = st.query_params.get("sso")
+    if token and not s.get("pass_user"):
+        u = access.verify_pass(token)
+        if u:
+            s.pass_user = u
+    c = _claims()
+    if c:
+        email = str(c.get("email") or "").strip().lower()
+        verified = bool(c.get("email_verified"))
+        if st.query_params.get("checkout") == "done":
+            billing.forget(email)
+        sub = billing.plan_for_email(email) if (verified and email) else None
+        if sub:
+            s.user = {"customer": sub["customer"], "tier": sub["plan"], "email": email}
+        elif s.get("pass_user"):
+            s.user = {**s.pass_user, "email": email}
+        else:
+            s.user = {**access.free(email), "unverified": bool(email) and not verified}
+    else:
+        s.user = s.get("pass_user") or access.free()
+
+
 def current_user():
-    """The signed-in user, or, when the owner previews a plan, a stand-in on that plan."""
-    u = st.session_state.get("user")
+    """The visitor, or, when the owner previews a plan, a stand-in on that plan."""
+    u = st.session_state.get("user") or access.free()
     view = st.session_state.get("view_as", "owner")
-    if u and u.get("tier") == "owner" and view in access.TIERS:
-        return {"customer": f"cus_owner_preview_{view}", "tier": view, "preview": True}
+    if u.get("tier") == "owner" and view in ["free", *access.TIERS]:
+        return {"customer": f"cus_owner_preview_{view}" if view != "free" else None,
+                "tier": view, "preview": True}
     return u
 
 
-def plans_panel() -> None:
-    """The three plans with checkout buttons; buying returns straight to Macro Analyzer."""
+def _checkout_links() -> Dict[Any, str]:
+    """Stripe checkout links for the signed-in account, made once per session."""
+    s = st.session_state
+    links = s.get("checkout_links")
+    if not links or time.time() - links["_at"] > 20 * 3600:
+        email = current_user().get("email")
+        links = {"_at": time.time()}
+        for plan in access.TIERS:
+            for interval in ("month", "year"):
+                links[(plan, interval)] = billing.checkout_url(email, plan, interval, APP_URL + "/")
+        s.checkout_links = links
+    return links
+
+
+def _portal_link() -> Optional[str]:
+    s = st.session_state
+    u = current_user()
+    if not s.get("portal_link") and u.get("customer", "").startswith("cus_") and not u.get("preview"):
+        try:
+            s.portal_link = billing.portal_url(u["customer"], APP_URL + "/")
+        except Exception:
+            return None
+    return s.get("portal_link")
+
+
+def login_button(label: str = "Log in / Sign up", key: str = "login", primary: bool = True) -> None:
+    if AUTH_ENABLED and st.button(label, key=key, type="primary" if primary else "secondary"):
+        st.login("auth0")
+
+
+def plans_panel(key: str) -> None:
+    """The three plans. Signed in: one-click Stripe checkout. Not signed in: log in first,
+    so the purchase is tied to an account that can sign in again on any device."""
+    u = current_user()
+    can_buy = (AUTH_ENABLED and billing.ENABLED and st.user.is_logged_in
+               and u.get("email") and not u.get("unverified") and not u.get("preview"))
+    links = {}
+    if can_buy:
+        try:
+            links = _checkout_links()
+        except Exception as e:
+            st.warning(f"Checkout is unavailable right now ({e}). Try again in a minute.")
     cols = st.columns(3)
     for col, plan in zip(cols, access.TIERS):
         p = access.PLANS[plan]
@@ -111,93 +208,87 @@ def plans_panel() -> None:
             st.markdown(f"**\\${p['month']}** / month · \\${p['year']} / year")
             for point in p["points"]:
                 st.markdown(f"- {point}")
-            st.link_button(f"{access.TIER_NAMES[plan]} monthly", access.checkout_url(plan, "month"),
-                           type="primary" if plan == "plus" else "secondary", use_container_width=True)
-            st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free",
-                           access.checkout_url(plan, "year"), use_container_width=True)
+            if links:
+                st.link_button(f"{access.TIER_NAMES[plan]} monthly", links[(plan, "month")],
+                               type="primary" if plan == "plus" else "secondary", use_container_width=True)
+                st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free", links[(plan, "year")],
+                               use_container_width=True)
+    if not links and not u.get("preview"):
+        if u.get("unverified"):
+            st.info("Verify your email first: open the link Auth0 sent you, then log out and log in again.")
+        elif AUTH_ENABLED and not st.user.is_logged_in:
+            st.markdown("**Log in or create a free account to choose a plan.** Your plan is tied to the "
+                        "account, so you can sign in again from any device with Google or your email.")
+            login_button("Log in / Sign up to subscribe", key=f"login_{key}")
     st.caption("Secure checkout by Stripe. Every plan also unlocks all of AI Bubble Tracker. "
                "Prices exclude VAT where it applies. Cancel any time; 14-day refund on your first "
                "payment. AI credits reset monthly. Not financial advice. "
                f"[Terms]({access.AI_BUBBLE_URL}/terms.html) · [Privacy]({access.AI_BUBBLE_URL}/privacy.html)")
 
 
-def password_gate():
-    if "auth" not in st.session_state:
-        st.session_state.auth = False
-
-    # Subscribers arrive from AI Bubble Tracker with a signed pass in the URL.
-    # It stays in the address bar, so a refresh keeps them signed in until it expires.
-    token = st.query_params.get("sso")
-    if token and not st.session_state.auth:
-        u = access.verify_pass(token)
-        if u:
-            st.session_state.user = u
-            st.session_state.auth = True
-            return
-
-    if not st.session_state.auth:
-        st.title("Macro Analyzer")
-        st.caption("Cross-asset market data with an AI analyst: currencies, carry, central banks, "
-                   "metals, crypto, fundamentals, news, the Fed and multi-agent briefs.")
-        if token:
-            st.warning("This sign-in link has expired or is not valid. Sign in again below.")
-        st.markdown("**Already subscribed?**")
-        st.link_button("Sign in with your AI Bubble Tracker subscription", access.signin_url())
-        st.markdown("---")
-        st.markdown("### Choose a plan")
-        plans_panel()
-        st.markdown("---")
-        with st.expander("Owner sign-in"):
-            pwd = st.text_input("Owner password", type="password")
-
-            # Read APP_PASSWORD from env first (Render), then Streamlit secrets (Streamlit Cloud)
-            expected = os.environ.get("APP_PASSWORD", "")
-            if not expected:
-                try:
-                    if "APP_PASSWORD" in st.secrets:
-                        expected = str(st.secrets["APP_PASSWORD"])
-                except Exception:
-                    expected = ""
-
-            if pwd and expected and pwd == expected:
-                st.session_state.auth = True
-                st.session_state.user = access.owner()
-                st.rerun()
-            elif pwd:
-                st.error("Wrong password")
-            elif not expected:
-                st.warning("APP_PASSWORD not configured on the server.")
-
-        st.stop()
-
-password_gate()
-if st.session_state.get("auth") and not current_user():
-    st.session_state.user = access.owner()   # signed in before plans existed
-
 def locked_tab(tab: str) -> None:
     need = access.TIER_NAMES[access.TAB_TIER[tab]]
     st.info(f"🔒 This tab is part of the {need} plan" + (" and above." if need != "Pro" else "."))
-    if (current_user() or {}).get("preview"):
-        st.caption("(Owner preview: a customer on this plan sees an upgrade link here.)")
+    u = current_user()
+    if u.get("preview"):
+        st.caption("(Owner preview: a visitor sees the plans and a way to buy or upgrade here.)")
+    elif access.paid(u):
+        link = _portal_link()
+        if link:
+            st.link_button(f"Upgrade to {need}", link, type="primary")
     else:
-        st.link_button(f"Upgrade to {need}", access.upgrade_url(), type="primary")
+        plans_panel(key=tab)
 
+
+resolve_user()
+
+if st.query_params.get("checkout") == "done":
+    _u0 = current_user()
+    if access.paid(_u0):
+        st.success(f"Payment received. Your {access.TIER_NAMES[_u0['tier']]} plan is active.")
+    else:
+        st.info("Payment received. It can take a minute to show up; refresh the page if your plan isn't active yet.")
 
 with st.sidebar:
     st.markdown(f"[← AI Bubble Tracker]({access.AI_BUBBLE_URL})")
-    if (st.session_state.get("user") or {}).get("tier") == "owner":
-        st.selectbox("View as", ["owner", *access.TIERS], key="view_as",
-                     format_func=lambda t: "Owner (everything)" if t == "owner" else f"{access.TIER_NAMES[t]} customer",
-                     help="See exactly what a subscriber on that plan sees. AI calls still run "
-                          "for real and cost API money; credits are counted on a separate preview account.")
+    _real = st.session_state.get("user") or {}
+    if AUTH_ENABLED:
+        if st.user.is_logged_in:
+            st.caption(f"Signed in as {_claims().get('email', '')}")
+            if st.button("Log out", key="logout"):
+                for k in ("user", "pass_user", "checkout_links", "portal_link"):
+                    st.session_state.pop(k, None)
+                st.logout()
+        elif _real.get("tier") != "owner":
+            login_button()
+    if _real.get("tier") == "owner":
+        st.selectbox("View as", ["owner", "free", *access.TIERS], key="view_as",
+                     format_func=lambda t: "Owner (everything)" if t == "owner" else (
+                         "Visitor without a plan" if t == "free" else f"{access.TIER_NAMES[t]} customer"),
+                     help="See exactly what a visitor or a subscriber on that plan sees. AI calls still "
+                          "run for real and cost API money; credits are counted on a separate preview account.")
     _u = current_user()
     st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}" + (" (preview)" if _u.get("preview") else ""))
+    if _u.get("unverified"):
+        st.warning("Verify your email (check your inbox), then log out and log in again to see your plan.")
     _left = access.credits_left(_u)
-    if _left is not None:
+    if access.paid(_u):
         st.markdown(f"**AI credits:** {_left} of {access.CREDITS[_u['tier']]} left · reset {access.next_reset():%d %b}")
         st.caption("AI read 1 · news forecast 1 · analyst question 3 · FOMC read 3 · Deep Brief up to 10")
-        if not _u.get("preview"):
-            st.markdown(f"[{'Change plan' if _u['tier'] == 'pro' else 'Upgrade for more tabs and credits'}]({access.upgrade_url()})")
+        _pl = None if _u.get("preview") else _portal_link()
+        if _pl:
+            st.link_button("Change plan, card or invoices", _pl)
+    elif _u["tier"] == "free":
+        st.caption("Global Signals is free. The 🔒 tabs and the AI features come with a plan.")
+    if _real.get("tier") != "owner":
+        with st.expander("Owner"):
+            _pwd = st.text_input("Owner password", type="password", key="owner_pwd")
+            _expected = os.environ.get("APP_PASSWORD", "")
+            if _pwd and _expected and hmac.compare_digest(_pwd, _expected):
+                st.session_state.user = access.owner()
+                st.rerun()
+            elif _pwd:
+                st.error("Wrong password")
 
 
 def inject_secrets_to_env():
@@ -3594,12 +3685,15 @@ now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
+_TAB_LABELS = [
+    ("global", "🌍 Global Signals"), ("fx", "💱 Currencies"), ("carry", "💴 Carry Trade"),
+    ("cb", "🏦 Central Banks"), ("metals", "🥇 Metals"), ("crypto", "🪙 Crypto (Binance)"),
+    ("fund", "📐 Fundamentals"), ("news", "📰 News & Macro"), ("quant", "🧮 Quant Lab"),
+    ("ai", "🤖 AI Analyst"), ("fomc", "🏛 FOMC Lab"), ("brief", "🎯 Deep Brief"),
+]
 (tab_global, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
  tab_news, tab_quant, tab_ai, tab_fomc, tab_brief) = st.tabs(
-    ["🌍 Global Signals", "💱 Currencies", "💴 Carry Trade", "🏦 Central Banks",
-     "🥇 Metals", "🪙 Crypto (Binance)", "📐 Fundamentals", "📰 News & Macro",
-     "🧮 Quant Lab", "🤖 AI Analyst", "🏛 FOMC Lab", "🎯 Deep Brief",
-]
+    [label if access.tab_open(current_user(), key) else f"🔒 {label}" for key, label in _TAB_LABELS]
 )
 
 # -------- GLOBAL TAB (Bloomberg-style dashboard) --------

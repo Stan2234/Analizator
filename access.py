@@ -31,7 +31,8 @@ SSO_SECRET = os.environ.get("ANALIZATOR_SSO_SECRET", "").strip()
 AI_BUBBLE_URL = os.environ.get("AI_BUBBLE_URL", "https://ai-bubble-tracker.onrender.com").rstrip("/")
 
 TIERS = ["basic", "plus", "pro"]
-TIER_NAMES = {"basic": "Basic", "plus": "Plus", "pro": "Pro", "owner": "Owner"}
+TIER_NAMES = {"free": "Free", "basic": "Basic", "plus": "Plus", "pro": "Pro", "owner": "Owner"}
+RANK = {"free": 0, "basic": 1, "plus": 2, "pro": 3}
 CREDITS = {"basic": 10, "plus": 60, "pro": 180}
 COST = {"read": 1, "news": 1, "analyst": 3, "fomc": 3, "brief": 10}
 ACTION_NAMES = {"read": "an AI read", "news": "the AI news forecast", "analyst": "an analyst question",
@@ -39,7 +40,7 @@ ACTION_NAMES = {"read": "an AI read", "news": "the AI news forecast", "analyst":
 
 PLANS = {
     "basic": {"month": 9, "year": 90, "points": [
-        "Global Signals, Currencies, Central Banks, Metals", "10 AI credits a month", "All of AI Bubble Tracker"]},
+        "Adds Currencies, Central Banks, Metals", "10 AI credits a month", "All of AI Bubble Tracker"]},
     "plus": {"month": 24, "year": 240, "points": [
         "Everything in Basic", "Adds Crypto, Fundamentals, News & Macro, Quant Lab, AI Analyst", "60 AI credits a month"]},
     "pro": {"month": 49, "year": 490, "points": [
@@ -48,7 +49,7 @@ PLANS = {
 
 # The lowest plan that opens each tab.
 TAB_TIER = {
-    "global": "basic", "fx": "basic", "cb": "basic", "metals": "basic",
+    "global": "free", "fx": "basic", "cb": "basic", "metals": "basic",
     "crypto": "plus", "fund": "plus", "news": "plus", "quant": "plus", "ai": "plus",
     "carry": "pro", "fomc": "pro", "brief": "pro",
 }
@@ -99,12 +100,20 @@ def owner() -> Dict[str, Any]:
     return {"customer": None, "tier": "owner"}
 
 
+def free(email: Optional[str] = None) -> Dict[str, Any]:
+    """A visitor without a plan: anonymous, or signed in without a subscription."""
+    return {"customer": None, "tier": "free", "email": email}
+
+
+def paid(user: Optional[Dict[str, Any]]) -> bool:
+    return bool(user) and user["tier"] in TIERS
+
+
 def tab_open(user: Optional[Dict[str, Any]], tab: str) -> bool:
-    if not user:
-        return False
-    if user["tier"] == "owner":
+    tier = (user or {}).get("tier", "free")
+    if tier == "owner":
         return True
-    return TIERS.index(user["tier"]) >= TIERS.index(TAB_TIER[tab])
+    return RANK.get(tier, 0) >= RANK[TAB_TIER[tab]]
 
 
 def period(now: Optional[dt.datetime] = None) -> str:
@@ -118,8 +127,10 @@ def next_reset(now: Optional[dt.datetime] = None) -> dt.date:
 
 def credits_left(user: Optional[Dict[str, Any]]) -> Optional[int]:
     """None means unlimited (the owner)."""
-    if not user or user["tier"] == "owner":
+    if user and user["tier"] == "owner":
         return None
+    if not paid(user):
+        return 0
     return max(0, CREDITS[user["tier"]] - dl.credits_used(user["customer"], period()))
 
 
@@ -130,10 +141,10 @@ def brief_cost(n_specialists: int) -> int:
 
 def charge(user: Optional[Dict[str, Any]], action: str, cost: Optional[int] = None) -> Optional[str]:
     """Spend the credits for one AI action. Returns None if it may run, else why not."""
-    if not user:
-        return "sign in first"
-    if user["tier"] == "owner":
+    if user and user["tier"] == "owner":
         return None
+    if not paid(user):
+        return "AI features are part of the paid plans. Log in and choose a plan to use them."
     cost = cost or COST[action]
     if dl.spend_credits(user["customer"], period(), cost, CREDITS[user["tier"]]):
         return None

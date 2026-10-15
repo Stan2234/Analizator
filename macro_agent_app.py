@@ -253,7 +253,9 @@ if st.query_params.get("checkout") == "done":
         st.info("Payment received. It can take a minute to show up; refresh the page if your plan isn't active yet.")
 
 with st.sidebar:
-    st.markdown(f"[← AI Bubble Tracker]({access.AI_BUBBLE_URL})")
+    # logged in here: the same Auth0 session logs them in there without a password
+    _aib = access.AI_BUBBLE_URL + ("/api/login" if AUTH_ENABLED and st.user.is_logged_in else "")
+    st.markdown(f"[← AI Bubble Tracker]({_aib})")
     _real = st.session_state.get("user") or {}
     if AUTH_ENABLED:
         if st.user.is_logged_in:

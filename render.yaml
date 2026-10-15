@@ -42,5 +42,9 @@ services:
         value: https://analizator-vigr.onrender.com
       - key: STRIPE_SECRET_KEY
         sync: false
+      - key: AUTH0_DOMAIN
+        value: dev-g5tgi4qivhjrt7f2.eu.auth0.com
+      - key: AUTH0_CLIENT_ID
+        value: fH0L8UQPkUNxeQemUnL39MjH8wJU4v59
       - key: AUTH0_CLIENT_SECRET
         sync: false

@@ -95,8 +95,6 @@ if _HAS_AGENT and "scheduler_started" not in st.session_state:
     except Exception as _e:
         st.session_state["scheduler_started"] = False
         st.session_state["scheduler_error"] = str(_e)
-if "yahoo_live_errors" not in st.session_state:
-    st.session_state["yahoo_live_errors"] = {}
 APP_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:8502").rstrip("/")
 
 
@@ -436,34 +434,18 @@ ASSETS_BY_CLASS: Dict[str, Dict[str, str]] = {
 # public one, so no key is needed for any of it.
 
 
-# Live ticker – кои символи да показваме хоризонтално (Binance crypto)
+# The scrolling price bar at the top: TradingView's embeddable ticker tape, so the
+# prices are TradingView's own and update live in the browser. Symbols are ones the
+# free widget is allowed to show (CME/ICE futures and some index feeds are not).
 LIVE_TICKER_SYMBOLS = [
-    # Commodities + FX (existing)
-    ("GC=F", "GOLD"),
-    ("SI=F", "SILVER"),
-    ("EURUSD=X", "EUR/USD"),
-    ("GBPUSD=X", "GBP/USD"),
-    ("JPY=X", "USD/JPY"),
-
-    # Crypto via Binance (existing)
-    ("BTCUSDT", "BTC"),
-    ("ETHUSDT", "ETH"),
-    ("BNBUSDT", "BNB"),
-    ("SOLUSDT", "SOL"),
-    ("XRPUSDT", "XRP"),
-
-    # Major global indices, rates, DXY, WTI (added 2026-05)
-    ("^GSPC",     "S&P 500"),
-    ("^NDX",      "NASDAQ 100"),
-    ("^DJI",      "DOW"),
-    ("^RUT",      "RUSSELL 2000"),
-    ("^VIX",      "VIX"),
-    ("^TNX",      "US 10Y"),
-    ("DX-Y.NYB",  "DXY"),
-    ("CL=F",      "WTI CRUDE"),
-    ("^FTSE",     "FTSE 100"),
-    ("^GDAXI",    "DAX"),
-    ("^N225",     "NIKKEI"),
+    ("TVC:GOLD", "Gold"), ("TVC:SILVER", "Silver"),
+    ("FX:EURUSD", "EUR/USD"), ("FX:GBPUSD", "GBP/USD"), ("FX:USDJPY", "USD/JPY"),
+    ("BINANCE:BTCUSDT", "BTC"), ("BINANCE:ETHUSDT", "ETH"), ("BINANCE:BNBUSDT", "BNB"),
+    ("BINANCE:SOLUSDT", "SOL"), ("BINANCE:XRPUSDT", "XRP"),
+    ("FOREXCOM:SPXUSD", "S&P 500"), ("FOREXCOM:NSXUSD", "Nasdaq 100"), ("FOREXCOM:DJI", "Dow"),
+    ("FOREXCOM:US2000", "Russell 2000"), ("CAPITALCOM:VIX", "VIX"),
+    ("FRED:DGS10", "US 10Y (daily)"), ("CAPITALCOM:DXY", "DXY"), ("TVC:USOIL", "WTI Crude"),
+    ("FOREXCOM:UKXGBP", "FTSE 100"), ("PEPPERSTONE:GER40", "DAX"), ("FOREXCOM:JP225", "Nikkei 225"),
 ]
 
 
@@ -3288,344 +3270,17 @@ def show_fomc_lab():
 st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_yahoo_live_quote(symbol: str) -> Dict[str, float]:
-    url = YAHOO_CHART_URL.format(symbol)
-    params = {"range": "1d", "interval": "1m"}
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    r = requests.get(url, params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-
-    result = (data.get("chart", {}) or {}).get("result") or []
-    if not result:
-        raise ValueError(f"No Yahoo chart result for {symbol}. chart.error={data.get('chart', {}).get('error')}")
-
-    res0 = result[0]
-    meta = res0.get("meta", {}) or {}
-
-    # 1) опит: meta regularMarketPrice / previousClose
-    last = meta.get("regularMarketPrice", None)
-    prev_close = meta.get("previousClose", None)
-
-    # 2) fallback: вземи последния не-None close от indicators
-    if last is None or prev_close is None:
-        quotes = (res0.get("indicators", {}) or {}).get("quote", []) or []
-        closes = (quotes[0] or {}).get("close", []) if quotes else []
-        closes_clean = [c for c in closes if c is not None]
-
-        if last is None and closes_clean:
-            last = closes_clean[-1]
-        if prev_close is None and len(closes_clean) >= 2:
-            prev_close = closes_clean[-2]
-
-    if last is None or prev_close is None:
-        raise ValueError(f"Yahoo meta missing prices for {symbol}. meta keys={list(meta.keys())[:20]}")
-
-    last = float(last)
-    prev_close = float(prev_close)
-
-    pct = ((last - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
-    return {"last": last, "pct": pct}
-
-
-
-@st.cache_data(ttl=3, show_spinner=False)
-def fetch_binance_24h_quote(symbol: str) -> Dict[str, float]:
-    base_urls = [
-        "https://data-api.binance.vision",
-        "https://api.binance.com",
-        "https://api1.binance.com",
-        "https://api2.binance.com",
-        "https://api3.binance.com",
-    ]
-    params = {"symbol": symbol}
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    last_err = None
-    for base in base_urls:
-        try:
-            url = f"{base}/api/v3/ticker/24hr"
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            r.raise_for_status()
-            j = r.json()
-            return {
-                "last": float(j.get("lastPrice", 0.0)),
-                "pct": float(j.get("priceChangePercent", 0.0)),
-            }
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(f"Binance 24h quote failed for {symbol}: {last_err}")
-
-# ===== LIVE TICKER HORIZONTAL (CRYPTO, YAHOO STYLE) =====
-
-live_ticker_css = """
-<style>
-.live-ticker-container {
-    position: relative;
-    margin-top: 0.5rem;
-    margin-bottom: 1.5rem;
-    padding: 16px 0;
-    overflow: hidden;
-    background-color: #0a0a0a;
-    border-top: 1px solid #1f1f1f;
-    border-bottom: 1px solid #1f1f1f;
-    color: #ffffff;
-}
-/* Auto-scrolling marquee: cells rendered twice, row slides 0 -> -50%. */
-.live-ticker-row {
-    display: inline-flex;
-    gap: 0;
-    align-items: center;
-    width: max-content;
-    animation: ticker-marquee 140s linear infinite;
-}
-.live-ticker-container:hover .live-ticker-row {
-    animation-play-state: paused;
-}
-@keyframes ticker-marquee {
-    0%   { transform: translateX(0); }
-    100% { transform: translateX(-50%); }
-}
-
-/* Flat text-only ticker cells (no borders, no cards). */
-.ticker-item {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 14px;
-    padding: 0 38px;
-    font-family: 'Courier New', monospace;
-    white-space: nowrap;
-    min-width: 0;
-}
-
-/* Source badge (Yahoo / Binance) hidden — cleaner look. */
-.ticker-source { display: none; }
-
-.ticker-header { display: inline; }
-.ticker-symbol {
-    color: #9aa0a6;
-    font-size: 16px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-.ticker-price-row { display: inline-flex; align-items: baseline; gap: 12px; }
-.ticker-price {
-    color: #ffffff;
-    font-size: 21px;
-    font-weight: 700;
-}
-.ticker-change {
-    font-size: 17px;
-    font-weight: 600;
-    color: #cccccc;
-}
-.ticker-change.up   { color: #00d97e; }
-.ticker-change.down { color: #ff4d6d; }
-
-/* Scroll arrows hidden — replaced by auto-scrolling marquee. */
-.ticker-arrow { display: none; }
-</style>
-"""
-
-# 1) Дърпаме Yahoo live само за металите
-# --- LIVE PRICE MAPS (INITIAL VALUES) ---
-
-yahoo_live_map: Dict[str, Dict[str, float]] = {}
-
-for sym, _ in LIVE_TICKER_SYMBOLS:
-    if sym.endswith("USDT"):
-        continue  # това е Binance
-    try:
-        yahoo_live_map[sym] = fetch_yahoo_live_quote(sym)
-    except Exception as e:
-        yahoo_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
-        st.session_state["yahoo_live_errors"][sym] = str(e)
-
-
-
-binance_live_map = {}
-for sym, _ in LIVE_TICKER_SYMBOLS:
-    if not sym.endswith("=X"):
-        try:
-            binance_live_map[sym] = fetch_binance_24h_quote(sym)
-        except Exception:
-            binance_live_map[sym] = {"last": float("nan"), "pct": float("nan")}
-
-
-ticker_items_html = []
-for sym, short in LIVE_TICKER_SYMBOLS:
-    source = "Binance" if sym.endswith("USDT") else "Yahoo"
-
-
-    # initial values (само за Yahoo; Binance ще се обновява от JS)
-    initial_last = "..."
-    initial_pct = "..."
-    initial_class = ""
-
-    if source == "Yahoo":
-        q = yahoo_live_map.get(sym, {})
-    else:
-        q = binance_live_map.get(sym, {})
-
-    last = q.get("last")
-    pct = q.get("pct")
-
-    if isinstance(last, (int, float)) and last == last:
-        initial_last = f"{last:.4f}"
-    if isinstance(pct, (int, float)) and pct == pct:
-        initial_pct = f"{pct:.2f}%"
-        initial_class = "up" if pct >= 0 else "down"
-
-
-    item_html = f"""
-<div class="ticker-item" data-symbol="{sym}" data-source="{source}">
-  <div class="ticker-header">
-    <div class="ticker-symbol">{short}</div>
-    <div class="ticker-source">{source}</div>
-  </div>
-  <div class="ticker-price-row">
-    <div class="ticker-price" data-symbol="{sym}" data-field="last">{initial_last}</div>
-    <div class="ticker-change {initial_class}" data-symbol="{sym}" data-field="chgClass">
-      <span data-symbol="{sym}" data-field="changePct">{initial_pct}</span>
-    </div>
-  </div>
+live_ticker_html = f"""
+<div class="tradingview-widget-container">
+  <div class="tradingview-widget-container__widget"></div>
+  <script src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+  {json.dumps({
+      "symbols": [{"proName": sym, "title": title} for sym, title in LIVE_TICKER_SYMBOLS],
+      "showSymbolLogo": False, "isTransparent": True, "displayMode": "adaptive",
+      "colorTheme": "dark", "locale": "en"})}
+  </script>
 </div>
 """
-    ticker_items_html.append(item_html)
-
-
-symbols_js = [sym for sym, _ in LIVE_TICKER_SYMBOLS]
-
-# Duplicate the cells so the CSS marquee animation (0% → -50%) loops
-# seamlessly without a visible jump at the end.
-_ticker_items_doubled = ''.join(ticker_items_html) * 2
-
-live_ticker_html = live_ticker_css + textwrap.dedent(f"""
-<div class="live-ticker-container">
-  <div class="live-ticker-row" id="live-ticker-row">
-    {_ticker_items_doubled}
-  </div>
-</div>
-
-<script>
-(function () {{
-  const SYMBOLS = {json.dumps(symbols_js)};
-  const ROW_ID = "live-ticker-row";
-  const STORAGE_KEY = "ticker_scroll_left_v1";
-
-  function fmtPrice(x) {{
-    if (!isFinite(x)) return "...";
-    if (x >= 1000) return x.toLocaleString(undefined, {{ maximumFractionDigits: 2 }});
-    if (x >= 1) return x.toLocaleString(undefined, {{ maximumFractionDigits: 4 }});
-    return x.toLocaleString(undefined, {{ maximumFractionDigits: 8 }});
-  }}
-
-  window.scrollTicker = function (direction) {{
-    const row = document.getElementById(ROW_ID);
-    if (!row) return;
-    const item = row.querySelector(".ticker-item");
-    const step = item ? (item.offsetWidth + 12) : 180;
-    row.scrollBy({{ left: direction * step, behavior: "smooth" }});
-  }};
-
-  function saveScroll() {{
-    const row = document.getElementById(ROW_ID);
-    if (!row) return;
-    try {{ localStorage.setItem(STORAGE_KEY, String(row.scrollLeft)); }} catch (e) {{}}
-  }}
-
-  function restoreScroll() {{
-    const row = document.getElementById(ROW_ID);
-    if (!row) return;
-    try {{
-      const v = localStorage.getItem(STORAGE_KEY);
-      if (v !== null) row.scrollLeft = Number(v) || 0;
-    }} catch (e) {{}}
-  }}
-
-  async function fetchAll24h() {{
-    const urls = [
-      "https://api.binance.com/api/v3/ticker/24hr",
-      "https://data-api.binance.vision/api/v3/ticker/24hr"
-    ];
-    let lastErr = null;
-
-    for (const url of urls) {{
-      try {{
-        const r = await fetch(url, {{ cache: "no-store" }});
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return await r.json();
-      }} catch (e) {{
-        lastErr = e;
-      }}
-    }}
-    throw lastErr;
-  }}
-
-  function updateDom(map) {{
-    for (const sym of SYMBOLS) {{
-      if (!sym.endsWith("USDT")) continue; // само Binance се обновява от JS
-
-      const data = map.get(sym);
-      if (!data) continue;
-
-      const last = Number(data.lastPrice);
-      const pct = Number(data.priceChangePercent);
-
-      // The marquee duplicates each cell — update BOTH copies so the
-      // visible price stays consistent as the row scrolls.
-      const lastEls = document.querySelectorAll(`[data-symbol="${sym}"][data-field="last"]`);
-      const pctEls  = document.querySelectorAll(`[data-symbol="${sym}"][data-field="changePct"]`);
-      const chgEls  = document.querySelectorAll(`[data-symbol="${sym}"][data-field="chgClass"]`);
-
-      lastEls.forEach(el => {{ el.textContent = fmtPrice(last); }});
-      pctEls.forEach(el => {{
-        el.textContent = (isFinite(pct) ? pct.toFixed(2) : "...") + "%";
-      }});
-      chgEls.forEach(el => {{
-        el.classList.remove("up", "down");
-        if (isFinite(pct)) el.classList.add(pct >= 0 ? "up" : "down");
-      }});
-    }}
-  }}
-
-  async function tick() {{
-    try {{
-      const all = await fetchAll24h();
-      const map = new Map();
-      for (const item of all) {{
-        if (item && item.symbol) map.set(item.symbol, item);
-      }}
-      updateDom(map);
-    }} catch (e) {{
-      // ignore
-    }}
-  }}
-
-  function init() {{
-    const row = document.getElementById(ROW_ID);
-    if (row) {{
-      row.addEventListener("scroll", saveScroll, {{ passive: true }});
-      restoreScroll();
-    }}
-    tick();
-    setInterval(tick, 3000);
-  }}
-
-  if (document.readyState === "loading") {{
-    document.addEventListener("DOMContentLoaded", init);
-  }} else {{
-    init();
-  }}
-}})();
-</script>
-""")
 
 # Make the ticker span the full viewport width (edge-to-edge).
 # We target the iframe by its unique height=78 (the value we pass below)
@@ -3671,20 +3326,7 @@ def _load_sentiments():
     except Exception as _e:
         return {"error": str(_e)}
 
-with st.expander("Data source diagnostics"):
-    _errs = st.session_state.get("yahoo_live_errors", {})
-    if _errs:
-        st.caption("Symbols whose live Yahoo fetch failed this session. "
-                   "Panels using them fall back to the cached snapshot.")
-        st.write(_errs)
-    else:
-        st.caption("All live fetches succeeded this session.")
-
-
-
 # ===== REST OF HEADER =====
-# (The 11 major indices are now part of the LIVE_TICKER_SYMBOLS row above —
-# same bordered-card style, same scroll-arrow navigation as gold/silver/FX.)
 
 now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Last update time (UTC): {now}")

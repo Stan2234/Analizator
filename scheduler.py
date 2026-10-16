@@ -339,15 +339,23 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
             return _SCHED
         sched = BackgroundScheduler(timezone="UTC", job_defaults={"coalesce": True, "max_instances": 1})
 
+        # The slower jobs also run a few minutes after start, staggered, instead of
+        # waiting a full interval: a restart (deploy) would otherwise leave a fresh
+        # database without S&P 500 prices, news or macro data for up to 6 hours.
+        soon = lambda minutes: dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
         sched.add_job(job_refresh_quotes, IntervalTrigger(minutes=5), id="quotes", replace_existing=True)
         sched.add_job(job_refresh_universe_full, IntervalTrigger(minutes=30),
-                      id="universe_full", replace_existing=True)
+                      id="universe_full", replace_existing=True, next_run_time=soon(2))
         sched.add_job(job_refresh_rss, IntervalTrigger(minutes=20), id="rss", replace_existing=True)
-        sched.add_job(job_refresh_news, IntervalTrigger(minutes=30), id="newsapi", replace_existing=True)
+        sched.add_job(job_refresh_news, IntervalTrigger(minutes=30), id="newsapi", replace_existing=True,
+                      next_run_time=soon(1))
         sched.add_job(job_refresh_crypto_market, IntervalTrigger(minutes=15), id="crypto_market", replace_existing=True)
-        sched.add_job(job_refresh_finnhub_calendars, IntervalTrigger(hours=2), id="finnhub_cal", replace_existing=True)
-        sched.add_job(job_refresh_fred, IntervalTrigger(hours=6), id="fred", replace_existing=True)
-        sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True)
+        sched.add_job(job_refresh_finnhub_calendars, IntervalTrigger(hours=2), id="finnhub_cal", replace_existing=True,
+                      next_run_time=soon(3))
+        sched.add_job(job_refresh_fred, IntervalTrigger(hours=6), id="fred", replace_existing=True,
+                      next_run_time=soon(4))
+        sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True,
+                      next_run_time=soon(5))
         sched.add_job(job_prune, CronTrigger(hour=3, minute=0), id="prune", replace_existing=True)
         sched.add_job(job_refresh_sp500_universe, CronTrigger(hour=2, minute=30),
                       id="sp500_universe", replace_existing=True)

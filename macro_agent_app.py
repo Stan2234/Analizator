@@ -85,7 +85,8 @@ except Exception as _oe:
     _HAS_ORCH = False
     _ORCH_IMPORT_ERROR = str(_oe)
 
-st.set_page_config(page_title="Market Analyst · Global Market Analyst", layout="wide")
+st.set_page_config(page_title="Market Analyst · Global Market Analyst", layout="wide",
+                   page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png"))
 
 # Start background scheduler exactly once per process
 if _HAS_AGENT and "scheduler_started" not in st.session_state:

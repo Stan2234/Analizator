@@ -254,7 +254,7 @@ if st.query_params.get("checkout") == "done":
 with st.sidebar:
     # logged in here: the same Auth0 session logs them in there without a password
     _aib = access.AI_BUBBLE_URL + ("/api/login" if AUTH_ENABLED and st.user.is_logged_in else "")
-    st.markdown(f"[← AI Bubble Tracker]({_aib})")
+    st.markdown(f'<a href="{_aib}" target="_self">← AI Bubble Tracker</a>', unsafe_allow_html=True)   # same tab
     _real = st.session_state.get("user") or {}
     if AUTH_ENABLED:
         if st.user.is_logged_in:

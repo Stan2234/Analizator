@@ -88,6 +88,14 @@ except Exception as _oe:
 st.set_page_config(page_title="Market Analyst · Global Market Analyst", layout="wide",
                    page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png"))
 
+# The Render copy only points to the new address (and runs no jobs, so nothing is paid twice).
+if os.environ.get("RENDER"):
+    st.title("Market Analyst has moved")
+    st.markdown('<a href="https://globalmarketanalyst.com/market/" target="_self" style="font-size:20px">'
+                'Open Market Analyst at globalmarketanalyst.com/market →</a>', unsafe_allow_html=True)
+    st.caption("Your account and plan work the same at the new address. Please update your bookmark.")
+    st.stop()
+
 # Start background scheduler exactly once per process
 if (_HAS_AGENT and "scheduler_started" not in st.session_state
         and os.environ.get("SCHEDULER_EXTERNAL") != "1"):   # the VPS runs the jobs as their own service

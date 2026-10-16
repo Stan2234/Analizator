@@ -73,6 +73,8 @@ def plan_for_email(email: str, fresh: bool = False) -> Optional[Dict[str, Any]]:
     except Exception:
         return hit[0] if hit else None          # Stripe unreachable: keep the last answer
     live = [s for s in subs if s["status"] in LIVE_STATUSES]
+    if not live:                        # bought before accounts: find it by the checkout email
+        live = _subs_by_checkout_email(email)
     res = None
     if live:
         s = max(live, key=lambda x: x["created"])
@@ -80,6 +82,20 @@ def plan_for_email(email: str, fresh: bool = False) -> Optional[Dict[str, Any]]:
                "customer": s["customer"], "subscription": s["id"]}
     _cache[email] = (res, time.time())
     return res
+
+
+def _subs_by_checkout_email(email: str) -> list:
+    """Live subscriptions of customers who completed a checkout with this email."""
+    try:
+        sessions = _stripe("GET", "checkout/sessions", status="complete", limit=20,
+                           **{"customer_details[email]": email})["data"]
+        out = []
+        for customer in dict.fromkeys(x["customer"] for x in sessions if x.get("customer")):
+            subs = _stripe("GET", "subscriptions", customer=customer, status="all", limit=10)["data"]
+            out += [s for s in subs if s["status"] in LIVE_STATUSES]
+        return out
+    except Exception:
+        return []
 
 
 def checkout_url(email: str, plan: str, interval: str, return_url: str) -> str:

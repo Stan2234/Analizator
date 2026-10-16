@@ -745,7 +745,7 @@ def _clean_entity(name: str) -> str:
     return _FOOTNOTE.sub("", str(name).strip()).strip()
 
 
-def gold_holdings(path: str = GOLD_FILE) -> Dict[str, Any]:
+def gold_holdings(path: Optional[str] = None) -> Dict[str, Any]:
     """Official gold holdings by country.
 
     The sheet lays 100 rows out as two side-by-side blocks of fifty, so it is
@@ -756,6 +756,12 @@ def gold_holdings(path: str = GOLD_FILE) -> Dict[str, Any]:
 
     Returns {table, world_tonnes, euro_area_tonnes, vintage, as_of_range}.
     """
+    if path is None:            # an uploaded newer file (see wgc.py) wins over the shipped one
+        try:
+            import wgc
+            path = wgc.path_for("holdings")
+        except Exception:
+            path = GOLD_FILE
     out: Dict[str, Any] = {"path": path}
     if not os.path.exists(path):
         out["error"] = "file not present"

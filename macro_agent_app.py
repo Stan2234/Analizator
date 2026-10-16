@@ -5371,6 +5371,228 @@ def mt_load_cpi():
     return cbk.cpi_index("USD", "1990-01") if _HAS_CBK else pd.Series(dtype=float)
 
 
+# ---------------- World Gold Council: gold ETFs and central banks ----------------
+_REGION_COLORS = {"North America": "#4488ff", "Europe": "#22c55e", "Asia": "#ffaa00", "Other": "#a3a3a3"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _wgc_load(etf_mtime: float, cb_mtime: float):
+    """Parsed WGC files; the mtimes are only there so an upload busts the cache."""
+    import wgc
+    return wgc.etf_flows(), wgc.cb_changes()
+
+
+def _wgc_data():
+    import wgc
+    mt = lambda k: os.path.getmtime(wgc.path_for(k)) if os.path.exists(wgc.path_for(k)) else 0.0
+    return _wgc_load(mt("etf"), mt("cb_changes"))
+
+
+def _wgc_ai_context() -> Dict[str, Any]:
+    """The WGC figures for the metals desk read: summaries, not raw tables."""
+    try:
+        import wgc
+        e, c = _wgc_data()
+        return {"gold_etfs": wgc.etf_summary(e), "etf_demand_vs_price": wgc.demand_vs_price(e),
+                "central_banks": wgc.cb_summary(c), "source": wgc.SOURCE}
+    except Exception as exc:
+        return {"error": str(exc)[:120]}
+
+
+def _usd_bn(mn: float) -> str:
+    return f"{'+' if mn >= 0 else '−'}${abs(mn) / 1000:,.1f}bn"
+
+
+def _render_wgc_panel() -> None:
+    import wgc
+    e, c = _wgc_data()
+    st.markdown("""
+Two kinds of buyer the price board cannot show: **gold ETFs**, where investors
+hold physical metal through a fund, and **central banks**, which have been the
+steadiest net buyers of the last decade. Both are reported by the World Gold
+Council: ETF holdings monthly by fund, central-bank changes by country as each
+reports to the IMF. They describe who has been buying and selling; neither is a
+forecast, and the central-bank figures run a month or two behind.
+""")
+
+    # ---- gold ETFs ----
+    st.markdown("#### Gold ETFs")
+    if e.get("error"):
+        st.info(f"ETF data unavailable: {e['error']}.")
+    else:
+        s = wgc.etf_summary(e)
+        tot = lambda d: sum(d.values())
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Holdings", f"{s['holdings_tonnes']:,.0f} t",
+                  help=f"Record: {s['holdings_peak']['tonnes']:,.0f} t in {s['holdings_peak']['month']}")
+        k2.metric("Assets", f"${s['aum_usd_bn']:,.0f}bn" if s.get("aum_usd_bn") else "—")
+        k3.metric(f"Demand, {s['month']}", f"{tot(s['demand_t']['month']):+,.1f} t",
+                  _usd_bn(tot(s['flows_usd_mn']['month'])), delta_color="off")
+        k4.metric("Demand, last 12 months", f"{tot(s['demand_t']['12m']):+,.0f} t",
+                  _usd_bn(tot(s['flows_usd_mn']['12m'])), delta_color="off")
+        record = s["holdings_tonnes"] >= s["holdings_peak"]["tonnes"]
+        st.caption(f"As of {s['as_of']}. "
+                   + ("Holdings are at a record in tonnes, not just in dollars. " if record else
+                      f"The record is {s['holdings_peak']['tonnes']:,.0f} t "
+                      f"({s['holdings_peak']['month']}). ")
+                   + f"{s['months_of_inflow_last_12']} of the last 12 months had net inflows.")
+
+        span = st.radio("Window", ["2 years", "5 years", "Since 2003"], horizontal=True,
+                        key="wgc_etf_span")
+        n = {"2 years": 24, "5 years": 60, "Since 2003": 10_000}[span]
+        dem = e["demand_t"].tail(n)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        for r in wgc.REGIONS:
+            fig.add_bar(x=dem.index, y=dem[r], name=r, marker_color=_REGION_COLORS[r])
+        fig.add_scatter(x=dem.index, y=e["price"].reindex(dem.index), name="Gold, US$/oz (avg)",
+                        line=dict(color="#ffffff", width=1.5), secondary_y=True)
+        fig.update_layout(barmode="relative", template="plotly_dark", height=380,
+                          paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                          margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.12))
+        fig.update_yaxes(title_text="tonnes", secondary_y=False)
+        fig.update_yaxes(title_text="US$/oz", secondary_y=True, showgrid=False)
+        st.markdown("##### Monthly ETF demand by region (tonnes) against the gold price")
+        st.plotly_chart(fig, use_container_width=True)
+
+        rel = wgc.demand_vs_price(e)
+        if rel:
+            st.markdown(
+                f"Over the last {rel['months']} months, global ETF demand and the same month's "
+                f"price move had a correlation of **{rel['correlation']:+.2f}**. In months the price "
+                f"rose, ETFs added **{rel['avg_demand_when_price_up_t']:+.1f} t** on average; in "
+                f"months it fell, **{rel['avg_demand_when_price_down_t']:+.1f} t**. The price still "
+                f"rose in **{rel['months_price_up_while_outflows']}** months of net outflows, so other "
+                f"buyers (central banks, bars and coins, Asia's physical market) can carry it "
+                f"without the funds. This is a description of what moved together, not which caused which.")
+
+        hold = e["holdings"]
+        fig2 = go.Figure()
+        for r in wgc.REGIONS:
+            fig2.add_scatter(x=hold.index, y=hold[r], name=r, stackgroup="h",
+                             line=dict(width=0.5, color=_REGION_COLORS[r]))
+        fig2.update_layout(template="plotly_dark", height=300, paper_bgcolor="#000",
+                           plot_bgcolor="#0a0a0a", margin=dict(l=10, r=10, t=30, b=10),
+                           legend=dict(orientation="h", y=1.15), yaxis_title="tonnes")
+        st.markdown("##### Holdings by region since 2003")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        reg = pd.DataFrame({
+            "Holdings (t)": s["holdings_by_region"],
+            f"{s['month']} (t)": s["demand_t"]["month"],
+            "3 months (t)": s["demand_t"]["3m"],
+            "Year to date (t)": s["demand_t"]["ytd"],
+            "12 months (t)": s["demand_t"]["12m"],
+            "12 months (US$bn)": {k: v / 1000 for k, v in s["flows_usd_mn"]["12m"].items()},
+        })
+        st.dataframe(reg.style.format("{:,.1f}"), use_container_width=True)
+
+        f = e["funds"]
+        cols = [col for col in f.columns if col in ("Name", "Country of Listing", "Holdings Tns",
+                                                    "AUM (US$mn)")]
+        flows_cols = [col for col in f.columns if "Demand (tonnes)" in col]
+        with st.expander("The largest funds"):
+            show = f[cols + flows_cols].sort_values("Holdings Tns", ascending=False).head(25)
+            st.dataframe(show.style.format({col: "{:,.1f}" for col in show.columns[2:]}),
+                         use_container_width=True, hide_index=True)
+
+    # ---- central banks ----
+    st.markdown("#### Central banks")
+    if c.get("error"):
+        st.info(f"Central-bank data unavailable: {c['error']}.")
+    else:
+        cs = wgc.cb_summary(c)
+        nt = cs["net_tonnes"]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(f"Net, {cs['as_of']}", f"{nt['last_month']:+,.1f} t")
+        k2.metric("Net, last 12 months", f"{nt['last_12m']:+,.0f} t",
+                  f"{nt['last_12m'] - nt['prior_12m']:+,.0f} t vs the 12 before", delta_color="off")
+        k3.metric("Net, year to date", f"{nt['ytd']:+,.0f} t")
+        k4.metric("Buyers / sellers (12m)", f"{cs['n_buyers']} / {cs['n_sellers']}")
+        st.caption("Reported to the IMF and compiled by the WGC. Countries report on their own "
+                   "schedule, so the latest months fill in later; some buying is never reported.")
+
+        net = wgc.cb_net_series(c)
+        start = st.select_slider("From", options=list(range(2002, net.index.max().year + 1)),
+                                 value=max(2002, net.index.max().year - 9), key="wgc_cb_from")
+        net = net[net.index.year >= start]
+        fig3 = go.Figure()
+        fig3.add_bar(x=net.index, y=net, name="Net monthly",
+                     marker_color=["#22c55e" if v >= 0 else "#ff4444" for v in net])
+        fig3.add_scatter(x=net.index, y=net.rolling(12).sum() / 12, name="12-month average",
+                         line=dict(color="#ffffff", width=1.5))
+        fig3.update_layout(template="plotly_dark", height=320, paper_bgcolor="#000",
+                           plot_bgcolor="#0a0a0a", margin=dict(l=10, r=10, t=30, b=10),
+                           legend=dict(orientation="h", y=1.15), yaxis_title="tonnes")
+        st.markdown("##### Reported net central-bank purchases (tonnes per month)")
+        st.plotly_chart(fig3, use_container_width=True)
+
+        b1, b2 = st.columns(2)
+        with b1:
+            st.markdown("##### Biggest buyers, last 12 months")
+            st.dataframe(pd.DataFrame(cs["top_buyers"]).rename(
+                columns={"country": "Country", "tonnes": "Tonnes"}),
+                use_container_width=True, hide_index=True)
+        with b2:
+            st.markdown("##### Biggest sellers, last 12 months")
+            st.dataframe(pd.DataFrame(cs["top_sellers"]).rename(
+                columns={"country": "Country", "tonnes": "Tonnes"}),
+                use_container_width=True, hide_index=True)
+
+        m = c["monthly"]
+        countries = sorted((x for x in m.columns if not x.endswith("*")),
+                           key=lambda x: -m[x].abs().sum())[:60]
+        pick = st.selectbox("One country's history", countries,
+                            format_func=wgc.display_name, key="wgc_cb_country")
+        series = m[pick]
+        fig4 = go.Figure()
+        fig4.add_bar(x=series.index, y=series, name="Monthly change",
+                     marker_color=["#22c55e" if v >= 0 else "#ff4444" for v in series])
+        fig4.add_scatter(x=series.index, y=series.cumsum(), name="Cumulative since 2002",
+                         yaxis="y2", line=dict(color="#ffaa00", width=1.5))
+        fig4.update_layout(template="plotly_dark", height=300, paper_bgcolor="#000",
+                           plot_bgcolor="#0a0a0a", margin=dict(l=10, r=10, t=10, b=10),
+                           legend=dict(orientation="h", y=1.15), yaxis_title="tonnes",
+                           yaxis2=dict(overlaying="y", side="right", showgrid=False))
+        st.plotly_chart(fig4, use_container_width=True)
+        if c["comments"].get(pick):
+            st.caption(c["comments"][pick])
+
+    st.caption(f"Source: {wgc.SOURCE}. Files are updated by hand each month "
+               f"(the downloads need a Goldhub login).")
+
+    # ---- owner: upload newer files ----
+    if (st.session_state.get("user") or {}).get("tier") == "owner":
+        with st.expander("Owner: upload newer World Gold Council files"):
+            st.caption("Drop the files as downloaded from Goldhub: ETF Flows, Changes_latest (IFS), "
+                       "World official gold holdings (IFS). Each is recognised from its contents.")
+            st.dataframe(pd.DataFrame(wgc.file_status()), use_container_width=True, hide_index=True)
+            ups = st.file_uploader("WGC files", type=["xlsx"], accept_multiple_files=True,
+                                   key="wgc_upload")
+            if ups and st.button("Save files", key="wgc_save"):
+                for up in ups:
+                    data = up.getvalue()
+                    kind = wgc.detect_kind(data)
+                    if not kind:
+                        st.error(f"{up.name}: not a recognised WGC file, not saved.")
+                        continue
+                    # read it from a scratch copy first, so a bad file never replaces a good one
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+                        tf.write(data)
+                    test = {"etf": wgc.etf_flows, "cb_changes": wgc.cb_changes,
+                            "holdings": cbk.gold_holdings}[kind]
+                    try:
+                        res = test(tf.name)
+                    finally:
+                        os.unlink(tf.name)
+                    if res.get("error"):
+                        st.error(f"{up.name}: could not be read ({res['error']}), not saved.")
+                        continue
+                    wgc.save_upload(kind, data)
+                    st.success(f"{up.name}: saved as {wgc.FILES[kind]}.")
+                st.cache_data.clear()
+
+
 with tab_metals:
     if access.tab_open(current_user(), "metals"):
         if not _HAS_MTL:
@@ -5453,9 +5675,9 @@ their own median instead of as a decimal that only looks precise.
                           "estimated."
                     )
 
-                mtt1, mtt2, mtt3, mtt4, mtt5 = st.tabs([
+                mtt1, mtt2, mtt3, mtt4, mtt_wgc, mtt5 = st.tabs([
                     "🥇 The board", "💵 Metal or dollar?", "⚖️ Ratios",
-                    "🔗 What drives them", "🤖 Desk read"])
+                    "🔗 What drives them", "🏦 ETFs & central banks", "🤖 Desk read"])
 
                 # ---------------- the board ----------------
                 with mtt1:
@@ -5825,12 +6047,16 @@ about the industry which the metal price cannot carry, and it is the reason to
 look at the equity at all.
                         """)
 
+                # ---------------- gold ETFs and central banks ----------------
+                with mtt_wgc:
+                    _render_wgc_panel()
+
                 # ---------------- desk read ----------------
                 with mtt5:
                     st.caption(
-                        "Reads the measured figures above. It has no inventory "
-                        "data, no mine supply, no positioning — say so if the "
-                        "question needs them."
+                        "Reads the measured figures above, including gold ETF flows and "
+                        "central-bank purchases. It has no inventory data, no mine supply "
+                        "and no futures positioning — say so if the question needs them."
                     )
                     if st.button("▶ Read the metals complex", type="primary",
                                  key="mt_ai"):
@@ -5870,14 +6096,18 @@ look at the equity at all.
                                                 window=corr_win), 0.7),
                                         "miners": mtl.miner_spread(mt_px, window=win)
                                                   .reset_index().to_dict("records"),
+                                        "gold_buyers": _wgc_ai_context(),
                                         "caveats": [
                                             "Decomposition splits a dollar-quoted move into "
                                             "the metal's part and the dollar's, using the "
                                             "median return across currencies.",
                                             "Ratio percentiles run from 2000 at the earliest "
                                             "— as far back as these futures go.",
-                                            "No inventory, mine supply, ETF flow or "
-                                            "positioning data is in this payload.",
+                                            "gold_buyers holds World Gold Council monthly data: "
+                                            "gold ETF holdings and demand by region, and reported "
+                                            "central-bank purchases (these lag a month or two). "
+                                            "No inventory, mine supply or futures positioning "
+                                            "data is in this payload.",
                                         ],
                                     }
                                     sysmsg = (
@@ -5888,7 +6118,7 @@ look at the equity at all.
                                         "against their own history, correlations to macro "
                                         "drivers, correlation clusters, and mining equity "
                                         "against its metal.\n\n"
-                                        "Write 250-350 words covering:\n"
+                                        "Write 300-400 words covering:\n"
                                         "1. What actually moved — and for each notable move, "
                                         "whether it was the metal or the dollar. The "
                                         "decomposition is given; use it rather than assuming.\n"
@@ -5898,10 +6128,14 @@ look at the equity at all.
                                         "one position held several times, and worth saying "
                                         "plainly.\n"
                                         "4. Whether the miners confirm or contradict their "
-                                        "metal, and what that would imply about costs.\n\n"
+                                        "metal, and what that would imply about costs.\n"
+                                        "5. Who has been buying gold: ETF demand by region and "
+                                        "reported central-bank purchases (gold_buyers), and "
+                                        "whether the price move had the funds behind it or ran "
+                                        "without them. Central-bank data lags a month or two.\n\n"
                                         "Quote the numbers you rely on. Do not forecast a "
                                         "price. If the argument needs something absent from "
-                                        "the payload — inventories, flows, supply — say so "
+                                        "the payload — inventories, supply, positioning — say so "
                                         "rather than supplying it from memory."
                                     )
                                     st.markdown(ai_agent.complete(

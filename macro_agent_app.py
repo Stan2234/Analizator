@@ -3293,19 +3293,19 @@ live_ticker_html = f"""
   <script src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
   {json.dumps({
       "symbols": [{"proName": sym, "title": title} for sym, title in LIVE_TICKER_SYMBOLS],
-      "showSymbolLogo": False, "isTransparent": True, "displayMode": "adaptive",
+      "showSymbolLogo": False, "isTransparent": True, "displayMode": "regular",
       "colorTheme": "dark", "locale": "en"})}
   </script>
 </div>
 """
 
 # Make the ticker span the full viewport width (edge-to-edge).
-# We target the iframe by its unique height=78 (the value we pass below)
+# We target the iframe by its unique height=50 (the value we pass below)
 # so this rule does not affect any other Streamlit iframe component.
 st.markdown(
     """
     <style>
-    iframe[height="78"] {
+    iframe[height="50"] {
         position: relative !important;
         width: 100vw !important;
         left: 50% !important;
@@ -3318,7 +3318,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-components.html(live_ticker_html, height=78, scrolling=False)
+components.html(live_ticker_html, height=50, scrolling=False)
 
 # ===== FEAR & GREED INDEXES =====
 def _fg_color(v):

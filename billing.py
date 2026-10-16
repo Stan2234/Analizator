@@ -1,4 +1,4 @@
-"""Stripe for Macro Analyzer: which plan an account's email has, checkout, the billing portal.
+"""Stripe for Market Analyst: which plan an account's email has, checkout, the billing portal.
 
 A subscription bought here carries the buyer's verified login email in its
 metadata (account_email), so signing in with that email from any device finds

@@ -85,7 +85,7 @@ except Exception as _oe:
     _HAS_ORCH = False
     _ORCH_IMPORT_ERROR = str(_oe)
 
-st.set_page_config(page_title="AI Macro Agent", layout="wide")
+st.set_page_config(page_title="Market Analyst · Global Market Analyst", layout="wide")
 
 # Start background scheduler exactly once per process
 if _HAS_AGENT and "scheduler_started" not in st.session_state:
@@ -3267,7 +3267,23 @@ def show_fomc_lab():
 # STREAMLIT UI
 # ------------------------------------
 
-st.title("AI Macro Agent — Multi-Asset Dashboard + AI Analyst")
+# The strip that ties the two dashboards together on globalmarketanalyst.com.
+_home = access.AI_BUBBLE_URL.rsplit("/", 1)[0] if access.AI_BUBBLE_URL.endswith("/bubble") else access.AI_BUBBLE_URL
+st.markdown(f"""
+<style>
+.gma-suite {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; font-size:13px; margin:-8px 0 4px; }}
+.gma-suite a {{ text-decoration:none !important; color:#a3a3a3 !important; }}
+.gma-suite .home {{ font-weight:600; letter-spacing:.02em; }}
+.gma-suite .sw {{ display:inline-flex; border:1px solid #2a2a2a; border-radius:999px; padding:2px; }}
+.gma-suite .sw a {{ padding:4px 12px; border-radius:999px; }}
+.gma-suite .sw a.on {{ background:#22c55e; color:#000 !important; }}
+</style>
+<div class="gma-suite">
+  <a class="home" href="{_home}/" target="_self">Global Market Analyst</a>
+  <span class="sw"><a href="{access.AI_BUBBLE_URL}/" target="_self">AI Bubble Tracker</a><a class="on" href="#" target="_self">Market Analyst</a></span>
+</div>
+""", unsafe_allow_html=True)
+st.title("Market Analyst — Multi-Asset Dashboard + AI Analyst")
 
 
 live_ticker_html = f"""

@@ -295,6 +295,7 @@ def job_refresh_sp500_universe() -> None:
             log.info("  added: %s", ", ".join(added[:20]))
         if removed:
             log.info("  removed: %s", ", ".join(removed[:20]))
+        dl.kv_set("sp500_constituents", su.SP500_COMPANIES)
         dl.seed_universe(force=True)
     except Exception as e:
         log.exception("job_refresh_sp500_universe failed: %s", e)
@@ -347,7 +348,8 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_universe_full, IntervalTrigger(minutes=30),
                       id="universe_full", replace_existing=True, next_run_time=soon(2))
         sched.add_job(job_refresh_rss, IntervalTrigger(minutes=20), id="rss", replace_existing=True)
-        sched.add_job(job_refresh_news, IntervalTrigger(minutes=30), id="newsapi", replace_existing=True,
+        # NewsAPI's free plan allows 100 requests a day; a run makes 5, so every 2 h is 60.
+        sched.add_job(job_refresh_news, IntervalTrigger(hours=2), id="newsapi", replace_existing=True,
                       next_run_time=soon(1))
         sched.add_job(job_refresh_crypto_market, IntervalTrigger(minutes=15), id="crypto_market", replace_existing=True)
         sched.add_job(job_refresh_finnhub_calendars, IntervalTrigger(hours=2), id="finnhub_cal", replace_existing=True,

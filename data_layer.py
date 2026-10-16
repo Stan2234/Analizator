@@ -652,6 +652,9 @@ def seed_universe(force: bool = False) -> int:
         import symbol_universe as su
     except Exception:
         return 0
+    # The constituent list the jobs fetched last (kept in the DB so the app process,
+    # which may run separately from the jobs, uses the same one), else the shipped one.
+    companies = kv_get("sp500_constituents") or su.SP500_COMPANIES
     conn = get_conn()
     with _DB_LOCK:
         if not force:
@@ -661,7 +664,7 @@ def seed_universe(force: bool = False) -> int:
             # which meant a refreshed constituent list — sixty new names in
             # this index's case — was never written because the old rows had
             # already met the quota.
-            known = {r["symbol"] for r in su.SP500_COMPANIES}
+            known = {r["symbol"] for r in companies}
             known |= {r["symbol"] for r in su.MAJOR_INDICES}
             have = {r["symbol"] for r in conn.execute(
                 "SELECT symbol FROM symbols_universe").fetchall()}
@@ -670,14 +673,14 @@ def seed_universe(force: bool = False) -> int:
         now = now_utc_iso()
         core_set = set(su.CORE_WATCHLIST)
         rows = []
-        for r in su.SP500_COMPANIES:
+        for r in companies:
             rows.append((r["symbol"], r["name"], r["sector"], r["industry"],
                          "equity", 1 if r["symbol"] in core_set else 0, now))
         for r in su.MAJOR_INDICES:
             rows.append((r["symbol"], r["name"], "Index/Commodity", r["type"],
                          r["type"], 1, now))  # all indices are core
         # ETFs in core watchlist that aren't S&P members - register them too
-        sp500_set = {x["symbol"] for x in su.SP500_COMPANIES}
+        sp500_set = {x["symbol"] for x in companies}
         idx_set = {x["symbol"] for x in su.MAJOR_INDICES}
         for sym in su.CORE_WATCHLIST:
             if sym in sp500_set or sym in idx_set:
@@ -689,6 +692,12 @@ def seed_universe(force: bool = False) -> int:
                VALUES (?,?,?,?,?,?,?)""",
             rows,
         )
+        if force:
+            # names that left the index stop counting as S&P 500 members
+            keep = {r[0] for r in rows}
+            conn.execute(
+                f"DELETE FROM symbols_universe WHERE asset_type='equity' AND symbol NOT IN "
+                f"({','.join('?' * len(keep))})", tuple(keep))
         conn.commit()
         return len(rows)
 

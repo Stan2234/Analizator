@@ -7844,7 +7844,7 @@ calendar, institutional filings, analyst estimates and the crypto market.
 The conversation stays in this browser tab; a refresh starts a new one.
 """)
 
-        st.subheader("🤖 Analizator — Conversational Agent")
+        st.subheader("🤖 Market Analyst — Conversational Agent")
         st.caption(
             f"Claude with tool access to this app's data: news (NewsAPI plus "
             f"{len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} RSS feeds), market quotes "
@@ -8071,7 +8071,7 @@ it was given; it does not predict prices or give investment advice.
                     st.info("No scheduled brief job is currently registered. "
                             "To enable: set `ENABLE_SCHEDULED_BRIEF=true` (and "
                             "optionally `DEEP_BRIEF_CRON=0 7 * * 1-5` or `07:00`) "
-                            "in Render env vars, then redeploy. Default schedule "
+                            "in the server's environment, then redeploy. Default schedule "
                             "is 07:00 UTC weekdays.")
 
                 if st.button("▶️ Run scheduled brief now (manual trigger)",

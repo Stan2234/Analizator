@@ -37,6 +37,7 @@ EnvironmentFile=-$APP/.env
 Environment=ANALIZATOR_DB_PATH=$DATA/analizator.db
 Environment=PUBLIC_URL=https://globalmarketanalyst.com/market
 Environment=AI_BUBBLE_URL=https://globalmarketanalyst.com/bubble
+Environment=SCHEDULER_EXTERNAL=1
 ExecStartPre=$APP/venv/bin/python write_secrets.py
 ExecStart=$APP/venv/bin/streamlit run macro_agent_app.py --server.port=8502 --server.address=127.0.0.1 --server.headless=true --server.baseUrlPath=market
 Restart=always
@@ -45,9 +46,26 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
+# the data jobs run on their own, so they keep going when nobody has the app open
+cat > /etc/systemd/system/analizator-jobs.service <<UNIT
+[Unit]
+Description=Market Analyst background data jobs
+After=network-online.target
+
+[Service]
+WorkingDirectory=$APP
+EnvironmentFile=-$APP/.env
+Environment=ANALIZATOR_DB_PATH=$DATA/analizator.db
+ExecStart=$APP/venv/bin/python scheduler.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 systemctl daemon-reload
-systemctl enable -q analizator
-systemctl restart analizator
+systemctl enable -q analizator analizator-jobs
+systemctl restart analizator-jobs analizator
 for i in \$(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8502/market/_stcore/health && break; sleep 2; done
 systemctl is-active analizator
 curl -s -o /dev/null -w "health %{http_code}\n" http://127.0.0.1:8502/market/_stcore/health

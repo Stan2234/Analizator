@@ -402,3 +402,15 @@ def scheduler_status() -> dict:
             for j in s.get_jobs()
         ],
     }
+
+
+if __name__ == "__main__":
+    # Run the jobs as their own process (the VPS does this, see deploy_vps.sh), so data
+    # keeps flowing whether or not anyone has the app open. The app then sets
+    # SCHEDULER_EXTERNAL=1 and doesn't start a second copy.
+    import time
+    from dotenv import load_dotenv
+    load_dotenv()
+    start_scheduler(run_now=True)
+    while True:
+        time.sleep(3600)

@@ -89,7 +89,8 @@ st.set_page_config(page_title="Market Analyst · Global Market Analyst", layout=
                    page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png"))
 
 # Start background scheduler exactly once per process
-if _HAS_AGENT and "scheduler_started" not in st.session_state:
+if (_HAS_AGENT and "scheduler_started" not in st.session_state
+        and os.environ.get("SCHEDULER_EXTERNAL") != "1"):   # the VPS runs the jobs as their own service
     try:
         bg_scheduler.start_scheduler(run_now=True)
         st.session_state["scheduler_started"] = True

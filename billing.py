@@ -11,6 +11,7 @@ nothing is sold and every signed-in account counts as Free.
 from __future__ import annotations
 
 import json
+import re
 import os
 import time
 import urllib.error
@@ -98,9 +99,12 @@ def _subs_by_checkout_email(email: str) -> list:
         return []
 
 
-def checkout_url(email: str, plan: str, interval: str, return_url: str) -> str:
+def checkout_url(email: str, plan: str, interval: str, return_url: str, ref: str = "") -> str:
     email = email.strip().lower()
-    s = _stripe("POST", "checkout/sessions", **{
+    # which ad or post the buyer came from (the site sets a gma_ref cookie, see the Caddyfile)
+    extra = ({"metadata[ref]": ref, "subscription_data[metadata][ref]": ref}
+             if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", ref or "") else {})
+    s = _stripe("POST", "checkout/sessions", **extra, **{
         "mode": "subscription",
         "line_items[0][price]": PRICES[plan][interval], "line_items[0][quantity]": 1,
         "managed_payments[enabled]": "true",

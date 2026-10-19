@@ -168,6 +168,14 @@ def current_user():
     return u
 
 
+def _ad_ref() -> str:
+    """The ad or post this visitor came from, if any (cookie set by the web server)."""
+    try:
+        return str(st.context.cookies.get("gma_ref", "") or "")
+    except Exception:
+        return ""
+
+
 def _checkout_links() -> Dict[Any, str]:
     """Stripe checkout links for the signed-in account, made once per session."""
     s = st.session_state
@@ -177,7 +185,8 @@ def _checkout_links() -> Dict[Any, str]:
         links = {"_at": time.time()}
         for plan in access.TIERS:
             for interval in ("month", "year"):
-                links[(plan, interval)] = billing.checkout_url(email, plan, interval, APP_URL + "/")
+                links[(plan, interval)] = billing.checkout_url(email, plan, interval, APP_URL + "/",
+                                                               ref=_ad_ref())
         s.checkout_links = links
     return links
 

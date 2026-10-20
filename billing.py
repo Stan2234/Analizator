@@ -10,6 +10,8 @@ nothing is sold and every signed-in account counts as Free.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 import os
@@ -122,3 +124,37 @@ def portal_url(customer: str, return_url: str) -> str:
 
 def forget(email: str) -> None:
     _cache.pop((email or "").strip().lower(), None)
+
+
+def customer_from_cookie(code: str) -> Optional[str]:
+    """The Stripe customer in AI Bubble Tracker's aib_pro cookie (customer id + HMAC), if genuine.
+
+    Both apps share globalmarketanalyst.com, so a plan bought without an account (AI Bubble
+    sets this cookie when the buyer returns from Stripe) unlocks Market Analyst too."""
+    customer, _, _ = (code or "").strip().partition(".")
+    if not (STRIPE_KEY and customer.startswith("cus_")):
+        return None
+    mac = hmac.new(hashlib.sha256(("aib-pro::" + STRIPE_KEY).encode()).digest(),
+                   customer.encode(), hashlib.sha256).hexdigest()[:20]
+    return customer if hmac.compare_digest(f"{customer}.{mac}", code.strip()) else None
+
+
+def plan_for_customer(customer: str) -> Optional[Dict[str, Any]]:
+    """{"plan", "customer", "subscription"} for the customer's newest live subscription, or None."""
+    if not (ENABLED and customer):
+        return None
+    hit = _cache.get("cus:" + customer)
+    if hit and time.time() - hit[1] < (TTL_HIT if hit[0] else TTL_MISS):
+        return hit[0]
+    try:
+        subs = _stripe("GET", "subscriptions", customer=customer, status="all", limit=10)["data"]
+    except Exception:
+        return hit[0] if hit else None
+    live = [s for s in subs if s["status"] in LIVE_STATUSES]
+    res = None
+    if live:
+        s = max(live, key=lambda x: x["created"])
+        res = {"plan": PRICE_PLAN.get(s["items"]["data"][0]["price"]["id"], "basic"),
+               "customer": customer, "subscription": s["id"]}
+    _cache["cus:" + customer] = (res, time.time())
+    return res

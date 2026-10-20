@@ -141,6 +141,14 @@ def resolve_user() -> None:
         u = access.verify_pass(token)
         if u:
             s.pass_user = u
+    if not s.get("pass_user"):           # paid without an account: AI Bubble's plan cookie
+        try:
+            cus = billing.customer_from_cookie(str(st.context.cookies.get("aib_pro", "") or ""))
+            sub = billing.plan_for_customer(cus) if cus else None
+            if sub:
+                s.pass_user = {"customer": sub["customer"], "tier": sub["plan"]}
+        except Exception:
+            pass
     c = _claims()
     if c:
         email = str(c.get("email") or "").strip().lower()
@@ -208,8 +216,8 @@ def login_button(label: str = "Log in / Sign up", key: str = "login", primary: b
 
 
 def plans_panel(key: str) -> None:
-    """The three plans. Signed in: one-click Stripe checkout. Not signed in: log in first,
-    so the purchase is tied to an account that can sign in again on any device."""
+    """The three plans, one click to Stripe. Signed in: the checkout carries the account email.
+    Not signed in: checkout through AI Bubble Tracker, no account needed (see access.checkout_url)."""
     u = current_user()
     can_buy = (AUTH_ENABLED and billing.ENABLED and st.user.is_logged_in
                and u.get("email") and not u.get("unverified") and not u.get("preview"))
@@ -233,13 +241,19 @@ def plans_panel(key: str) -> None:
                                type="primary" if plan == "plus" else "secondary", use_container_width=True)
                 st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free", links[(plan, "year")],
                                use_container_width=True)
-    if not links and not u.get("preview"):
-        if u.get("unverified"):
-            st.info("Verify your email first: open the link Auth0 sent you, then log out and log in again.")
-        elif AUTH_ENABLED and not st.user.is_logged_in:
-            st.markdown("**Log in or create a free account to choose a plan.** Your plan is tied to the "
-                        "account, so you can sign in again from any device with Google or your email.")
-            login_button("Log in / Sign up to subscribe", key=f"login_{key}")
+    if not links and not u.get("preview") and billing.ENABLED:
+        # No account needed to buy: checkout runs through AI Bubble Tracker, Stripe asks for the
+        # email, and the buyer comes back here with the plan unlocked in this browser.
+        for col, plan in zip(cols, access.TIERS):
+            with col:
+                st.link_button(f"{access.TIER_NAMES[plan]} monthly", access.checkout_url(plan, "month"),
+                               type="primary" if plan == "plus" else "secondary", use_container_width=True)
+                st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free",
+                               access.checkout_url(plan, "year"), use_container_width=True)
+        if AUTH_ENABLED and not st.user.is_logged_in:
+            st.caption("Already subscribed? Log in with the email you paid with and your plan follows you "
+                       "to every device.")
+            login_button("Log in", key=f"login_{key}", primary=False)
     st.caption("Secure checkout by Stripe. Every plan also unlocks all of AI Bubble Tracker. "
                "Prices exclude VAT where it applies. Cancel any time; 14-day refund on your first "
                "payment. AI credits reset monthly. Not financial advice. "

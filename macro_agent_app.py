@@ -3316,6 +3316,21 @@ st.markdown(f"""
   <span class="sw"><a href="{access.AI_BUBBLE_URL}/" target="_self">AI Bubble Tracker</a><a class="on" href="#" target="_self">Market Analyst</a></span>
 </div>
 """, unsafe_allow_html=True)
+# Phones: Market Analyst is built for wide screens; say so and point to the mobile-friendly part.
+st.markdown(f"""
+<style>
+.gma-mobile {{ display:none; }}
+@media (max-width: 768px) {{
+  .gma-mobile {{ display:block; border:1px solid #1f3d2b; background:#06140c; border-radius:12px;
+    padding:12px 14px; margin:4px 0 10px; font-size:14px; line-height:1.45; color:#d4d4d4; }}
+  .gma-mobile b {{ color:#fff; }}
+  .gma-mobile a {{ color:#22c55e !important; font-weight:600; text-decoration:none !important; }}
+}}
+</style>
+<div class="gma-mobile">💻 <b>Market Analyst is built for larger screens.</b> Its charts and tables are dense, so open
+it on a computer for the full experience. On your phone, <a href="{access.AI_BUBBLE_URL}/" target="_self">AI Bubble
+Tracker →</a> works well.</div>
+""", unsafe_allow_html=True)
 st.title("Market Analyst — Multi-Asset Dashboard + AI Analyst")
 
 

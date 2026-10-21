@@ -26,6 +26,8 @@ cd $APP
 command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null; }
 [ -x venv/bin/python ] || uv venv -q -p 3.11 venv
 VIRTUAL_ENV=$APP/venv uv pip install -q -r requirements.txt
+# the branded loading screen goes into Streamlit's own index.html (see boot/patch_streamlit.py)
+./venv/bin/python boot/patch_streamlit.py
 cat > /etc/systemd/system/analizator.service <<UNIT
 [Unit]
 Description=Market Analyst (Analizator, Streamlit)

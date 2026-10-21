@@ -3325,6 +3325,8 @@ st.markdown(f"""
     padding:12px 14px; margin:4px 0 10px; font-size:14px; line-height:1.45; color:#d4d4d4; }}
   .gma-mobile b {{ color:#fff; }}
   .gma-mobile a {{ color:#22c55e !important; font-weight:600; text-decoration:none !important; }}
+  /* phones only: the page title would otherwise fill half the screen */
+  [data-testid="stMainBlockContainer"] h1 {{ font-size: 1.7rem !important; line-height: 1.2 !important; }}
 }}
 </style>
 <div class="gma-mobile">💻 <b>Market Analyst is built for larger screens.</b> Its charts and tables are dense, so open

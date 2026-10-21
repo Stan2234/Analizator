@@ -1419,6 +1419,19 @@ def analyze_yahoo_asset(name: str, ticker: str, asset_class: str) -> Optional[Di
 
 
 
+def global_assets_df() -> pd.DataFrame:
+    """Names and tickers of the global assets, for the asset pickers (no price pulls)."""
+    return pd.DataFrame([{"name": n, "ticker": t} for c, m in ASSETS_BY_CLASS.items()
+                         if c != "currency" for n, t in m.items()])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def global_signals_cached() -> pd.DataFrame:
+    """The technical-alignment table the AI forecasts read. Built on demand, not on page load:
+    it re-pulls a year of history per asset, which made every first visit slower."""
+    return run_analysis_global([c for c in ASSETS_BY_CLASS.keys() if c != "currency"])
+
+
 def run_analysis_global(selected_classes: List[str]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for asset_class, mapping in ASSETS_BY_CLASS.items():
@@ -3681,35 +3694,6 @@ independent measure — and never quote them as if they were a published index.
         except Exception as _e:
             st.error(f"Universe browser failed: {_e}")
 
-        # ============== Legacy multi-indicator analysis (collapsed) ==============
-        with st.expander("📊 Legacy multi-indicator signal table (original Global Signals)",
-                          expanded=False):
-            st.caption(
-                "The original SMA+RSI+MACD+Bollinger+Stochastic+ADX scoring "
-                "table. Slower (re-pulls history). Kept for power-user use."
-            )
-            all_classes_legacy = [c for c in ASSETS_BY_CLASS.keys() if c != "currency"]
-            selected_classes = st.multiselect(
-                "Asset classes to show:",
-                options=all_classes_legacy,
-                default=all_classes_legacy,
-                key="legacy_global_classes",
-            )
-            refresh = st.button("🔄 Refresh legacy signals", key="legacy_global_refresh")
-            if "df_signals_global" not in st.session_state or refresh:
-                df_global = run_analysis_global(selected_classes)
-                st.session_state["df_signals_global"] = df_global
-            else:
-                df_global = st.session_state["df_signals_global"]
-
-            if df_global.empty:
-                st.warning("No legacy results yet.")
-            else:
-                def color_terminal(row):
-                    return ["color: #00ff00; background-color: #000000;" for _ in row]
-                styled_df = df_global.style.apply(color_terminal, axis=1)
-                st.dataframe(styled_df, use_container_width=True)
-                st.caption(ALIGNMENT_NOTE)
     else:
         locked_tab("global")
 
@@ -7219,7 +7203,7 @@ feeds update on their own every 20 minutes.
             if auto_msg:
                 st.success(auto_msg)
 
-            df_global_for_ai = st.session_state.get("df_signals_global", pd.DataFrame())
+            df_global_for_ai = global_assets_df()
             df_crypto_for_ai = st.session_state.get("df_signals_binance", pd.DataFrame())
 
             asset_options: List[str] = ["Global macro view"]
@@ -7303,7 +7287,7 @@ feeds update on their own every 20 minutes.
                 news_items_for_run = st.session_state.get("news_items", [])
                 if news_items_for_run:
                     news_forecast = run_news_forecast(
-                        df_global=df_global_for_ai,
+                        df_global=global_signals_cached(),
                         df_crypto=df_crypto_for_ai,
                         latest_news_items=news_items_for_run,
                         focus_asset=focus_asset,
@@ -7320,7 +7304,7 @@ feeds update on their own every 20 minutes.
             if news_items and (not news_forecast or news_forecast_asset != focus_asset) and st.button(
                     f"🤖 Run AI forecast for {focus_asset} (1 credit)", key="news_ai_run"):
                 news_forecast = run_news_forecast(
-                    df_global=df_global_for_ai,
+                    df_global=global_signals_cached(),
                     df_crypto=df_crypto_for_ai,
                     latest_news_items=news_items,
                     focus_asset=focus_asset,
@@ -7433,7 +7417,7 @@ than tuned.
         except Exception:
             pass
 
-        df_global_for_q = st.session_state.get("df_signals_global", pd.DataFrame())
+        df_global_for_q = global_assets_df()
         df_crypto_for_q = st.session_state.get("df_signals_binance", pd.DataFrame())
         if not df_global_for_q.empty:
             asset_options_q.extend(

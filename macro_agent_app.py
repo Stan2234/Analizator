@@ -3846,17 +3846,19 @@ describes the recent past.
         </div>
         """, unsafe_allow_html=True)
 
-            fxc1, fxc2, fxc3 = st.columns([1.4, 1.4, 1])
-            with fxc1:
-                fx_scope = st.radio("Universe", ["G10", "G10 + EM"], horizontal=True,
-                                    key="fx_scope", label_visibility="collapsed")
-            with fxc2:
-                fx_horizon = st.select_slider(
-                    "Horizon", options=list(fxa.HORIZON_BARS.keys()), value="1M",
-                    key="fx_horizon", label_visibility="collapsed")
-            with fxc3:
-                if st.button("🔄 Refresh", key="fx_refresh", use_container_width=True):
-                    fx_load_prices.clear()
+            with st.form("fx_form", border=False):
+                fxc1, fxc2, fxc3 = st.columns([1.4, 1.4, 1])
+                with fxc1:
+                    fx_scope = st.radio("Universe", ["G10", "G10 + EM"], horizontal=True,
+                                        key="fx_scope", label_visibility="collapsed")
+                with fxc2:
+                    fx_horizon = st.select_slider(
+                        "Horizon", options=list(fxa.HORIZON_BARS.keys()), value="1M",
+                        key="fx_horizon", label_visibility="collapsed")
+                with fxc3:
+                    st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True)
+            if st.button("🔄 Refresh prices", key="fx_refresh"):
+                fx_load_prices.clear()
 
             fx_codes = fxa.G10 if fx_scope == "G10" else fxa.G10 + fxa.EM
             fx_bars = fxa.HORIZON_BARS[fx_horizon]
@@ -4127,8 +4129,11 @@ describes the recent past.
                 # 3. VOL & CORRELATION
                 # ═══════════════════════════════════════════════════════
                 with fxt3:
-                    vs_ccy = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
-                                          key="fx_vol_vs")
+                    with st.form("fx_vol_form", border=False):
+                        vc1, vc2 = st.columns([3, 1])
+                        vs_ccy = vc1.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
+                                               key="fx_vol_vs")
+                        vc2.form_submit_button("▶ Run analysis", use_container_width=True)
                     vol_rows = []
                     for code in fx_codes:
                         if code == vs_ccy:
@@ -4202,8 +4207,11 @@ describes the recent past.
                         "sessions. Textbook FX relationships lapse for quarters at a time, so this "
                         "measures the link rather than assuming it."
                     )
-                    drv_vs = st.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
-                                          key="fx_drv_vs")
+                    with st.form("fx_drv_form", border=False):
+                        dvc1, dvc2 = st.columns([3, 1])
+                        drv_vs = dvc1.selectbox("Quote currency", ["USD"] + [c for c in fx_codes if c != "USD"],
+                                                key="fx_drv_vs")
+                        dvc2.form_submit_button("▶ Run analysis", use_container_width=True)
 
                     rows, labels = [], []
                     for code in fx_codes:
@@ -4256,18 +4264,23 @@ describes the recent past.
                 # 5. PAIR DEEP DIVE
                 # ═══════════════════════════════════════════════════════
                 with fxt5:
-                    pc1, pc2, pc3 = st.columns([1, 1, 1])
                     avail = [c for c in fx_codes if c in uv.columns]
-                    with pc1:
-                        dd_base = st.selectbox("Base", avail,
-                                               index=avail.index("EUR") if "EUR" in avail else 0,
-                                               key="fx_dd_base")
-                    with pc2:
-                        dd_quote = st.selectbox("Quote", [c for c in avail if c != dd_base],
-                                                index=0, key="fx_dd_quote")
-                    with pc3:
-                        run_dd = st.button("▶ Analyse", type="primary", key="fx_dd_run",
-                                           use_container_width=True)
+                    with st.form("fx_dd_form", border=False):
+                        pc1, pc2, pc3 = st.columns([1, 1, 1])
+                        with pc1:
+                            dd_base = st.selectbox("Base", avail,
+                                                   index=avail.index("EUR") if "EUR" in avail else 0,
+                                                   key="fx_dd_base")
+                        with pc2:
+                            dd_quote = st.selectbox("Quote", avail,
+                                                    index=avail.index("USD") if "USD" in avail else 1,
+                                                    key="fx_dd_quote")
+                        with pc3:
+                            st.form_submit_button("▶ Run analysis", type="primary",
+                                                  use_container_width=True)
+                    if dd_quote == dd_base:
+                        dd_quote = next(c for c in avail if c != dd_base)
+                    run_dd = st.button(f"🤖 AI read of {dd_base}/{dd_quote} (1 credit)", key="fx_dd_run")
 
                     snap = fxa.pair_snapshot(uv, dd_base, dd_quote, fx_rates, fx_prices)
                     if not snap:
@@ -4498,17 +4511,19 @@ prevailing at the time, so the curve is tilted toward the current regime, and
 that error is largest exactly where it matters most — around a policy turn.
             """)
 
-            cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
-            with cc1:
-                funding_ccy = st.selectbox(
-                    "Funding currency", ["JPY", "CHF", "EUR", "USD"],
-                    key="carry_funding", label_visibility="collapsed")
-            with cc2:
-                target_scope = st.radio("Targets", ["G10", "G10 + EM"], horizontal=True,
-                                        key="carry_scope", label_visibility="collapsed")
-            with cc3:
-                if st.button("🔄 Refresh", key="carry_refresh", use_container_width=True):
-                    fx_load_prices.clear()
+            with st.form("carry_form", border=False):
+                cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+                with cc1:
+                    funding_ccy = st.selectbox(
+                        "Funding currency", ["JPY", "CHF", "EUR", "USD"],
+                        key="carry_funding", label_visibility="collapsed")
+                with cc2:
+                    target_scope = st.radio("Targets", ["G10", "G10 + EM"], horizontal=True,
+                                            key="carry_scope", label_visibility="collapsed")
+                with cc3:
+                    st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True)
+            if st.button("🔄 Refresh prices", key="carry_refresh"):
+                fx_load_prices.clear()
 
             carry_targets = fxa.G10 if target_scope == "G10" else fxa.G10 + fxa.EM
 
@@ -5023,10 +5038,12 @@ most of the work.
                             )
 
                     st.markdown("##### The path of each rate")
-                    pick = st.multiselect(
-                        "Banks to plot", list(board.index),
-                        default=[c for c in ("USD", "EUR", "JPY", "GBP") if c in board.index],
-                        key="cb_path_pick")
+                    with st.form("cb_path_form", border=False):
+                        pick = st.multiselect(
+                            "Banks to plot", list(board.index),
+                            default=[c for c in ("USD", "EUR", "JPY", "GBP") if c in board.index],
+                            key="cb_path_pick")
+                        st.form_submit_button("▶ Update chart")
                     if pick:
                         fig = go.Figure()
                         for ccy in pick:
@@ -5480,8 +5497,11 @@ forecast, and the central-bank figures run a month or two behind.
                       f"({s['holdings_peak']['month']}). ")
                    + f"{s['months_of_inflow_last_12']} of the last 12 months had net inflows.")
 
-        span = st.radio("Window", ["2 years", "5 years", "Since 2003"], horizontal=True,
-                        key="wgc_etf_span")
+        with st.form("wgc_etf_form", border=False):
+            wc1, wc2 = st.columns([3, 1])
+            span = wc1.radio("Window", ["2 years", "5 years", "Since 2003"], horizontal=True,
+                             key="wgc_etf_span")
+            wc2.form_submit_button("▶ Update chart", use_container_width=True)
         n = {"2 years": 24, "5 years": 60, "Since 2003": 10_000}[span]
         dem = e["demand_t"].tail(n)
         fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -5555,8 +5575,11 @@ forecast, and the central-bank figures run a month or two behind.
                    "schedule, so the latest months fill in later; some buying is never reported.")
 
         net = wgc.cb_net_series(c)
-        start = st.select_slider("From", options=list(range(2002, net.index.max().year + 1)),
-                                 value=max(2002, net.index.max().year - 9), key="wgc_cb_from")
+        with st.form("wgc_cb_form", border=False):
+            fc1, fc2 = st.columns([3, 1])
+            start = fc1.select_slider("From", options=list(range(2002, net.index.max().year + 1)),
+                                      value=max(2002, net.index.max().year - 9), key="wgc_cb_from")
+            fc2.form_submit_button("▶ Update chart", use_container_width=True)
         net = net[net.index.year >= start]
         fig3 = go.Figure()
         fig3.add_bar(x=net.index, y=net, name="Net monthly",
@@ -5584,8 +5607,11 @@ forecast, and the central-bank figures run a month or two behind.
         m = c["monthly"]
         countries = sorted((x for x in m.columns if not x.endswith("*")),
                            key=lambda x: -m[x].abs().sum())[:60]
-        pick = st.selectbox("One country's history", countries,
-                            format_func=wgc.display_name, key="wgc_cb_country")
+        with st.form("wgc_country_form", border=False):
+            cc1, cc2 = st.columns([3, 1])
+            pick = cc1.selectbox("One country's history", countries,
+                                 format_func=wgc.display_name, key="wgc_cb_country")
+            cc2.form_submit_button("▶ Run analysis", use_container_width=True)
         series = m[pick]
         fig4 = go.Figure()
         fig4.add_bar(x=series.index, y=series, name="Monthly change",
@@ -5682,19 +5708,21 @@ is an artefact of contract specifications. Those are shown as an index against
 their own median instead of as a decimal that only looks precise.
             """)
 
-            mc1, mc2, mc3 = st.columns([1.5, 1.6, 1])
-            with mc1:
-                mt_window = st.selectbox(
-                    "Comparison window", ["1 year", "6 months", "3 months", "2 years"],
-                    key="mt_window", label_visibility="collapsed")
-            with mc2:
-                mt_corr_window = st.radio(
-                    "Correlation window", ["6 months", "1 year"], horizontal=True,
-                    key="mt_corr_win", label_visibility="collapsed")
-            with mc3:
-                if st.button("🔄 Refresh", key="mt_refresh", use_container_width=True):
-                    mt_load_prices.clear()
-                    st.rerun()
+            with st.form("mt_form", border=False):
+                mc1, mc2, mc3 = st.columns([1.5, 1.6, 1])
+                with mc1:
+                    mt_window = st.selectbox(
+                        "Comparison window", ["1 year", "6 months", "3 months", "2 years"],
+                        key="mt_window", label_visibility="collapsed")
+                with mc2:
+                    mt_corr_window = st.radio(
+                        "Correlation window", ["6 months", "1 year"], horizontal=True,
+                        key="mt_corr_win", label_visibility="collapsed")
+                with mc3:
+                    st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True)
+            if st.button("🔄 Refresh prices", key="mt_refresh"):
+                mt_load_prices.clear()
+                st.rerun()
 
             # Calendar days, not bar counts — the label has to mean the same thing
             # whatever frequency the feed returns.
@@ -5793,8 +5821,11 @@ their own median instead of as a decimal that only looks precise.
                                 "above are unaffected."
                             )
                         else:
-                            rp_metal = st.selectbox(
-                                "Metal", list(mtl.METALS.keys()), key="mt_real_pick")
+                            with st.form("mt_real_form", border=False):
+                                rpc1, rpc2 = st.columns([3, 1])
+                                rp_metal = rpc1.selectbox(
+                                    "Metal", list(mtl.METALS.keys()), key="mt_real_pick")
+                                rpc2.form_submit_button("▶ Run analysis", use_container_width=True)
                             tkr = mtl.METALS[rp_metal].yahoo
                             rp = (mtl.real_price(mt_px[tkr], cpi)
                                   if tkr in mt_px.columns else {"available": False})
@@ -5839,8 +5870,11 @@ their own median instead of as a decimal that only looks precise.
 
                 # ---------------- metal or dollar ----------------
                 with mtt2:
-                    dec_metal = st.selectbox(
-                        "Metal", list(mtl.METALS.keys()), key="mt_dec_pick")
+                    with st.form("mt_dec_form", border=False):
+                        dmc1, dmc2 = st.columns([3, 1])
+                        dec_metal = dmc1.selectbox(
+                            "Metal", list(mtl.METALS.keys()), key="mt_dec_pick")
+                        dmc2.form_submit_button("▶ Run analysis", use_container_width=True)
                     tkr = mtl.METALS[dec_metal].yahoo
 
                     fx_px, _fx_failed = fx_load_prices()
@@ -5923,9 +5957,11 @@ The median is unmoved by an outlier, which is the whole reason to use it here.
                             st.markdown("##### Rebased to 100")
                             default_ccys = [c for c in ("USD", "EUR", "JPY", "CNY", "TRY")
                                             if c == "USD" or c in uv.columns]
-                            picks = st.multiselect(
-                                "Currencies", ["USD"] + [c for c in uv.columns if c != "USD"],
-                                default=default_ccys, key="mt_ccy_pick")
+                            with st.form("mt_ccy_form", border=False):
+                                picks = st.multiselect(
+                                    "Currencies", ["USD"] + [c for c in uv.columns if c != "USD"],
+                                    default=default_ccys, key="mt_ccy_pick")
+                                st.form_submit_button("▶ Update chart")
                             if picks:
                                 reb = mtl.in_currencies_series(
                                     mt_px[tkr].tail(win + 1), uv, picks)
@@ -5990,8 +6026,11 @@ The median is unmoved by an outlier, which is the whole reason to use it here.
                             "is available here."
                         )
 
-                        pick_ratio = st.selectbox(
-                            "Chart", list(rt.index), key="mt_ratio_pick")
+                        with st.form("mt_ratio_form", border=False):
+                            mrc1, mrc2 = st.columns([3, 1])
+                            pick_ratio = mrc1.selectbox(
+                                "Chart", list(rt.index), key="mt_ratio_pick")
+                            mrc2.form_submit_button("▶ Update chart", use_container_width=True)
                         spec = next(s for s in mtl.RATIOS if s["name"] == pick_ratio)
                         r = mtl.ratio(mt_px, spec["num"], spec["den"])
                         if r.get("available"):
@@ -6298,21 +6337,24 @@ the asset class did. For deep single-coin work — regime, tail risk, Monte
 Carlo — the Quant Lab takes any Binance symbol directly.
             """)
 
-            cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
-            with cc1:
-                cr_size = st.selectbox("Universe size", [20, 30, 40, 60],
-                                       index=2, key="cr_size",
-                                       label_visibility="collapsed")
-            with cc2:
-                cr_win_label = st.radio("Window", ["90 days", "180 days", "1 year"],
-                                        index=1, horizontal=True, key="cr_win",
-                                        label_visibility="collapsed")
-            with cc3:
-                if st.button("🔄 Refresh", key="cr_refresh", use_container_width=True):
-                    cr_load_market.clear()
-                    cr_load_closes.clear()
-                    cr_load_funding.clear()
-                    st.rerun()
+            with st.form("cr_form", border=False):
+                cc1, cc2, cc3 = st.columns([1.3, 1.6, 1])
+                with cc1:
+                    cr_size = st.selectbox("Coins in the table", [20, 30, 40, 60],
+                                           index=2, key="cr_size",
+                                           format_func=lambda n: f"Top {n} coins",
+                                           label_visibility="collapsed")
+                with cc2:
+                    cr_win_label = st.radio("Window", ["90 days", "180 days", "1 year"],
+                                            index=1, horizontal=True, key="cr_win",
+                                            label_visibility="collapsed")
+                with cc3:
+                    st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True)
+            if st.button("🔄 Refresh prices", key="cr_refresh"):
+                cr_load_market.clear()
+                cr_load_closes.clear()
+                cr_load_funding.clear()
+                st.rerun()
 
             _CR_WIN = {"90 days": 90, "180 days": 180, "1 year": 365}
             cr_win = _CR_WIN[cr_win_label]
@@ -6579,8 +6621,11 @@ different and more durable thing than a direction.
                     """)
 
                         st.markdown("##### One coin's funding through time")
-                        fh_pick = st.selectbox(
-                            "Coin", list(universe.index), key="cr_funding_pick")
+                        with st.form("cr_funding_form", border=False):
+                            fhc1, fhc2 = st.columns([3, 1])
+                            fh_pick = fhc1.selectbox(
+                                "Coin", list(universe.index), key="cr_funding_pick")
+                            fhc2.form_submit_button("▶ Run analysis", use_container_width=True)
                         fh = cr_load_funding_history(f"{fh_pick}USDT", 200)
                         if fh.empty:
                             st.info(f"No funding history returned for {fh_pick}.")
@@ -6885,20 +6930,21 @@ estimates, which skew optimistic. Financials and REITs are not comparable to
 industrials on P/B or EV/EBITDA, so read them against their own sector only.
             """)
 
-            fc1, fc2, fc3 = st.columns([2, 1.4, 1])
-            with fc1:
-                fund_query = st.text_input(
-                    "Company", value="AAPL", key="fund_query",
-                    placeholder="Ticker or name — AAPL, Microsoft, JPM",
-                    label_visibility="collapsed")
-            with fc2:
-                fund_sector_override = st.selectbox(
-                    "Compare against", ["Own sector"] + (
-                        sorted(dl.universe_sector_counts().keys()) if _HAS_AGENT else []),
-                    key="fund_sector", label_visibility="collapsed")
-            with fc3:
-                fund_run = st.button("▶ Analyse", type="primary", key="fund_run",
-                                     use_container_width=True)
+            # A form: changing the company or the sector does nothing until "Run analysis".
+            with st.form("fund_form", border=False):
+                fc1, fc2, fc3 = st.columns([2, 1.4, 1])
+                with fc1:
+                    fund_query = st.text_input(
+                        "Company", value="AAPL", key="fund_query",
+                        placeholder="Ticker or name — AAPL, Microsoft, JPM",
+                        label_visibility="collapsed")
+                with fc2:
+                    fund_sector_override = st.selectbox(
+                        "Compare against", ["Own sector"] + (
+                            sorted(dl.universe_sector_counts().keys()) if _HAS_AGENT else []),
+                        key="fund_sector", label_visibility="collapsed")
+                with fc3:
+                    st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True)
 
             fund_sym = None
             if fund_query.strip():
@@ -7086,7 +7132,8 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
                                            "metric varies within this sector — a wide spread "
                                            "means the median is a weak benchmark.")
 
-                    # ---- AI read ----
+                    # ---- AI read (its own button: it spends a credit) ----
+                    fund_run = st.button(f"🤖 AI read of {fund_sym} (1 credit)", key="fund_run")
                     if fund_run:
                         _err = ai_unavailable("read")
                         if _err:
@@ -7462,7 +7509,7 @@ than tuned.
         with qc4:
             horizon_label_q = st.selectbox("Horizon", options=["1 day", "1 week", "1 month", "3 months"], index=1, key="quant_horizon", label_visibility="collapsed")
         with qc5:
-            run_quant_btn = st.button("▶ Run", type="primary", key="run_quant_btn", use_container_width=True)
+            run_quant_btn = st.button("▶ Run analysis", type="primary", key="run_quant_btn", use_container_width=True)
 
         # ── Free-text override: type any ticker or company name ──
         # Lets the user analyse companies outside the S&P 500 (small caps,

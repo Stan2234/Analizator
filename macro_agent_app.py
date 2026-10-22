@@ -1939,6 +1939,35 @@ def ai_failed(err: Exception, action: str = "read") -> None:
                  "in a few minutes.")
 
 
+def ai_md(text: str) -> None:
+    """Show model-written text. Streamlit reads a pair of dollar signs as a formula, so
+    "$2.75tn ... $81,450" came out as green monospace; every dollar is escaped first."""
+    st.markdown(re.sub(r"(?<!\\)\$", r"\\$", text or ""))
+
+
+# How every AI read is written: the conclusion first, three takeaways, then the reasoning
+# under question headings, then what would change it. Modelled on how bank research notes
+# are laid out (docs/ANALYSIS_PLAYBOOK.md).
+HOUSE_STYLE = (
+    "Write for an investor who is smart but not a specialist, in this layout:\n"
+    "**<Headline: the conclusion in one sentence, with the number that carries it>**\n"
+    "- three bullets, each a finding with a number and a comparison (against its own "
+    "history, against peers, or against what was expected)\n"
+    "### <a question the reader would ask>\n"
+    "two to four short sentences answering it from the data\n"
+    "### <a second question>\n"
+    "two to four short sentences\n"
+    "**What would change the picture:** one or two concrete things — a level, a data "
+    "release, a shift in a measured figure.\n"
+    "**Not in the data:** only if something the question needs is missing.\n\n"
+    "Rules: 300-450 words. Every claim carries a number and what it is compared with; "
+    "never 'strong' or 'weak' alone. Describe drivers as tendencies, not laws, and when "
+    "two of them pull opposite ways say which is winning now. Explain any jargon once in "
+    "brackets. No price forecast, no buy or sell advice. Use only the figures given; if "
+    "a point needs data that is not there, say so instead of supplying it from memory."
+)
+
+
 # The composite in basic_signal_from_series summarises indicator agreement. It
 # was walk-forward tested and does not predict, so every surface that shows it
 # says so — a label that looks like a call needs its track record beside it,
@@ -4484,7 +4513,7 @@ describes the recent past.
                                             max_tokens=9000, effort="high")
                                         st.markdown("---")
                                         st.markdown("### 🤖 Desk read")
-                                        st.markdown(read)
+                                        ai_md(read)
                                     except Exception as e:
                                         ai_failed(e)
     else:
@@ -4850,7 +4879,7 @@ that error is largest exactly where it matters most — around a policy turn.
                                         sysmsg, json.dumps(ctx, default=str, indent=2),
                                         max_tokens=9000, effort="high")
                                     st.markdown("---")
-                                    st.markdown(read)
+                                    ai_md(read)
                                 except Exception as e:
                                     ai_failed(e)
     else:
@@ -5407,7 +5436,7 @@ judgement that their rates are settled.
                                         "something the argument needs is absent from the "
                                         "payload, say so rather than supplying it from memory."
                                     )
-                                    st.markdown(ai_agent.complete(
+                                    ai_md(ai_agent.complete(
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
                                         max_tokens=8000, effort="medium"))
                                 except Exception as _e:
@@ -6252,7 +6281,7 @@ look at the equity at all.
                                         "the payload — inventories, supply, positioning — say so "
                                         "rather than supplying it from memory."
                                     )
-                                    st.markdown(ai_agent.complete(
+                                    ai_md(ai_agent.complete(
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
                                         max_tokens=8000, effort="medium"))
                                 except Exception as _e:
@@ -6458,6 +6487,125 @@ def crypto_today_cards(universe: pd.DataFrame, glob: Dict[str, Any], closes: pd.
     return cards
 
 
+def stocks_or_gold_sentence(mc: Dict[str, Any]) -> str:
+    """One plain sentence on what bitcoin has been moving with, and how that has changed
+    over six months — the answer the correlation chart exists to give."""
+    lat, ser = mc["latest"], mc["series"]
+    nas, gold, usd = lat.get("NASDAQ 100"), lat.get("Gold"), lat.get("Dollar index")
+    if nas is None or gold is None:
+        return ""
+
+    def kind(n: float, g: float) -> str:
+        if g > n + 0.15:
+            return "gold"
+        if n > g + 0.15:
+            return "tech stocks"
+        return "neither more than the other"
+
+    now = kind(nas, gold)
+    if now == "neither more than the other":
+        out = (f"Over the last 90 days bitcoin has been tied about equally to tech stocks "
+               f"(<b>{nas:+.2f}</b>) and to gold (<b>{gold:+.2f}</b>).")
+    else:
+        other = "tech stocks" if now == "gold" else "gold"
+        out = (f"Over the last 90 days bitcoin has moved most with <b>{now}</b> "
+               f"(<b>{max(nas, gold):+.2f}</b>), less with {other} (<b>{min(nas, gold):+.2f}</b>).")
+    if usd is not None and abs(usd) >= 0.2:
+        out += (f" It has tended to fall when the dollar rises (<b>{usd:+.2f}</b>)." if usd < 0
+                else f" Unusually, it has risen with the dollar (<b>{usd:+.2f}</b>).")
+    past = ser.dropna(how="all")
+    if len(past) > 130 and {"NASDAQ 100", "Gold"} <= set(past.columns):
+        then = past.iloc[-127]
+        was = kind(then["NASDAQ 100"], then["Gold"])
+        figs = f"(tech {then['NASDAQ 100']:+.2f}, gold {then['Gold']:+.2f})"
+        if was == "neither more than the other" and was != now:
+            out += f" Six months ago it was tied about equally to both {figs}."
+        elif was != now:
+            out += f" Six months ago it was different: it moved more with <b>{was}</b> {figs}."
+        else:
+            out += " That has been the case for at least six months."
+    if now == "gold":
+        out += " In this stretch it has behaved more like a hedge than a risk asset."
+    elif now == "tech stocks":
+        out += " In this stretch it has behaved like a risk asset: a stock-market sell-off has tended to hit it too."
+    return out
+
+
+def crypto_coin_context(coin: str, universe: pd.DataFrame, glob: Dict[str, Any],
+                        closes: pd.DataFrame, funding: pd.DataFrame,
+                        mc: Dict[str, Any], fg: Optional[Dict[str, Any]],
+                        market_cards: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Everything measured about one coin, plus the market it sits in, for the AI read.
+    Each figure comes with what it is compared against, so the read can say "x against y"
+    rather than "strong"."""
+    row = universe.loc[coin] if coin in universe.index else pd.Series(dtype=object)
+    px = closes[coin].dropna() if coin in closes.columns else pd.Series(dtype=float)
+    btc = closes["BTC"].dropna() if "BTC" in closes.columns else pd.Series(dtype=float)
+    ctx: Dict[str, Any] = {"coin": coin, "name": row.get("name"), "rank": row.get("rank"),
+                           "as_of_utc": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")}
+
+    ctx["price"] = {k: row.get(k) for k in ("price", "market_cap", "volume_24h", "chg_24h",
+                                            "chg_7d", "chg_30d", "chg_1y", "from_ath_pct",
+                                            "ath", "ath_date")}
+    if len(px) >= 200:
+        last = float(px.iloc[-1])
+        ctx["trend"] = {"ma50": float(px.tail(50).mean()), "ma200": float(px.tail(200).mean()),
+                        "above_50d": last > px.tail(50).mean(),
+                        "above_200d": last > px.tail(200).mean(),
+                        "high_52w": float(px.tail(365).max()), "low_52w": float(px.tail(365).min())}
+    rets = np.log(px / px.shift(1)).dropna()
+    if len(rets) >= 60:
+        vol = float(rets.tail(90).std() * np.sqrt(365) * 100)
+        ctx["volatility_90d_annual_pct"] = vol
+        if coin != "BTC" and len(btc) > 60:
+            bvol = float(np.log(btc / btc.shift(1)).dropna().tail(90).std() * np.sqrt(365) * 100)
+            ctx["btc_volatility_90d_annual_pct"] = bvol
+
+    if coin != "BTC" and not btc.empty and not px.empty:
+        rel = cra.btc_relationship(closes[[c for c in ("BTC", coin) if c in closes.columns]],
+                                   window=90)
+        if coin in rel.index:
+            r = rel.loc[coin]
+            ctx["vs_bitcoin_90d"] = {
+                "beta": r["beta"], "correlation": r["corr"],
+                "share_of_moves_explained_by_btc": r["r2"],
+                "return_beyond_btc_pct": r["excess_pct"],
+                "meaning": "beta = how far it moves for a 1% bitcoin move; share explained = "
+                           "how much of its movement is simply bitcoin"}
+        for d in (30, 90):
+            if len(px) > d and len(btc) > d:
+                ctx.setdefault("performance_vs_btc", {})[f"{d}d"] = {
+                    "coin_pct": (px.iloc[-1] / px.iloc[-d - 1] - 1) * 100,
+                    "btc_pct": (btc.iloc[-1] / btc.iloc[-d - 1] - 1) * 100}
+    else:
+        ctx["bitcoin_dominance_pct"] = (glob or {}).get("dominance", {}).get("BTC")
+        if mc and mc.get("available"):
+            ctx["correlation_90d_with"] = mc["latest"]
+
+    if funding is not None and not funding.empty and coin in funding.index:
+        ctx["funding"] = {"now_annual_pct": float(funding.loc[coin, "funding_annual_pct"]),
+                          "median_of_universe_annual_pct": float(funding["funding_annual_pct"].median()),
+                          "meaning": "what leveraged buyers pay sellers to hold a perpetual future; "
+                                     "positive = longs paying, a crowded long when high"}
+        fh = cr_load_funding_history(f"{coin}USDT", 90)
+        if fh is not None and not fh.empty:
+            ctx["funding"]["avg_last_30d_annual_pct"] = float(fh.mean())
+        mark = funding.loc[coin].get("mark_price")
+        if mark:
+            oi = cr_load_oi((f"{coin}USDT",), ((coin, float(mark)),))
+            if not oi.empty and coin in oi.index:
+                ctx["open_interest_usd"] = oi.loc[coin, "open_interest_usd"]
+    else:
+        ctx["funding"] = "no perpetual future on Binance for this coin"
+
+    ctx["market_backdrop"] = [{k: c[k] for k in ("topic", "state", "text")} for c in market_cards]
+    if fg and fg.get("value") is not None:
+        ctx["fear_greed"] = {"value": fg["value"], "label": fg.get("label")}
+    ctx["not_in_data"] = ["on-chain activity, fees, token unlocks", "exchange flows and order book",
+                          "liquidations", "news"]
+    return ctx
+
+
 def btc_trend_chart(closes: pd.DataFrame) -> Optional[go.Figure]:
     if closes.empty or "BTC" not in closes.columns:
         return None
@@ -6578,8 +6726,8 @@ Carlo — the Quant Lab takes any Binance symbol directly.
                           if (not closes.empty and "BTC" in closes.columns and not macro_all.empty)
                           else {})
                 fg_all = (_load_sentiments() or {}).get("crypto")
-                read_cards("Crypto today",
-                           crypto_today_cards(universe, glob, closes, funding_all, mc_all, fg_all),
+                cr_cards = crypto_today_cards(universe, glob, closes, funding_all, mc_all, fg_all)
+                read_cards("Crypto today", cr_cards,
                            note="Computed from the prices, funding rates and index readings in the "
                                 "sections below. It describes the market now; it is not a forecast.")
                 fig_btc = btc_trend_chart(closes)
@@ -6905,133 +7053,88 @@ different and more durable thing than a direction.
                                 "correlation."
                             )
                         else:
-                            latest = mc["latest"]
-                            cols = st.columns(len(latest) + (1 if "reading" in mc else 0))
-                            for col, (label, val) in zip(cols, latest.items()):
-                                col.metric(f"vs {label}", f"{val:+.2f}")
-                            if "reading" in mc:
-                                cols[-1].metric("Reading", mc["reading"].replace(
-                                    "trading as ", ""))
+                            ser = mc["series"]
+                            st.markdown(
+                                f"<div style='font-size:17px;line-height:1.6;margin:4px 0 8px'>"
+                                f"{stocks_or_gold_sentence(mc)}</div>",
+                                unsafe_allow_html=True)
 
                             fig = go.Figure()
                             palette = {"NASDAQ 100": "#42a5f5", "Gold": "#ffb300",
                                        "Dollar index": "#26a69a", "S&P 500": "#ab47bc"}
-                            for col in mc["series"].columns:
+                            # the S&P 500 tracks the Nasdaq almost exactly here and only crowds it
+                            for col in [c for c in ser.columns if c != "S&P 500"]:
+                                s = ser[col].dropna()
                                 fig.add_trace(go.Scatter(
-                                    x=mc["series"].index, y=mc["series"][col],
-                                    name=col, line=dict(width=1.8,
-                                                        color=palette.get(col))))
-                            fig.add_hline(y=0, line_dash="dot", line_color="#666")
+                                    x=s.index, y=s, name=col, showlegend=False,
+                                    line=dict(width=2, color=palette.get(col)),
+                                    hovertemplate=f"{col}: %{{y:+.2f}}<extra></extra>"))
+                                # the name sits at the end of its own line, not in a legend
+                                fig.add_annotation(
+                                    x=s.index[-1], y=s.iloc[-1], xanchor="left", xshift=6,
+                                    text=f"{col} {s.iloc[-1]:+.2f}", showarrow=False,
+                                    font=dict(color=palette.get(col), size=13))
+                            fig.add_hline(y=0, line_dash="dot", line_color="#666",
+                                          annotation_text="no link", annotation_position="bottom left",
+                                          annotation_font_color="#888")
                             fig.update_layout(
-                                height=420, template="plotly_dark",
-                                margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title="90-day rolling correlation with bitcoin",
-                                legend=dict(orientation="h", y=1.14, x=0),
+                                height=420, template="plotly_dark", paper_bgcolor="#000",
+                                plot_bgcolor="#0a0a0a",
+                                margin=dict(l=10, r=150, t=10, b=10),
+                                yaxis=dict(title="correlation with bitcoin", range=[-1, 1],
+                                           tickformat="+.1f"),
                                 hovermode="x unified")
                             st.plotly_chart(fig, use_container_width=True)
-
-                            st.markdown("""
-**The oldest argument about bitcoin, measured.** It is described as two
-incompatible things — a long-duration risk asset that trades with the Nasdaq,
-and a monetary hedge that trades with gold. Both camps can point at periods
-that prove them right, because the answer genuinely changes. What this shows
-is which one it has been behaving like lately.
-
-**Correlation of returns, not of levels.** Two assets that both rose over a
-year correlate near one on levels no matter how unrelated their reasons, which
-measures the direction of the decade and nothing else.
-
-**Crypto trades every day and the references do not.** The series are joined
-on the days both were open rather than filling the weekend forward, which
-would insert two artificially flat days a week into the reference and drag
-every correlation toward zero.
-                        """)
+                            st.caption(
+                                "Each line is the correlation of daily moves with bitcoin over the "
+                                "previous 90 days: +1 means they move together, 0 no link, −1 "
+                                "opposite. Measured on days both markets were open.")
 
                 # ---------------- desk read ----------------
                 with crt5:
+                    coins = list(universe.index)
+                    a1, a2 = st.columns([2, 1])
+                    with a1:
+                        ai_coin = st.selectbox(
+                            "Coin to analyse", coins, index=0, key="cr_ai_coin",
+                            format_func=lambda c: f"{c} · {universe.loc[c, 'name']}")
+                    with a2:
+                        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                        go_ai = st.button(f"🤖 AI read of {ai_coin} (1 credit)", type="primary",
+                                          key="cr_ai", use_container_width=True)
                     st.caption(
-                        "Reads the measured figures above. It has no on-chain "
-                        "data, no exchange flows and no order book — say so if the "
-                        "question needs them."
-                    )
-                    if st.button("▶ Read the crypto complex", type="primary",
-                                 key="cr_ai"):
+                        "Reads the measured figures for that coin (trend, its link to bitcoin, "
+                        "funding and positioning) against the market backdrop above. It has no "
+                        "on-chain data, exchange flows or news, and says so when the question "
+                        "needs them.")
+                    if go_ai:
                         _err = ai_unavailable("read")
                         if _err:
                             st.error(f"AI read unavailable: {_err}.")
                         else:
-                            with st.spinner("Reading…"):
+                            with st.spinner(f"Reading {ai_coin}…"):
                                 try:
-                                    rel = (cra.btc_relationship(closes, window=cr_win)
-                                           if not closes.empty else pd.DataFrame())
-                                    funding = cr_load_funding(syms)
-                                    macro = cr_load_macro()
-                                    mc = (cra.macro_correlation(closes["BTC"], macro, 90)
-                                          if (not closes.empty and "BTC" in closes.columns
-                                              and not macro.empty) else {})
-                                    ctx = {
-                                        "window": cr_win_label,
-                                        "global": glob,
-                                        "board": universe.drop(
-                                            columns=["binance_symbol",
-                                                     "tokenised_commodity"],
-                                            errors="ignore").reset_index().to_dict("records"),
-                                        "vs_bitcoin": (rel.reset_index().to_dict("records")
-                                                       if not rel.empty else []),
-                                        "clusters": cra.clusters(closes, 0.8, cr_win)
-                                                    if not closes.empty else [],
-                                        "funding_annualised": (
-                                            funding[["funding_annual_pct"]]
-                                            .reset_index().to_dict("records")
-                                            if not funding.empty else []),
-                                        "macro_correlation": {
-                                            k: v for k, v in mc.items()
-                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                        "caveats": [
-                                            "Funding is positioning, not a signal. It has "
-                                            "stayed expensive through whole trends and "
-                                            "turned negative at the bottom of them.",
-                                            "Annualised funding multiplies an eight-hour "
-                                            "payment out to a year; nobody earns it for a "
-                                            "year. Coins sharing an identical figure are "
-                                            "showing the exchange's baseline rate.",
-                                            "Stablecoins and tokenised gold are excluded "
-                                            "from the universe.",
-                                            "No on-chain data, exchange flows, order book "
-                                            "or liquidation data is in this payload.",
-                                        ],
-                                    }
+                                    ctx = crypto_coin_context(ai_coin, universe, glob, closes,
+                                                              funding_all, mc_all, fg_all, cr_cards)
                                     sysmsg = (
-                                        "You are a crypto strategist writing the digital "
-                                        "assets section of a morning note for a macro "
-                                        "desk. You are given the market board with each "
-                                        "coin's distance from its all-time high, each "
-                                        "coin's beta and variance explained against "
-                                        "bitcoin, the correlation clusters, perpetual "
-                                        "funding rates, and bitcoin's rolling correlation "
-                                        "to equities and gold.\n\n"
-                                        "Write 250-350 words covering:\n"
-                                        "1. What moved, and how much of it was simply "
-                                        "bitcoin. Use the variance-explained figures "
-                                        "rather than assuming.\n"
-                                        "2. Where the complex is concentrated — name the "
-                                        "clusters plainly, since holding them separately "
-                                        "looks like diversification and behaves like "
-                                        "size.\n"
-                                        "3. What funding says about who is already "
-                                        "positioned, and what a reversal would have to "
-                                        "unwind. Do not treat it as a direction.\n"
-                                        "4. Whether bitcoin is currently trading as a risk "
-                                        "asset or as a hedge, quoting both correlations.\n\n"
-                                        "Quote the numbers you rely on. Do not forecast a "
-                                        "price. If the argument needs something absent "
-                                        "from the payload — flows, on-chain, "
-                                        "liquidations — say so rather than supplying it "
-                                        "from memory."
-                                    )
-                                    st.markdown(ai_agent.complete(
+                                        "You are a crypto strategist at a research house writing a "
+                                        f"short note on {ai_coin} for investors. You get the coin's "
+                                        "price history figures, its trend against its 50- and 200-day "
+                                        "averages, how tied it is to bitcoin (beta and the share of its "
+                                        "moves bitcoin explains), its funding rate and open interest, "
+                                        "and the state of the whole crypto market.\n\n"
+                                        "Answer, in this order of importance: where the coin stands "
+                                        "(trend, distance from its record); whether it is doing "
+                                        "anything of its own or is mostly a bitcoin position (for "
+                                        "bitcoin itself: whether it is trading like a risk asset or a "
+                                        "hedge, and its dominance); who is positioned through leverage "
+                                        "and what an unwind would mean; and how the market backdrop "
+                                        "helps or hurts it.\n\n" + HOUSE_STYLE)
+                                    read = ai_agent.complete(
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
-                                        max_tokens=8000, effort="medium"))
+                                        max_tokens=8000, effort="medium")
+                                    st.markdown("---")
+                                    ai_md(read)
                                 except Exception as _e:
                                     ai_failed(_e)
     else:
@@ -7401,7 +7504,7 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
                                         max_tokens=10000, effort="high")
                                     st.markdown("---")
                                     st.markdown("### 🤖 Analyst read")
-                                    st.markdown(read)
+                                    ai_md(read)
                                 except Exception as e:
                                     ai_failed(e)
     else:
@@ -7603,7 +7706,7 @@ feeds update on their own every 20 minutes.
                     st.caption(f"Latest forecast for {focus_asset}, written {stored['ts']} UTC. "
                                "Run it again for one based on the newest headlines.")
                     st.markdown("---")
-                    st.markdown(stored["text"])
+                    ai_md(stored["text"])
                 else:
                     st.info(f"No forecast for {focus_asset} yet. Press the AI forecast button to "
                             "write one from the latest headlines.")
@@ -8464,7 +8567,7 @@ The conversation stays in this browser tab; a refresh starts a new one.
                 with st.expander(f"💬 {label}", expanded=False):
                     st.markdown(f"**You:** {q}")
                     st.markdown("---")
-                    st.markdown(a)
+                    ai_md(a)
                     if tools:
                         with st.expander(f"🔧 Tools used ({len(tools)})", expanded=False):
                             for tc in tools:
@@ -8493,7 +8596,7 @@ The conversation stays in this browser tab; a refresh starts a new one.
                                 "tools": tool_calls,
                             })
                             # Show the latest answer fully visible
-                            st.markdown(answer_text)
+                            ai_md(answer_text)
                             if tool_calls:
                                 with st.expander(f"🔧 Tools used ({len(tool_calls)})"):
                                     for tc in tool_calls:
@@ -8735,7 +8838,7 @@ it was given; it does not predict prices or give investment advice.
             if brief:
                 st.markdown("---")
                 st.markdown("### 📋 Executive Brief")
-                st.markdown(brief.get("synthesis", "(no synthesis)"))
+                ai_md(brief.get("synthesis", "(no synthesis)"))
 
                 st.markdown("---")
                 st.markdown("### 🔬 Specialist Briefings")
@@ -8761,16 +8864,16 @@ it was given; it does not predict prices or give investment advice.
                             if res.get("key_findings"):
                                 st.markdown("**Key findings:**")
                                 for kf in res["key_findings"]:
-                                    st.markdown(f"- {kf}")
+                                    ai_md(f"- {kf}")
                             if res.get("data_points"):
                                 st.markdown("**Data points:**")
                                 st.json(res["data_points"])
                             if res.get("outlook"):
-                                st.markdown(f"**Outlook:** {res['outlook']}")
+                                ai_md(f"**Outlook:** {res['outlook']}")
                             if res.get("risks"):
                                 st.markdown("**Risks:**")
                                 for rk in res["risks"]:
-                                    st.markdown(f"- {rk}")
+                                    ai_md(f"- {rk}")
                         tlog = r.get("tool_log") or []
                         if tlog:
                             with st.expander(f"🔧 Tool calls ({len(tlog)})", expanded=False):

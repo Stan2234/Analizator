@@ -70,9 +70,59 @@ def call_cost(model: str, usage: Any) -> float:
             + g("cache_creation_input_tokens") * p_cw + g("cache_read_input_tokens") * p_cr) / 1e6
 
 
+class AIOutage(RuntimeError):
+    """The API refuses every call for now (spend limit reached, key revoked). Not the user's fault."""
+
+
+OUTAGE_KEY = "ai_outage"
+
+
+def ai_outage() -> Optional[Dict[str, Any]]:
+    """{"since", "until", "reason"} while the API is known to be refusing calls, else None."""
+    try:
+        o = dl.kv_get(OUTAGE_KEY)
+    except Exception:
+        return None
+    if not o:
+        return None
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    if o.get("until") and o["until"] < now:          # the limit has reset
+        return None
+    if not o.get("until") and o.get("since", "") < (dt.datetime.now(dt.timezone.utc)
+                                                     - dt.timedelta(hours=1)).isoformat():
+        return None                                  # unknown end: try again hourly
+    return o
+
+
+def _mark_outage(err: Exception) -> None:
+    import re
+    msg = str(err)
+    m = re.search(r"regain access on (\d{4}-\d{2}-\d{2})(?: at (\d{2}:\d{2}))?", msg)
+    until = f"{m.group(1)}T{m.group(2) or '00:00'}:00+00:00" if m else None
+    try:
+        dl.kv_set(OUTAGE_KEY, {"since": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                               "until": until, "reason": "usage limit" if "usage limit" in msg else "auth"})
+    except Exception:
+        pass
+
+
 def create_message(client: Any, *, route: str, **kwargs: Any) -> Any:
-    """client.messages.create plus a usage record: one place that knows what AI costs."""
-    resp = client.messages.create(**kwargs)
+    """client.messages.create plus a usage record: one place that knows what AI costs.
+
+    An account-level refusal (spend limit reached, invalid key) is remembered, so the app
+    stops charging credits and shows a plain message instead of the raw API error."""
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as e:
+        text = str(e).lower()
+        if "usage limit" in text or "authentication_error" in text or "invalid x-api-key" in text:
+            _mark_outage(e)
+            raise AIOutage("AI features are temporarily unavailable") from e
+        raise
+    try:
+        dl.kv_set(OUTAGE_KEY, None) if dl.kv_get(OUTAGE_KEY) else None   # working again
+    except Exception:
+        pass
     usage = getattr(resp, "usage", None)
     rec = {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

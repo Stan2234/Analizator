@@ -1887,9 +1887,24 @@ def ai_unavailable(action: Optional[str] = None) -> Optional[str]:
         return f"AI module failed to load ({_AGENT_IMPORT_ERROR})"
     if not get_secret("ANTHROPIC_API_KEY"):
         return "ANTHROPIC_API_KEY is not configured"
+    if ai_agent.ai_outage():                         # checked before any credit is spent
+        return ("AI features are temporarily unavailable on our side. No credits were used; "
+                "please try again later")
     if action:
         return access.charge(current_user(), action)   # spends the credits when allowed
     return None
+
+
+def ai_failed(err: Exception, action: str = "read") -> None:
+    """A panel's AI call failed after its credit was spent: give the credit back and say so
+    plainly, without the raw API error."""
+    access.refund(current_user(), action)
+    if isinstance(err, ai_agent.AIOutage):
+        st.warning("AI features are temporarily unavailable on our side. No credit was used; "
+                   "please try again later.")
+    else:
+        st.error("The AI read could not be produced right now. No credit was used; please try again "
+                 "in a few minutes.")
 
 
 # The composite in basic_signal_from_series summarises indicator agreement. It
@@ -2364,7 +2379,7 @@ def run_news_forecast(
     try:
         _err = ai_unavailable("news")
         if _err:
-            return f"AI news-forecast unavailable: {_err}."
+            return f"⚠️ AI news forecast unavailable: {_err}."
 
         history_items = get_relevant_news_for_asset(focus_asset)
         effective_news = history_items or latest_news_items or []
@@ -2445,8 +2460,12 @@ confident note is the failure mode this section exists to avoid.
 
         return ai_agent.complete(system_prompt, context, max_tokens=7000, effort="medium")
 
-    except Exception as e:
-        return f"AI news-forecast error: {e}"
+    except ai_agent.AIOutage:
+        access.refund(current_user(), "news")       # charged above; nothing was produced
+        return "⚠️ AI features are temporarily unavailable on our side. No credit was used."
+    except Exception:
+        access.refund(current_user(), "news")
+        return "⚠️ The AI forecast could not be produced right now. No credit was used; please try again."
 
 # ------------------------------------
 # FOMC FETCH HELPERS (автоматично дърпане от fed.gov)
@@ -4422,7 +4441,7 @@ describes the recent past.
                                         st.markdown("### 🤖 Desk read")
                                         st.markdown(read)
                                     except Exception as e:
-                                        st.error(f"AI read failed: {type(e).__name__}: {e}")
+                                        ai_failed(e)
     else:
         locked_tab("fx")
 
@@ -4786,7 +4805,7 @@ that error is largest exactly where it matters most — around a policy turn.
                                     st.markdown("---")
                                     st.markdown(read)
                                 except Exception as e:
-                                    st.error(f"AI read failed: {type(e).__name__}: {e}")
+                                    ai_failed(e)
     else:
         locked_tab("carry")
 
@@ -5343,7 +5362,7 @@ judgement that their rates are settled.
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
                                         max_tokens=8000, effort="medium"))
                                 except Exception as _e:
-                                    st.error(f"Model call failed: {_e}")
+                                    ai_failed(_e)
     else:
         locked_tab("cb")
 
@@ -6166,7 +6185,7 @@ look at the equity at all.
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
                                         max_tokens=8000, effort="medium"))
                                 except Exception as _e:
-                                    st.error(f"Model call failed: {_e}")
+                                    ai_failed(_e)
     else:
         locked_tab("metals")
 
@@ -6757,7 +6776,7 @@ every correlation toward zero.
                                         sysmsg, json.dumps(ctx, indent=1, default=str),
                                         max_tokens=8000, effort="medium"))
                                 except Exception as _e:
-                                    st.error(f"Model call failed: {_e}")
+                                    ai_failed(_e)
     else:
         locked_tab("crypto")
 
@@ -7125,7 +7144,7 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
                                     st.markdown("### 🤖 Analyst read")
                                     st.markdown(read)
                                 except Exception as e:
-                                    st.error(f"AI read failed: {type(e).__name__}: {e}")
+                                    ai_failed(e)
     else:
         locked_tab("fund")
 

@@ -1555,7 +1555,23 @@ def fetch_news_for_keyword(keyword: str, page_size: int = 5) -> List[Dict[str, A
     return cleaned
 
 
-def load_news_history_df() -> pd.DataFrame:
+def load_news_history_df(days: int = 7) -> pd.DataFrame:
+    """Recent news from the database the scheduler fills every 20 minutes (29 RSS feeds plus
+    NewsAPI), newest first. The old news_history.csv is only a last resort: it was the source
+    here and, with NewsAPI rate-limited, it served January's headlines in October."""
+    if _HAS_AGENT:
+        try:
+            rows = dl.query_news(since_hours=days * 24, limit=3000)
+            if rows:
+                df = pd.DataFrame([{
+                    "keyword": (json.loads(r.get("keywords") or "[]") or [r.get("category") or ""])[0],
+                    "source": r.get("source"), "title": r.get("title"),
+                    "description": r.get("description"), "url": r.get("url"),
+                    "published_at": r.get("published_at")} for r in rows])
+                df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
+                return df.sort_values("published_at", ascending=False)
+        except Exception:
+            pass
     if not os.path.exists(NEWS_HISTORY_FILE):
         return pd.DataFrame(
             columns=["keyword", "source", "title", "description", "url", "published_at"]
@@ -1830,6 +1846,22 @@ def get_news_fetch_status() -> Dict[str, Any]:
         "next_fetch_hour_utc": f"{next_fetch_hour:02d}:00 UTC",
         "schedule": [f"{h:02d}:00 UTC" for h in NEWS_FETCH_HOURS_UTC],
     }
+
+
+def save_news_forecast(asset: str, text: str) -> None:
+    """Keep the latest forecast per asset, so it is still there on the next visit."""
+    if _HAS_AGENT and text and not text.startswith("⚠️"):
+        try:
+            dl.kv_set(f"news_forecast:{asset}", {"text": text, "ts": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")})
+        except Exception:
+            pass
+
+
+def load_news_forecast(asset: str) -> Optional[Dict[str, Any]]:
+    try:
+        return dl.kv_get(f"news_forecast:{asset}") if _HAS_AGENT else None
+    except Exception:
+        return None
 
 
 def get_relevant_news_for_asset(focus_asset: str, max_items: int = 40) -> List[Dict[str, Any]]:
@@ -7359,6 +7391,7 @@ feeds update on their own every 20 minutes.
                         focus_asset=focus_asset,
                     )
                     st.session_state["news_forecast"] = news_forecast
+                    save_news_forecast(focus_asset, news_forecast)
                     st.session_state["news_forecast_asset"] = focus_asset
 
             news_items = st.session_state.get("news_items", [])
@@ -7377,17 +7410,23 @@ feeds update on their own every 20 minutes.
                 )
                 st.session_state["news_forecast"] = news_forecast
                 st.session_state["news_forecast_asset"] = focus_asset
+                save_news_forecast(focus_asset, news_forecast)
 
             st.markdown("### 🤖 AI News-driven forecast")
 
-            if news_forecast:
+            if news_forecast and news_forecast_asset == focus_asset:
                 st.markdown("---")
                 st.markdown(news_forecast)
             else:
-                st.info(
-                    "No forecast yet. News will auto-fetch at the next scheduled window, "
-                    "or press 'Manual Refresh' to fetch now."
-                )
+                stored = load_news_forecast(focus_asset)
+                if stored:
+                    st.caption(f"Latest forecast for {focus_asset}, written {stored['ts']} UTC. "
+                               "Run it again for one based on the newest headlines.")
+                    st.markdown("---")
+                    st.markdown(stored["text"])
+                else:
+                    st.info(f"No forecast for {focus_asset} yet. Press the AI forecast button to "
+                            "write one from the latest headlines.")
 
             st.markdown("---")
             st.markdown("### Latest raw headlines")

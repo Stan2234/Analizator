@@ -151,6 +151,14 @@ def job_refresh_finnhub_calendars() -> None:
         log.exception("job_refresh_finnhub_calendars failed: %s", e)
 
 
+def job_refresh_macro_calendar() -> None:
+    try:
+        n = dl.upsert_econ_events(src.fetch_forexfactory_calendar())
+        log.info("macro calendar job: %d events", n)
+    except Exception as e:
+        log.exception("job_refresh_macro_calendar failed: %s", e)
+
+
 def job_refresh_sec() -> None:
     try:
         filings = src.fetch_sec_all_institutions()
@@ -354,6 +362,8 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_crypto_market, IntervalTrigger(minutes=15), id="crypto_market", replace_existing=True)
         sched.add_job(job_refresh_finnhub_calendars, IntervalTrigger(hours=2), id="finnhub_cal", replace_existing=True,
                       next_run_time=soon(3))
+        sched.add_job(job_refresh_macro_calendar, IntervalTrigger(hours=4), id="macro_cal",
+                      replace_existing=True, next_run_time=soon(1))
         sched.add_job(job_refresh_fred, IntervalTrigger(hours=6), id="fred", replace_existing=True,
                       next_run_time=soon(4))
         sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True,

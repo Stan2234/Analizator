@@ -88,6 +88,13 @@ tear sheet), образователните материали на Fidelity, IG
 
 ## 4. План по табове
 
+**Статус (23.10.2026):** блоковете „… today“ и новият формат на AI са направени за
+Crypto, Fundamentals, Currencies, Metals, Central Banks, Carry Trade, News & Macro,
+Quant Lab („in plain words“) и FOMC Lab („The statement in plain words“). AI Analyst
+и Deep Brief пишат в същия формат. Икономическият календар идва от ForexFactory
+(седмичен, безплатен). Finnhub дава само корпоративни отчети. Ако календарът липсва,
+картите казват, че липсва, а не че седмицата е спокойна.
+
 **Global Signals.** Не се пипа (по решение на собственика).
 
 **Crypto** ✅ блокът е направен. Остава:

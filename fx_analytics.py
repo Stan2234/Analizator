@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -637,6 +638,11 @@ TIER1_KEYWORDS = (
     "cpi", "inflation", "gdp", "employment", "payroll", "unemployment",
     "pmi", "retail sales", "trade balance",
 )
+_TIER1_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in TIER1_KEYWORDS) + r")\b")
+# Rate decisions as the calendars title them: "Federal Funds Rate", "Main Refinancing Rate",
+# "Official Bank Rate", "BOJ Policy Rate", "Cash Rate", "Overnight Rate", "SNB Policy Rate".
+_CB_RE = re.compile(r"\b(rate decision|interest rate decision|policy rate|funds rate|refinancing rate|"
+                    r"bank rate|cash rate|overnight rate|fomc statement|monetary policy statement)\b")
 
 # Finnhub reports country codes; map them to the currency they move.
 COUNTRY_TO_CCY = {
@@ -677,15 +683,16 @@ def fx_event_risk(events: List[Dict[str, Any]], codes: List[str],
             continue
         label = str(e.get("title") or e.get("event") or "")
         low = label.lower()
-        if not any(k in low for k in TIER1_KEYWORDS):
+        # Whole words only: "ecb" inside "NECB" and "boe" inside "CBOE" made two
+        # company earnings reports look like central-bank decisions.
+        high = str(e.get("importance") or e.get("impact") or "").lower() == "high"
+        if "earnings" in low or not (high or _TIER1_RE.search(low) or _CB_RE.search(low)):
             continue
         rows.append({
             "date": when, "ccy": ccy, "flag": CURRENCIES[ccy].flag,
             "event": label,
             "impact": e.get("importance") or e.get("impact") or "",
-            "is_cb": any(k in low for k in
-                         ("rate decision", "interest rate", "policy rate",
-                          "fomc", "ecb", "boe", "boj")),
+            "is_cb": bool(_CB_RE.search(low)),
         })
     if not rows:
         return pd.DataFrame()

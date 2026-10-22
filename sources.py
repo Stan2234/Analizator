@@ -629,6 +629,50 @@ def fetch_finnhub_economic_calendar(api_key: str) -> List[Dict[str, Any]]:
         return []
 
 
+# Finnhub's economic calendar is a paid endpoint and returns nothing on the free key, which
+# left the app with company earnings and no CPI, payrolls or rate decisions at all. The
+# ForexFactory weekly feed is free, keyless and covers the G10 with impact, forecast and
+# previous; it holds the current week, and next week once ForexFactory publishes it.
+FF_WEEKS = ("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            "https://nfs.faireconomy.media/ff_calendar_nextweek.json")
+_FF_CCY_TO_COUNTRY = {"USD": "US", "EUR": "EU", "GBP": "GB", "JPY": "JP", "CAD": "CA", "AUD": "AU",
+                      "NZD": "NZ", "CHF": "CH", "CNY": "CN", "All": ""}
+
+
+def fetch_forexfactory_calendar() -> List[Dict[str, Any]]:
+    """This week's (and, when published, next week's) macro calendar, in UTC."""
+    out: List[Dict[str, Any]] = []
+    for url in FF_WEEKS:
+        # it answers 429 to bursts, so the job runs every few hours, never in a loop
+        r = _get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; MarketAnalyst/1.0)"})
+        if not r:
+            continue
+        try:
+            rows = r.json()
+        except Exception:
+            continue
+        for e in rows or []:
+            impact = str(e.get("impact") or "").lower()
+            if impact == "holiday" or not e.get("date") or not e.get("title"):
+                continue
+            try:
+                when = dt.datetime.fromisoformat(e["date"]).astimezone(dt.timezone.utc)
+            except Exception:
+                continue
+            out.append({
+                "event_time": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "country": _FF_CCY_TO_COUNTRY.get(e.get("country"), str(e.get("country") or "")[:2]),
+                "title": e["title"],
+                "importance": impact if impact in ("low", "medium", "high") else "low",
+                "actual": str(e.get("actual") or ""),
+                "forecast": str(e.get("forecast") or ""),
+                "previous": str(e.get("previous") or ""),
+                "source": "ForexFactory",
+                "extra": {"currency": e.get("country")},
+            })
+    return out
+
+
 def fetch_finnhub_ipo_calendar(api_key: str, days_ahead: int = 30) -> List[Dict[str, Any]]:
     if not api_key:
         return []

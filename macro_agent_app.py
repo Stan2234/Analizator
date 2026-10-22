@@ -3464,7 +3464,7 @@ st.markdown("---")
 
 _TAB_LABELS = [
     ("global", "🌍 Global Signals"), ("fx", "💱 Currencies"), ("carry", "💴 Carry Trade"),
-    ("cb", "🏦 Central Banks"), ("metals", "🥇 Metals"), ("crypto", "🪙 Crypto (Binance)"),
+    ("cb", "🏦 Central Banks"), ("metals", "🥇 Metals"), ("crypto", "🪙 Crypto"),
     ("fund", "📐 Fundamentals"), ("news", "📰 News & Macro"), ("quant", "🧮 Quant Lab"),
     ("ai", "🤖 AI Analyst"), ("fomc", "🏛 FOMC Lab"), ("brief", "🎯 Deep Brief"),
 ]
@@ -6318,6 +6318,167 @@ def cr_load_macro():
     return pd.DataFrame(frames).sort_index() if frames else pd.DataFrame()
 
 
+
+# ---------------- plain-language summaries ("… today" blocks) ----------------
+_TONE = {"up": ("#22c55e", "rgba(34,197,94,.08)"), "down": ("#ef4444", "rgba(239,68,68,.08)"),
+         "warn": ("#f59e0b", "rgba(245,158,11,.08)"), "flat": ("#a3a3a3", "rgba(163,163,163,.06)")}
+
+
+def read_cards(title: str, cards: List[Dict[str, str]], note: str = "") -> None:
+    """A row of plain-language findings: each card a topic, a one-word state and one sentence.
+
+    Every tab leads with these so a reader learns what the data says before meeting the
+    tables. They are computed from the data on the page, not written by the model, so
+    they cost nothing and say the same thing to everyone."""
+    if not cards:
+        return
+    items = "".join(
+        f"<div class='rc' style='border-left:3px solid {_TONE[c.get('tone', 'flat')][0]};"
+        f"background:{_TONE[c.get('tone', 'flat')][1]}'>"
+        f"<div class='rc-t'>{c['topic']}</div>"
+        f"<div class='rc-s' style='color:{_TONE[c.get('tone', 'flat')][0]}'>{c['state']}</div>"
+        f"<div class='rc-x'>{c['text']}</div></div>" for c in cards)
+    st.markdown(f"""
+<style>
+.rc-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; margin:6px 0 4px; }}
+.rc {{ border-radius:10px; padding:14px 16px; }}
+.rc-t {{ font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:#a3a3a3; }}
+.rc-s {{ font-size:20px; font-weight:700; margin:4px 0 6px; }}
+.rc-x {{ font-size:14.5px; line-height:1.5; color:#e5e5e5; }}
+</style>
+<div style="font-size:22px;font-weight:700;margin:10px 0 2px">{title}</div>
+<div class='rc-grid'>{items}</div>""", unsafe_allow_html=True)
+    if note:
+        st.caption(note)
+
+
+def crypto_today_cards(universe: pd.DataFrame, glob: Dict[str, Any], closes: pd.DataFrame,
+                       funding: pd.DataFrame, mc: Dict[str, Any],
+                       fg: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    cards: List[Dict[str, str]] = []
+    btc = (closes["BTC"].dropna() if (not closes.empty and "BTC" in closes.columns)
+           else pd.Series(dtype=float))
+
+    # 1. Bitcoin's trend: where it is against its own averages and its record
+    if len(btc) >= 200:
+        px, ma50, ma200 = btc.iloc[-1], btc.tail(50).mean(), btc.tail(200).mean()
+        ath = universe.loc["BTC", "from_ath_pct"] if "BTC" in universe.index else None
+        chg30 = (px / btc.iloc[-31] - 1) * 100 if len(btc) > 31 else None
+        above200, above50 = px > ma200, px > ma50
+        state = ("Uptrend" if above200 and above50 else "Downtrend" if not above200 and not above50
+                 else "Recovering" if above50 else "Weakening")
+        tone = "up" if state == "Uptrend" else "down" if state == "Downtrend" else "warn"
+        text = (f"Bitcoin is at ${px:,.0f}, {'above' if above200 else 'below'} its 200-day average "
+                f"(${ma200:,.0f}) and {'above' if above50 else 'below'} its 50-day (${ma50:,.0f}).")
+        if ath is not None and pd.notna(ath):
+            text += f" It is {abs(ath):.0f}% below its record high."
+        if chg30 is not None:
+            text += f" Past 30 days: {chg30:+.1f}%."
+        cards.append({"topic": "Bitcoin trend", "state": state, "tone": tone, "text": text})
+
+    # 2. Breadth: is the whole market moving, or a few coins?
+    if not universe.empty and "chg_30d" in universe:
+        r30 = universe["chg_30d"].dropna()
+        if len(r30) >= 5:
+            up = int((r30 > 0).sum())
+            med = r30.median()
+            btc30 = universe.loc["BTC", "chg_30d"] if "BTC" in universe.index else None
+            state = ("Broad gains" if up >= 0.65 * len(r30) else
+                     "Broad losses" if up <= 0.35 * len(r30) else "Mixed")
+            tone = "up" if state == "Broad gains" else "down" if state == "Broad losses" else "flat"
+            text = (f"{up} of the top {len(r30)} coins are up over 30 days; "
+                    f"the typical coin moved {med:+.1f}%")
+            text += (f" against bitcoin's {btc30:+.1f}%." if btc30 is not None and pd.notna(btc30)
+                     else ".")
+            cards.append({"topic": "Market breadth", "state": state, "tone": tone, "text": text})
+
+    # 3. Bitcoin or the rest: where the money is going
+    dom = (glob or {}).get("dominance", {}).get("BTC")
+    alt = cra.alt_index(closes, window=90) if not closes.empty else pd.DataFrame()
+    if not alt.empty:
+        b_ret = alt.iloc[-1, 0] - 100
+        a_ret = alt.iloc[-1, 1] - 100
+        gap = b_ret - a_ret
+        state = ("Into bitcoin" if gap > 5 else "Into altcoins" if gap < -5
+                 else "No clear rotation")
+        text = (f"Over 90 days bitcoin returned {b_ret:+.0f}% and the typical altcoin {a_ret:+.0f}%"
+                + (f"; bitcoin is {dom:.1f}% of the whole market." if dom else "."))
+        if gap > 5:
+            text += " Money has been concentrating in bitcoin, as it usually does when risk appetite fades."
+        elif gap < -5:
+            text += " Smaller coins have outpaced bitcoin, a sign of rising risk appetite."
+        cards.append({"topic": "Bitcoin vs altcoins", "state": state, "tone": "flat", "text": text})
+
+    # 4. Leverage: what traders pay to hold leveraged positions
+    if funding is not None and not funding.empty:
+        f = funding["funding_annual_pct"].median()
+        n_long = int((funding["funding_annual_pct"] > 0).sum())
+        if f < 0:
+            state, tone, why = "Shorts crowded", "warn", "traders are paying to bet on falling prices"
+        elif f < 8:
+            state, tone, why = "Calm", "flat", "leveraged traders are not leaning hard either way"
+        elif f < 25:
+            state, tone, why = "Leaning long", "warn", "buyers on leverage are paying up to stay in"
+        else:
+            state, tone, why = "Crowded long", "down", "leveraged buyers are paying a lot, a crowded position"
+        cards.append({"topic": "Leverage", "state": state, "tone": tone,
+                      "text": f"Median funding is {f:+.1f}% a year and {n_long} of {len(funding)} coins "
+                              f"have longs paying shorts: {why}. This describes positioning, not "
+                              "what happens next."})
+
+    # 5. Mood: the published Fear & Greed index
+    if fg and fg.get("value") is not None:
+        v = int(fg["value"])
+        tone = "down" if v < 25 else "warn" if v < 45 else "flat" if v <= 55 else "up"
+        cards.append({"topic": "Sentiment", "state": (fg.get("label") or "").title() or str(v),
+                      "tone": tone,
+                      "text": f"The Crypto Fear & Greed index is {v}/100. Below 25 is extreme fear, "
+                              "above 75 extreme greed; extremes have tended to come near turning "
+                              "points, not reliably at them."})
+
+    # 6. What bitcoin is behaving like
+    if mc and mc.get("available"):
+        lat = mc["latest"]
+        nas, gold = lat.get("NASDAQ 100"), lat.get("Gold")
+        if nas is not None and gold is not None:
+            if nas > 0.3 and nas > gold + 0.15:
+                state = "Risk asset"
+                text = (f"bitcoin has been moving with tech stocks (correlation {nas:+.2f}), "
+                        f"much more than with gold ({gold:+.2f}).")
+            elif gold > 0.3 and gold > nas + 0.15:
+                state = "Hedge-like"
+                text = (f"bitcoin has been moving with gold (correlation {gold:+.2f}) "
+                        f"more than with tech stocks ({nas:+.2f}).")
+            else:
+                state = "Its own thing"
+                text = (f"bitcoin's link to tech stocks ({nas:+.2f}) and to gold ({gold:+.2f}) "
+                        "is weak.")
+            cards.append({"topic": "Behaves like", "state": state, "tone": "flat",
+                          "text": "Over the last 90 days " + text})
+    return cards
+
+
+def btc_trend_chart(closes: pd.DataFrame) -> Optional[go.Figure]:
+    if closes.empty or "BTC" not in closes.columns:
+        return None
+    s = closes["BTC"].dropna()
+    if len(s) < 220:
+        return None
+    ma50, ma200 = s.rolling(50).mean(), s.rolling(200).mean()
+    s, ma50, ma200 = s.tail(365), ma50.tail(365), ma200.tail(365)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=s.index, y=s, name="Bitcoin", line=dict(color="#f7931a", width=2.2)))
+    fig.add_trace(go.Scatter(x=ma50.index, y=ma50, name="50-day average",
+                             line=dict(color="#60a5fa", width=1.4)))
+    fig.add_trace(go.Scatter(x=ma200.index, y=ma200, name="200-day average",
+                             line=dict(color="#a3a3a3", width=1.4, dash="dash")))
+    fig.update_layout(template="plotly_dark", height=360, paper_bgcolor="#000",
+                      plot_bgcolor="#0a0a0a", margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", y=1.08),
+                      yaxis=dict(tickprefix="$", tickformat=",.0f"))
+    return fig
+
+
 with tab_crypto:
     if access.tab_open(current_user(), "crypto"):
         if not _HAS_CRA:
@@ -6326,7 +6487,7 @@ with tab_crypto:
             st.markdown("""
         <div style="padding:12px 0 4px 0">
         <span style="font-size:28px;font-weight:800;letter-spacing:-1px">CRYPTO</span>
-        <span style="font-size:14px;color:#888;margin-left:12px">The complex · how much of it is bitcoin · who is already positioned</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">Where crypto stands today, and what is driving it</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -6410,9 +6571,28 @@ Carlo — the Quant Lab takes any Binance symbol directly.
                 syms = tuple(universe["binance_symbol"])
                 closes = cr_load_closes(syms, "1d", 500)
 
+                # ---------------- crypto today: the summary first ----------------
+                funding_all = cr_load_funding(syms)
+                macro_all = cr_load_macro()
+                mc_all = (cra.macro_correlation(closes["BTC"], macro_all, window=90)
+                          if (not closes.empty and "BTC" in closes.columns and not macro_all.empty)
+                          else {})
+                fg_all = (_load_sentiments() or {}).get("crypto")
+                read_cards("Crypto today",
+                           crypto_today_cards(universe, glob, closes, funding_all, mc_all, fg_all),
+                           note="Computed from the prices, funding rates and index readings in the "
+                                "sections below. It describes the market now; it is not a forecast.")
+                fig_btc = btc_trend_chart(closes)
+                if fig_btc is not None:
+                    st.markdown("##### Bitcoin over the past year, with its 50- and 200-day averages")
+                    st.plotly_chart(fig_btc, use_container_width=True)
+                    st.caption("Price above both averages is the textbook uptrend, below both a "
+                               "downtrend. The 200-day line is the one long-term investors watch.")
+
+                st.markdown("#### The detail")
                 crt1, crt2, crt3, crt4, crt5 = st.tabs([
-                    "📊 The board", "₿ How much is bitcoin?", "🎢 Positioning",
-                    "🌐 Risk asset or hedge?", "🤖 Desk read"])
+                    "📊 All coins", "₿ How tied to bitcoin", "🎢 Leverage & positioning",
+                    "🌐 Stocks or gold?", "🤖 AI read (1 credit)"])
 
                 # ---------------- the board ----------------
                 with crt1:

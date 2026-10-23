@@ -376,6 +376,18 @@ Two to four sentences each. Cite which agents support each theme.
 ## Where the agents disagree
 Where they conflict and what the conflict implies. Say which side the data favours now.
 
+## The view and the scenarios (next 1-3 months)
+**View on global risk assets: <Bullish | Mildly bullish | Neutral | Mildly bearish | Bearish>** · Confidence: <low | medium | high>
+
+| Scenario | Probability | What markets do (S&P 500, 10y yield, dollar, gold, bitcoin) | What has to happen | First sign to watch |
+|---|---|---|---|---|
+| Bull | xx% | ... | ... | ... |
+| Base | xx% | ... | ... | ... |
+| Bear | xx% | ... | ... | ... |
+
+The probabilities add up to 100. They are your judgment, built from the agents' findings;
+say in one line under the table what they rest on, and never present an outcome as certain.
+
 ## What to watch this week
 Three to five specific, dated, checkable items: a release with its date, a level, a
 shift in a measured figure. "Monitor inflation" is useless; "US CPI on Thursday, last

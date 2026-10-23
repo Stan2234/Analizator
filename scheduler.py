@@ -159,6 +159,17 @@ def job_refresh_macro_calendar() -> None:
         log.exception("job_refresh_macro_calendar failed: %s", e)
 
 
+def job_free_market_read() -> None:
+    """The market read every visitor sees first on the News tab, written three times a day
+    after the morning, midday and evening news windows. Paid by the app, not by credits."""
+    try:
+        import ai_reads
+        if ai_reads.global_news_read():
+            log.info("free market read written")
+    except Exception as e:
+        log.exception("job_free_market_read failed: %s", e)
+
+
 def job_refresh_sec() -> None:
     try:
         filings = src.fetch_sec_all_institutions()
@@ -369,6 +380,10 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_sec, IntervalTrigger(hours=6), id="sec", replace_existing=True,
                       next_run_time=soon(5))
         sched.add_job(job_prune, CronTrigger(hour=3, minute=0), id="prune", replace_existing=True)
+        # Three free market reads a day (07:30, 13:30, 20:30 UTC). FREE_MARKET_READS=false stops them.
+        if _get_secret("FREE_MARKET_READS", "true").lower() not in ("0", "false", "no", "off"):
+            sched.add_job(job_free_market_read, CronTrigger(hour="7,13,20", minute=30),
+                          id="free_market_read", replace_existing=True)
         sched.add_job(job_refresh_sp500_universe, CronTrigger(hour=2, minute=30),
                       id="sp500_universe", replace_existing=True)
 

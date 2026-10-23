@@ -411,6 +411,13 @@ TOOLS: List[Dict[str, Any]] = [
         "description": "Diagnostics: how many news/market/signal/SEC rows are stored, and the timestamp of the latest news.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "get_forecast_inputs",
+        "description": "Base rates and volatility ranges for any Yahoo symbol (stocks, indices, futures like GC=F, FX like EURUSD=X, crypto like BTC-USD), from up to ten years of daily prices: how often the price was higher 1 and 3 months later from the same trend state as today, the median move and the 10th-90th percentile spread, the 1- and 2-sigma price ranges for each horizon, the chance of trading through the key moving averages and the 52-week high/low, and those levels. Call this before putting probabilities on scenarios for an asset.",
+        "input_schema": {"type": "object", "properties": {
+            "symbol": {"type": "string", "description": "Yahoo symbol, e.g. AAPL, ^GSPC, GC=F, EURUSD=X, BTC-USD"}},
+            "required": ["symbol"]}
+    },
 ]
 
 
@@ -684,7 +691,26 @@ def _tool_get_sentiment_indexes(_args: Dict[str, Any]) -> Any:
     }
 
 
+def _tool_get_forecast_inputs(args: Dict[str, Any]) -> Any:
+    import ai_reads
+    import pandas as pd
+    sym = str(args.get("symbol") or "").strip()
+    r = src._get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                 params={"range": "10y", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        res = r.json()["chart"]["result"][0]
+        s = pd.Series(res["indicators"]["quote"][0]["close"],
+                      index=pd.to_datetime(res["timestamp"], unit="s")).dropna()
+    except Exception:
+        return {"error": f"no price history for {sym}"}
+    ppy = 365 if sym.endswith("-USD") else 252
+    hz = (30, 90) if ppy == 365 else (21, 63)
+    return ai_reads.forecast_inputs(s, horizons=hz, periods_per_year=ppy, name=sym,
+                                    levels=ai_reads.default_levels(s, ppy))
+
+
 TOOL_DISPATCH = {
+    "get_forecast_inputs":          _tool_get_forecast_inputs,
     "search_news":                  _tool_search_news,
     "get_market_quote":             _tool_get_market_quote,
     "get_live_quote":               _tool_get_live_quote,
@@ -719,9 +745,14 @@ Rules:
 - If a tool returns no data, say so honestly. Don't invent numbers.
 - Separate what a tool returned from what you are inferring from it, and say
   which you are doing. A reader who cannot tell the difference cannot check you.
-- Do not attach percentage probabilities to scenarios. Nothing you have access
-  to produces one, so a number like "60% likely" would be invented. Rank
-  outcomes and say what would tip the balance.
+- When the question is about where an asset or the market is heading, give a view
+  (Bullish / Mildly bullish / Neutral / Mildly bearish / Bearish, with a confidence)
+  and a Bull / Base / Bear table with probabilities that add up to 100, a level or
+  range for each, what has to happen and the first sign to watch. Call
+  get_forecast_inputs first and anchor the probabilities on its base rates and
+  volatility ranges; say in one line what they rest on and why you depart from them.
+  They are your judgment, not a tested model, so say so in a short line under the
+  table, and never present any outcome as certain.
 - 13F filings are 45+ days delayed by SEC rule — never describe them as current positions.
 - The technical signal from get_signal measures how far the indicators agree
   right now. Walk-forward testing showed it does not predict returns, so use it

@@ -19,6 +19,12 @@ import io
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import logging
+
+import ai_reads as ar
+
+log = logging.getLogger("analizator.app")
+
 # New modules: SQLite data layer, source clients, background scheduler, Claude agent
 try:
     import sources as src_mod
@@ -1984,27 +1990,79 @@ def ai_md(text: str) -> None:
     st.markdown(re.sub(r"(?<!\\)\$", r"\\$", text or ""))
 
 
-# How every AI read is written: the conclusion first, three takeaways, then the reasoning
-# under question headings, then what would change it. Modelled on how bank research notes
-# are laid out (docs/ANALYSIS_PLAYBOOK.md).
-HOUSE_STYLE = (
-    "Write for an investor who is smart but not a specialist, in this layout:\n"
-    "**<Headline: the conclusion in one sentence, with the number that carries it>**\n"
-    "- three bullets, each a finding with a number and a comparison (against its own "
-    "history, against peers, or against what was expected)\n"
-    "### <a question the reader would ask>\n"
-    "two to four short sentences answering it from the data\n"
-    "### <a second question>\n"
-    "two to four short sentences\n"
-    "**What would change the picture:** one or two concrete things — a level, a data "
-    "release, a shift in a measured figure.\n"
-    "**Not in the data:** only if something the question needs is missing.\n\n"
-    "Rules: 300-450 words. Every claim carries a number and what it is compared with; "
-    "never 'strong' or 'weak' alone. Describe drivers as tendencies, not laws, and when "
-    "two of them pull opposite ways say which is winning now. Explain any jargon once in "
-    "brackets. No price forecast, no buy or sell advice. Use only the figures given; if "
-    "a point needs data that is not there, say so instead of supplying it from memory."
-)
+def ai_caption(subject: str) -> None:
+    st.caption(f"A research note on {subject}: what is driving it, a view for the next one to three "
+               "months, three scenarios with probabilities, and the levels to watch. Built from the "
+               "figures on this page. It stays here until you close the app, and the latest one is "
+               "kept for the next visit.")
+
+
+def _view_badge(meta: Dict[str, Any]) -> None:
+    """The call at a glance: the view, the confidence and the three probabilities as a bar."""
+    if not meta:
+        return
+    v = str(meta.get("view", ""))
+    col = ("#22c55e" if "bull" in v.lower() or "eas" in v.lower() or v.lower().startswith("supportive")
+           else "#ef4444" if "bear" in v.lower() or "tight" in v.lower() or "hostile" in v.lower()
+           else "#a3a3a3")
+    bull, base, bear = (int(meta.get(k, 0) or 0) for k in ("bull", "base", "bear"))
+    tot = max(bull + base + bear, 1)
+    bar = "".join(
+        f"<div style='width:{w / tot * 100:.1f}%;background:{c};padding:4px 8px;font-size:12.5px;"
+        f"color:#000;font-weight:700;white-space:nowrap;overflow:hidden'>{lbl} {w}%</div>"
+        for lbl, w, c in (("Bull", bull, "#22c55e"), ("Base", base, "#d4d4d4"), ("Bear", bear, "#ef4444"))
+        if w > 0)
+    st.markdown(
+        f"<div style='border:1px solid #262626;border-left:4px solid {col};border-radius:10px;"
+        f"padding:12px 16px;margin:8px 0 12px'>"
+        f"<div style='font-size:12px;letter-spacing:.08em;color:#a3a3a3'>THE CALL</div>"
+        f"<div style='font-size:22px;font-weight:800;color:{col}'>{ihtml.escape(v)}"
+        f"<span style='font-size:14px;color:#a3a3a3;font-weight:500'> · confidence "
+        f"{ihtml.escape(str(meta.get('confidence', '')))}</span></div>"
+        f"<div style='display:flex;border-radius:6px;overflow:hidden;margin-top:8px'>{bar}</div>"
+        f"</div>", unsafe_allow_html=True)
+
+
+def ai_read_run(panel: str, focus: str, system: str, ctx: Dict[str, Any],
+                price: Optional[float] = None, max_tokens: int = 10000, effort: str = "medium",
+                action: str = "read") -> None:
+    """Charge a credit, write the read, and keep it: in this session until the app closes,
+    and in the database as the latest read for this subject. Every call is recorded."""
+    _err = ai_unavailable(action)
+    if _err:
+        st.error(f"AI read unavailable: {_err}.")
+        return
+    if "calendar" not in ctx:          # every read can date its triggers
+        ctx["calendar_this_week"] = [
+            {"when_utc": e.get("event_time"), "country": e.get("country"), "event": e.get("title"),
+             "importance": e.get("importance"), "forecast": e.get("forecast"), "previous": e.get("previous")}
+            for e in fx_econ_events()
+            if not str(e.get("title") or "").lower().startswith("earnings")
+            and str(e.get("importance") or "").lower() in ("high", "medium")][:40]
+    with st.spinner(f"Writing the read on {focus}…"):
+        try:
+            text = ai_agent.complete(system, json.dumps(ctx, default=str, indent=1),
+                                     max_tokens=max_tokens, effort=effort)
+        except Exception as e:
+            ai_failed(e, action)
+            return
+    clean, meta = ar.split_view(text)
+    st.session_state[f"ai_out:{panel}:{focus}"] = {
+        "text": clean, "meta": meta, "ts": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"), "mine": True}
+    ar.save_read(panel, focus, clean, meta)
+    ar.record_call(panel, focus, meta, price)
+
+
+def ai_read_show(panel: str, focus: str, empty_hint: str = "") -> None:
+    """The read for this subject: this session's if there is one, otherwise the latest stored."""
+    r = st.session_state.get(f"ai_out:{panel}:{focus}") or ar.load_read(panel, focus)
+    if not r:
+        st.info(empty_hint or f"No read on {focus} yet. Press the button to write one.")
+        return
+    st.caption(("Your read" if r.get("mine") else "Latest read") + f" on {focus}, written {r['ts']} UTC.")
+    _view_badge(r.get("meta") or {})
+    ai_md(r["text"])
+    st.caption(ar.DISCLAIMER)
 
 
 # The composite in basic_signal_from_series summarises indicator agreement. It
@@ -2498,29 +2556,42 @@ def run_news_forecast(
                if not str(e.get("title") or "").lower().startswith("earnings")
                and str(e.get("importance") or "").lower() in ("high", "medium")][:40]
 
-        user_block = (f"ASSET UNDER ANALYSIS: {focus_name}\n\n"
-                      "SCHEDULED THIS WEEK (macro calendar, forecast and previous where known):\n"
-                      + json.dumps(cal, default=str))
+        # base rates and volatility ranges for the asset the read is about
+        sym = "^GSPC" if focus_name == ar.GLOBAL_FOCUS else parse_selected_asset_to_symbol(focus_name)
+        if sym.endswith("USDT"):
+            sym = sym[:-4] + "-USD"
+        fin: Dict[str, Any] = {}
+        try:
+            hist = fetch_yahoo_history(sym, years=10, max_points=4000)["close"]
+            if len(hist) > 260:
+                fin = ar.forecast_inputs(hist, name=sym, levels=ar.default_levels(hist))
+        except Exception:
+            fin = {"note": f"no price history for {sym}"}
+
+        user_block = (f"ASSET UNDER ANALYSIS: {focus_name}"
+                      + (" (the S&P 500 is the reference market)" if focus_name == ar.GLOBAL_FOCUS else "")
+                      + "\n\nSCHEDULED THIS WEEK (macro calendar, forecast and previous where known):\n"
+                      + json.dumps(cal, default=str)
+                      + "\n\nFORECAST_INPUTS (base rates and volatility ranges from its own history):\n"
+                      + json.dumps(fin, default=str))
 
         system_prompt = (
-            "You are a markets editor at a research house writing a short note on what the "
-            f"news means for {focus_name}. Readers have seen the headlines; your value is in "
-            "what they imply and what is being missed.\n\n"
-            "Cover, in this order: the two or three stories that actually carry consequence for "
-            "this asset and the mechanism by which each would move it (not that it is "
-            "'significant'); how the technical signals in the brief say the asset is already "
-            "trading, as context, remembering they describe and do not predict; and what is "
-            "scheduled this week that could change the picture, quoting forecast against "
-            "previous where the calendar has them.\n\n"
-            "Work from the supplied headlines and calendar only; add no events, figures or "
-            "quotes from memory. Name the headline behind each claim. No probability "
-            "percentages. If the news flow on this asset is thin, say so plainly: that is a "
-            "finding, and padding it into a confident note is the failure to avoid.\n\n"
-            + HOUSE_STYLE)
+            "You are a markets strategist at a research house writing a note on what the news "
+            f"means for {focus_name}. Readers have seen the headlines; your value is in what they "
+            "imply, what is being missed, and where the price is likely to go.\n\n"
+            "Pick the two or three stories that carry real consequence for this asset and explain "
+            "the mechanism by which each would move it; use the technical signals in the brief as "
+            "context on how it is already trading; and say what on this week's calendar could "
+            "change the picture, quoting forecast against previous. Name the headline behind each "
+            "claim and add no events, figures or quotes from memory. If the news flow on this "
+            "asset is thin, say so and lean more on the base rates.\n\n"
+            + ar.forecast_style(focus_name if focus_name != ar.GLOBAL_FOCUS
+                                else "global markets, with the S&P 500 as the reference"))
 
         context = base_ctx + "\n\n" + user_block
-
-        return ai_agent.complete(system_prompt, context, max_tokens=7000, effort="medium")
+        text = ai_agent.complete(system_prompt, context, max_tokens=9000, effort="medium")
+        st.session_state["news_last_price"] = fin.get("last_price")
+        return text
 
     except ai_agent.AIOutage:
         access.refund(current_user(), "news")       # charged above; nothing was produced
@@ -3120,13 +3191,17 @@ def show_fomc_lab():
             st.error("Current FOMC statement is required.")
             return
 
-        with st.spinner("Analyzing FOMC with GPT — cross-market impact assessment..."):
+        with st.spinner("Reading the statement — cross-market impact assessment..."):
             result = analyze_fomc_with_gpt(
                 current_text=current_text,
                 previous_text=previous_text,
                 pressconf_text=pressconf_text,
             )
+        if "error" not in result:
+            st.session_state["fomc_result"] = result       # kept until the app is closed
 
+    result = st.session_state.get("fomc_result") if not analyze_clicked else result
+    if result:
         if "error" in result:
             st.error(result.get("error"))
             if "raw_response" in result:
@@ -4467,7 +4542,9 @@ describes the recent past.
                                                   use_container_width=True)
                     if dd_quote == dd_base:
                         dd_quote = next(c for c in avail if c != dd_base)
-                    run_dd = st.button(f"🤖 AI read of {dd_base}/{dd_quote} (1 credit)", key="fx_dd_run")
+                    run_dd = st.button(f"🤖 AI read of {dd_base}/{dd_quote} (1 credit)", key="fx_dd_run",
+                                       type="primary")
+                    ai_caption(f"{dd_base}/{dd_quote}")
 
                     snap = fxa.pair_snapshot(uv, dd_base, dd_quote, fx_rates, fx_prices)
                     if not snap:
@@ -4592,51 +4669,46 @@ describes the recent past.
                                 use_container_width=True, hide_index=True)
                             st.caption("Carry and momentum both stop working across a policy decision.")
 
+                        pair_key = f"{dd_base}/{dd_quote}"
                         if run_dd:
-                            _err = ai_unavailable("read")
-                            if _err:
-                                st.error(f"AI read unavailable: {_err}.")
-                            else:
-                                with st.spinner("Reading the tape…"):
-                                    try:
-                                        ctx = {
-                                            "pair": snap["pair"],
-                                            "snapshot": {k: v for k, v in snap.items()
-                                                         if not isinstance(v, dict)},
-                                            "dominant_driver": snap.get("dominant_driver"),
-                                            "driver_ranking": (
-                                                fxa.driver_correlations(uv, dd_base, dd_quote,
-                                                                        fx_prices).reset_index()
-                                                .to_dict("records")),
-                                            "strength_ranking": (
-                                                fxa.currency_strength(uv, fx_codes, fx_bars)
-                                                ["strength"].round(2).to_dict()),
-                                            "events": ev.to_dict("records") if not ev.empty else [],
-                                        }
-                                        fx_system = (
-                                            "You are an FX strategist at a research house writing a short "
-                                            f"note on {dd_base}/{dd_quote} for investors. You get the pair's "
-                                            "spot changes, realised volatility and its percentile against "
-                                            "its own history, the interest-rate carry and what it returned "
-                                            "after the currency move, the measured correlation of the pair "
-                                            "with each macro driver, every currency's strength against all "
-                                            "the others, and the scheduled events.\n\n"
-                                            "Cover, in this order: what the pair is doing and whether it is "
-                                            f"a {dd_base} story or a {dd_quote} story (settle it with the "
-                                            "strength ranking); which driver is in control and how strong "
-                                            "that link is (below about 0.3 nothing is in control); what the "
-                                            "carry is worth once the spot move is netted off; and which "
-                                            "dated events could change the picture. Do not invent levels, "
-                                            "positioning data or forecasts; correlation is not causation.\n\n"
-                                            + HOUSE_STYLE
-                                        )
-                                        read = ai_agent.complete(
-                                            fx_system, json.dumps(ctx, default=str, indent=2),
-                                            max_tokens=9000, effort="high")
-                                        st.markdown("---")
-                                        ai_md(read)
-                                    except Exception as e:
-                                        ai_failed(e)
+                            ctx, px_now = None, None
+                            try:
+                                ctx = {
+                                    "pair": snap["pair"],
+                                    "snapshot": {k: v for k, v in snap.items() if not isinstance(v, dict)},
+                                    "dominant_driver": snap.get("dominant_driver"),
+                                    "driver_ranking": (fxa.driver_correlations(uv, dd_base, dd_quote, fx_prices)
+                                                       .reset_index().to_dict("records")),
+                                    "strength_ranking": (fxa.currency_strength(uv, fx_codes, fx_bars)
+                                                         ["strength"].round(2).to_dict()),
+                                    "events": ev.to_dict("records") if not ev.empty else [],
+                                }
+                                if len(series) > 260:
+                                    ctx["forecast_inputs"] = ar.forecast_inputs(
+                                        series, name=pair_key, levels=ar.default_levels(series))
+                                    px_now = float(series.iloc[-1])
+                            except Exception:
+                                log.exception("fx context failed")
+                            if ctx is not None:
+                                fx_system = (
+                                    "You are an FX strategist at a research house. You get the pair's "
+                                    "spot changes, realised volatility and its percentile against its own "
+                                    "history, the interest-rate carry and what it returned after the "
+                                    "currency move, the measured correlation of the pair with each macro "
+                                    "driver, every currency's strength against all the others, the "
+                                    "scheduled events, and forecast_inputs (base rates and volatility "
+                                    "ranges from the pair's own history).\n\n"
+                                    "Cover what the pair is doing and whether it is a "
+                                    f"{dd_base} story or a {dd_quote} story (settle it with the strength "
+                                    "ranking); which driver is in control and how strong that link is "
+                                    "(below about 0.3 nothing is in control); what the carry is worth once "
+                                    "the spot move is netted off; and which dated events could move it. "
+                                    f"The view is on {dd_base} against {dd_quote} (bullish = the pair rises). "
+                                    "No positioning data is included.\n\n"
+                                    + ar.forecast_style(pair_key))
+                                ai_read_run("fx", pair_key, fx_system, ctx, price=px_now)
+                        st.markdown("---")
+                        ai_read_show("fx", pair_key)
     else:
         locked_tab("fx")
 
@@ -5058,66 +5130,62 @@ that error is largest exactly where it matters most — around a policy turn.
 
                 # ═══════════════════════════════════════════════════
                 with ct4:
-                    st.caption("Reads the measured figures above. It has no positioning data, "
-                               "no options pricing and no flow — say so if the question needs them.")
-                    if st.button(f"🤖 AI read of the {funding_ccy}-funded trade (1 credit)", type="primary", key="carry_ai"):
-                        _err = ai_unavailable("read")
-                        if _err:
-                            st.error(f"AI read unavailable: {_err}.")
-                        else:
-                            with st.spinner("Reading…"):
-                                try:
-                                    _b = fxa.carry_basket(c_uv, c_rates, carry_targets,
-                                                          funding=funding_ccy)
-                                    ctx = {
-                                        "funding_currency": funding_ccy,
-                                        "funding_rate": f_rate,
-                                        "funding_rate_status": f_status,
-                                        "carry_legs": (
-                                            fxa.carry_table(c_uv, c_rates, carry_targets,
-                                                            vs=funding_ccy)
-                                            .drop(columns=["name", "flag"], errors="ignore")
-                                            .reset_index().to_dict("records")),
-                                        "basket": {k: v for k, v in _b.items()
-                                                   if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                        "worst_episodes": [
-                                            {**e, "start": str(e["start"])[:10],
-                                             "end": str(e["end"])[:10],
-                                             "trough": str(e["trough"])[:10]}
-                                            for e in fxa.worst_episodes(_b["drawdown"], 4)
-                                        ] if "error" not in _b else [],
-                                        "unwind_conditions": {
-                                            k: v for k, v in cond.items()
-                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                        "events": ev.to_dict("records") if not ev.empty else [],
-                                    }
-                                    ctx["summary_cards"] = [{k: c[k] for k in ("topic", "state", "text")}
-                                                            for c in (carry_cards if not f_missing else [])]
-                                    sysmsg = (
-                                        "You are an FX strategist at a research house writing a short "
-                                        f"note on the {funding_ccy}-funded carry trade for investors. "
-                                        "You get the funding rate, each leg's interest differential and "
-                                        "realised currency move, an equal-weighted basket with its "
-                                        "return, drawdowns and worst episodes, three measured unwind "
-                                        "conditions with their historical percentiles, the policy "
-                                        "calendar and summary cards already computed from them.\n\n"
-                                        "Cover, in this order: what the trade pays against what it has "
-                                        "actually returned once the currency move is netted off (the gap "
-                                        "is the argument); which leg carries the risk (a leg flagged as a "
-                                        "managed regime has volatility that understates its risk); the "
-                                        "three unwind conditions one by one against their own history, "
-                                        "never combined into a verdict or a probability; and what on the "
-                                        "calendar could reprice it. Say that the basket holds today's "
-                                        "policy rates constant across its history. There is no "
-                                        "positioning, options or flow data; name the gap.\n\n" + HOUSE_STYLE
-                                    )
-                                    read = ai_agent.complete(
-                                        sysmsg, json.dumps(ctx, default=str, indent=2),
-                                        max_tokens=9000, effort="high")
-                                    st.markdown("---")
-                                    ai_md(read)
-                                except Exception as e:
-                                    ai_failed(e)
+                    carry_key = f"{funding_ccy}-funded ({target_scope})"
+                    go_carry = st.button(f"🤖 AI read of the {funding_ccy}-funded trade (1 credit)",
+                                         type="primary", key="carry_ai")
+                    ai_caption(f"the {funding_ccy}-funded carry trade")
+                    if go_carry:
+                        ctx, px_now = None, None
+                        try:
+                            _b = fxa.carry_basket(c_uv, c_rates, carry_targets, funding=funding_ccy)
+                            ctx = {
+                                "funding_currency": funding_ccy, "funding_rate": f_rate,
+                                "funding_rate_status": f_status,
+                                "carry_legs": (fxa.carry_table(c_uv, c_rates, carry_targets, vs=funding_ccy)
+                                               .drop(columns=["name", "flag"], errors="ignore")
+                                               .reset_index().to_dict("records")),
+                                "basket": {k: v for k, v in _b.items()
+                                           if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                "worst_episodes": [
+                                    {**e, "start": str(e["start"])[:10], "end": str(e["end"])[:10],
+                                     "trough": str(e["trough"])[:10]}
+                                    for e in fxa.worst_episodes(_b["drawdown"], 4)
+                                ] if "error" not in _b else [],
+                                "unwind_conditions": {k: v for k, v in cond.items()
+                                                      if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                "events": ev.to_dict("records") if not ev.empty else [],
+                                "summary_cards": [{k: c[k] for k in ("topic", "state", "text")}
+                                                  for c in (carry_cards if not f_missing else [])],
+                            }
+                            eq = _b.get("equity") if "error" not in _b else None
+                            if eq is not None and len(eq) > 260:
+                                ctx["forecast_inputs_basket"] = ar.forecast_inputs(
+                                    eq, name=f"{funding_ccy}-funded basket", levels=ar.default_levels(eq))
+                                px_now = float(eq.iloc[-1])
+                        except Exception:
+                            log.exception("carry context failed")
+                        if ctx is not None:
+                            sysmsg = (
+                                "You are an FX strategist at a research house. You get the funding rate, "
+                                "each leg's interest differential and realised currency move, an "
+                                "equal-weighted basket with its return, drawdowns and worst episodes, three "
+                                "measured unwind conditions with their historical percentiles, the policy "
+                                "calendar, summary cards, and forecast_inputs for the basket's value.\n\n"
+                                "Cover what the trade pays against what it has actually returned once the "
+                                "currency move is netted off; which leg carries the risk (a managed-regime "
+                                "leg has volatility that understates its risk); the three unwind conditions "
+                                "one by one against their own history; and what on the calendar could "
+                                "reprice it. The view is on the trade itself: supportive means the "
+                                "conditions favour holding it, hostile means they favour an unwind; the "
+                                "bear scenario is an unwind and its probability is your judgment, anchored "
+                                "on the basket's base rates and the conditions. The basket holds today's "
+                                "policy rates constant across its history; say so. There is no positioning "
+                                "or options data.\n\n"
+                                + ar.forecast_style(f"the {funding_ccy}-funded carry trade", view_scale=[
+                                    "Supportive", "Mildly supportive", "Neutral", "Mildly hostile", "Hostile"]))
+                            ai_read_run("carry", carry_key, sysmsg, ctx, price=px_now)
+                    st.markdown("---")
+                    ai_read_show("carry", carry_key)
     else:
         locked_tab("carry")
 
@@ -5761,80 +5829,82 @@ judgement that their rates are settled.
                         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                         cb_go = st.button("🤖 AI read (1 credit)", type="primary",
                                           key="cb_ai_read", use_container_width=True)
-                    st.caption(
-                        "Reads the measured figures above. It has no meeting minutes, no "
-                        "speeches and no positioning data, and says so when the question "
-                        "needs them."
-                    )
+                    ai_caption("central-bank policy" if cb_focus == "All central banks"
+                               else cb_focus.split(" · ")[1])
                     if cb_go:
-                        _err = ai_unavailable("read")
-                        if _err:
-                            st.error(f"AI read unavailable: {_err}.")
-                        else:
-                            with st.spinner("Reading…"):
-                                try:
-                                    _fpath = cbk.implied_path(
-                                        cb_load_fed_curve(15),
-                                        float(board.loc["USD", "rate"])
-                                        if "USD" in board.index
-                                        and pd.notna(board.loc["USD", "rate"]) else None)
-                                    ctx = {
-                                        "banks": [
-                                            {k: (None if pd.isna(v) else v)
-                                             for k, v in row.items()
-                                             if not isinstance(v, (pd.Series, pd.DataFrame))}
-                                            | {"ccy": c}
-                                            for c, row in board.iterrows()],
-                                        "fed_futures_path": {
-                                            k: v for k, v in _fpath.items()
-                                            if not isinstance(v, (pd.Series, pd.DataFrame))},
-                                        "gold": (
-                                            cbk.gold_vs_reserves(cb_load_gold(), board)
-                                            [["tonnes", "pct_reserves", "status"]]
-                                            .reset_index().to_dict("records")
-                                            if "error" not in cb_load_gold() else []),
-                                        "caveats": [
-                                            "Real rates are ex-post: the policy rate less "
-                                            "realised year-on-year inflation, not inflation "
-                                            "expectations.",
-                                            "Inflation lags two to five months depending on "
-                                            "the country; the policy rate is current.",
-                                            "The futures curve carries a risk premium and is "
-                                            "not a forecast. It exists for the dollar only.",
-                                            "No meeting calendar, minutes, speeches or "
-                                            "positioning data are in this payload.",
-                                        ],
-                                    }
-                                    ctx["summary_cards"] = [{k: c[k] for k in ("topic", "state", "text")}
-                                                            for c in cb_cards]
-                                    one = cb_focus.split(" · ")[0] if cb_focus != "All central banks" else None
-                                    focus_txt = (
-                                        "the global picture: where policy is genuinely divergent and "
-                                        "where the gap disappears once inflation is netted off; which "
-                                        "banks are furthest from their own cycle peak and which have "
-                                        "not moved; and what the fed funds futures imply"
-                                        if one is None else
-                                        f"the {board.loc[one, 'bank']} ({one}): its rate, its last move "
-                                        "and how far it is from its cycle peak, its real rate against "
-                                        "the other banks, how its stance compares with the Fed's and "
-                                        "what that gap means for its currency"
-                                        + (", and what the futures curve has priced" if one == "USD" else ""))
-                                    sysmsg = (
-                                        "You are a central-bank analyst at a research house writing a "
-                                        "short note for investors. You get every covered central bank's "
-                                        "policy rate, its inflation and the real rate that follows, the "
-                                        "date and size of its last move, its distance from its cycle "
-                                        "peak, the fed funds futures path, official gold holdings and "
-                                        f"summary cards already computed from them.\n\nFocus on {focus_txt}.\n\n"
-                                        "Do not predict a decision or attach a probability to one; the "
-                                        "futures curve carries a risk premium and is not a forecast.\n\n"
-                                        + HOUSE_STYLE
-                                    )
-                                    ai_md(ai_agent.complete(
-                                        sysmsg, json.dumps(ctx, indent=1, default=str),
-                                        max_tokens=8000, effort="medium"))
-                                except Exception as _e:
-                                    ai_failed(_e)
+                        ctx, px_now = None, None
+                        one = cb_focus.split(" · ")[0] if cb_focus != "All central banks" else None
+                        try:
+                            _curve = cb_load_fed_curve(15)
+                            _fpath = cbk.implied_path(
+                                _curve, float(board.loc["USD", "rate"])
+                                if "USD" in board.index and pd.notna(board.loc["USD", "rate"]) else None)
+                            ctx = {
+                                "banks": [
+                                    {k: (None if pd.isna(v) else v) for k, v in row.items()
+                                     if not isinstance(v, (pd.Series, pd.DataFrame))} | {"ccy": c}
+                                    for c, row in board.iterrows()],
+                                "fed_futures_path": {k: v for k, v in _fpath.items()
+                                                     if not isinstance(v, (pd.Series, pd.DataFrame))},
+                                "summary_cards": [{k: c[k] for k in ("topic", "state", "text")} for c in cb_cards],
+                                "calendar": [e for e in fx_econ_events()
+                                             if not str(e.get("title") or "").lower().startswith("earnings")
+                                             and str(e.get("importance") or "").lower() == "high"][:25],
+                                "caveats": [
+                                    "Real rates are ex-post: the policy rate less realised inflation.",
+                                    "Inflation lags two to five months; the policy rate is current.",
+                                    "Fed funds futures exist for the dollar only and carry a risk premium.",
+                                ],
+                            }
+                            if _fpath.get("available") and not _curve.empty:
+                                cur = _fpath["current"]
+                                ctx["fed_market_implied"] = [
+                                    {"month": r["label"], "implied_rate": round(float(r["implied"]), 3),
+                                     "bp_from_today": round((float(r["implied"]) - cur) * 100, 1),
+                                     "quarter_point_moves_priced": round((float(r["implied"]) - cur) / 0.25, 2)}
+                                    for _, r in _curve.sort_values("months_out").iterrows()]
+                            if _HAS_FXA:
+                                fx_px, _ = fx_load_prices()
+                                if not fx_px.empty:
+                                    uv_cb = fxa.usd_values(fx_px)
+                                    if one and one != "USD" and one in uv_cb.columns:
+                                        ser = fxa.cross(uv_cb, one, "USD")
+                                        nm = f"{one}/USD"
+                                    else:
+                                        ser, nm = fx_dollar_index(uv_cb), "the dollar against the G10"
+                                    if len(ser) > 260:
+                                        ctx["forecast_inputs_currency"] = ar.forecast_inputs(
+                                            ser, name=nm, levels=ar.default_levels(ser))
+                                        px_now = float(ser.iloc[-1])
+                        except Exception:
+                            log.exception("central bank context failed")
+                        if ctx is not None:
+                            subject = ("global central-bank policy" if one is None
+                                       else f"the {board.loc[one, 'bank']} and the {one}")
+                            focus_txt = (
+                                "where policy is genuinely divergent and where the gap disappears once "
+                                "inflation is netted off, which banks are furthest from their cycle peak, "
+                                "and what the fed funds futures imply. The view is on the direction of "
+                                "global policy; scenarios cover the next one to three months of decisions"
+                                if one is None else
+                                f"the {board.loc[one, 'bank']}: its rate, last move and distance from its "
+                                "cycle peak, its real rate against the others, its stance against the "
+                                "Fed's and what that gap means for its currency. The view is on its policy "
+                                "direction; scenarios cover its next decisions and include the currency")
+                            sysmsg = (
+                                "You are a central-bank analyst at a research house. You get every "
+                                "covered bank's policy rate, inflation and real rate, its last move and "
+                                "distance from its cycle peak, the fed funds futures path (with the number "
+                                "of quarter-point moves priced each month), the high-impact calendar, "
+                                "summary cards, and forecast_inputs for the currency.\n\n"
+                                f"Cover {focus_txt}. For the Fed, start the scenario probabilities from "
+                                "what futures have priced and say where you differ from the market and "
+                                "why. No meeting minutes or speeches are in the data.\n\n"
+                                + ar.forecast_style(subject, view_scale=[
+                                    "Easing", "Leaning to ease", "On hold", "Leaning to tighten", "Tightening"]))
+                            ai_read_run("cb", cb_focus, sysmsg, ctx, price=px_now)
+                    st.markdown("---")
+                    ai_read_show("cb", cb_focus)
     else:
         locked_tab("cb")
 
@@ -6781,94 +6851,80 @@ look at the equity at all.
                         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                         mt_go = st.button(f"🤖 AI read: {mt_focus.replace('The whole ', '')} (1 credit)",
                                           type="primary", key="mt_ai", use_container_width=True)
-                    st.caption(
-                        "Reads the measured figures above, including gold ETF flows and "
-                        "central-bank purchases. It has no inventory data, no mine supply "
-                        "and no futures positioning, and says so when the question needs them."
-                    )
+                    ai_caption(mt_focus.replace("The whole ", "the whole "))
                     if mt_go:
-                        _err = ai_unavailable("read")
-                        if _err:
-                            st.error(f"AI read unavailable: {_err}.")
-                        else:
-                            with st.spinner("Reading…"):
-                                try:
-                                    fx_px, _ = fx_load_prices()
-                                    uv = (fxa.usd_values(fx_px)
-                                          if _HAS_FXA and not fx_px.empty else pd.DataFrame())
-                                    bd = mtl.board(mt_px)
-                                    rt = mtl.ratio_table(mt_px)
-                                    ctx = {
-                                        "window": mt_window,
-                                        "board": (bd.drop(columns=["note"], errors="ignore")
-                                                  .reset_index().to_dict("records")),
-                                        "themes": mtl.board(mt_px, mtl.THEMES)
-                                                  .reset_index().to_dict("records"),
-                                        "ratios": (rt.drop(columns=["asks"], errors="ignore")
-                                                   .reset_index().to_dict("records")),
-                                        "decomposition": {
-                                            name: {k: v for k, v in
-                                                   mtl.in_currencies(
-                                                       mt_px[m.yahoo], uv, days=win).items()
-                                                   if k != "per_currency"}
-                                            for name, m in mtl.METALS.items()
-                                            if m.yahoo in mt_px.columns and not uv.empty},
-                                        "driver_correlations":
-                                            mtl.driver_betas(mt_px, window=corr_win)
-                                            .reset_index().to_dict("records"),
-                                        "clusters": mtl.clustered(
-                                            mtl.correlations(
-                                                mt_px,
-                                                {m.name: m.yahoo for m in mtl.METALS.values()},
-                                                window=corr_win), 0.7),
-                                        "miners": mtl.miner_spread(mt_px, window=win)
-                                                  .reset_index().to_dict("records"),
-                                        "gold_buyers": _wgc_ai_context(),
-                                        "caveats": [
-                                            "Decomposition splits a dollar-quoted move into "
-                                            "the metal's part and the dollar's, using the "
-                                            "median return across currencies.",
-                                            "Ratio percentiles run from 2000 at the earliest "
-                                            "— as far back as these futures go.",
-                                            "gold_buyers holds World Gold Council monthly data: "
-                                            "gold ETF holdings and demand by region, and reported "
-                                            "central-bank purchases (these lag a month or two). "
-                                            "No inventory, mine supply or futures positioning "
-                                            "data is in this payload.",
-                                        ],
-                                    }
-                                    ctx["summary_cards"] = [{k: c[k] for k in ("topic", "state", "text")}
-                                                            for c in mt_cards]
-                                    ctx["focus"] = mt_focus
-                                    focus_txt = (
-                                        "the whole metals complex: what moved and whether it was the "
-                                        "metal or the dollar (use the decomposition), what the ratios "
-                                        "say one at a time, and who has been buying gold"
-                                        if mt_focus.startswith("The whole") else
-                                        f"{mt_focus}: its trend and where it sits in its range, how "
-                                        "much of its move was the metal and how much the dollar (use "
-                                        "the decomposition), which macro driver it has been trading "
-                                        "on, what its ratios against the other metals say, and "
-                                        + ("who has been buying it (ETF flows and central banks; "
-                                           "central-bank data lags a month or two)"
-                                           if mt_focus == "Gold" else
-                                           "whether the miners confirm it where miners exist"))
-                                    sysmsg = (
-                                        "You are a commodities strategist at a research house writing "
-                                        "a short note for investors. You get metal prices and returns, "
-                                        "the split of each move into the metal's part and the dollar's, "
-                                        "the classic ratios against their own history, correlations to "
-                                        "the dollar, US yields and stocks, mining shares against their "
-                                        "metal, World Gold Council buying data and summary cards already "
-                                        f"computed from them.\n\nFocus on {focus_txt}.\n\n"
-                                        "Never supply inventories, mine supply or positioning from "
-                                        "memory.\n\n" + HOUSE_STYLE
-                                    )
-                                    ai_md(ai_agent.complete(
-                                        sysmsg, json.dumps(ctx, indent=1, default=str),
-                                        max_tokens=8000, effort="medium"))
-                                except Exception as _e:
-                                    ai_failed(_e)
+                        ctx, px_now = None, None
+                        try:
+                            fx_px, _ = fx_load_prices()
+                            uv = (fxa.usd_values(fx_px)
+                                  if _HAS_FXA and not fx_px.empty else pd.DataFrame())
+                            bd = mtl.board(mt_px)
+                            rt = mtl.ratio_table(mt_px)
+                            ctx = {
+                                "board": (bd.drop(columns=["note"], errors="ignore")
+                                          .reset_index().to_dict("records")),
+                                "themes": mtl.board(mt_px, mtl.THEMES).reset_index().to_dict("records"),
+                                "ratios": (rt.drop(columns=["asks"], errors="ignore")
+                                           .reset_index().to_dict("records")),
+                                "decomposition": {
+                                    name: {k: v for k, v in
+                                           mtl.in_currencies(mt_px[m.yahoo], uv, days=win).items()
+                                           if k != "per_currency"}
+                                    for name, m in mtl.METALS.items()
+                                    if m.yahoo in mt_px.columns and not uv.empty},
+                                "driver_correlations":
+                                    mtl.driver_betas(mt_px, window=corr_win).reset_index().to_dict("records"),
+                                "clusters": mtl.clustered(
+                                    mtl.correlations(mt_px, {m.name: m.yahoo for m in mtl.METALS.values()},
+                                                     window=corr_win), 0.7),
+                                "miners": mtl.miner_spread(mt_px, window=win).reset_index().to_dict("records"),
+                                "gold_buyers": _wgc_ai_context(),
+                                "summary_cards": [{k: c[k] for k in ("topic", "state", "text")} for c in mt_cards],
+                                "caveats": [
+                                    "Decomposition splits a dollar-quoted move into the metal's part and "
+                                    "the dollar's, using the median return across currencies.",
+                                    "gold_buyers is World Gold Council monthly data; central-bank figures "
+                                    "lag a month or two. No inventory, mine supply or futures positioning "
+                                    "data is included.",
+                                ],
+                            }
+                            anchor = "Gold" if mt_focus.startswith("The whole") else mt_focus
+                            tk = mtl.METALS[anchor].yahoo
+                            if tk in mt_px.columns:
+                                ms = mt_px[tk].dropna()
+                                ctx["forecast_inputs"] = ar.forecast_inputs(
+                                    ms, name=anchor, levels=ar.default_levels(ms))
+                                px_now = float(ms.iloc[-1])
+                        except Exception:
+                            log.exception("metals context failed")
+                        if ctx is not None:
+                            focus_txt = (
+                                "the whole metals complex: what moved and whether it was the metal or "
+                                "the dollar (use the decomposition), what the ratios say one at a time, "
+                                "and who has been buying gold. Put the view and scenarios on gold as the "
+                                "reference metal"
+                                if mt_focus.startswith("The whole") else
+                                f"{mt_focus}: its trend and where it sits in its range, how much of its "
+                                "move was the metal and how much the dollar (use the decomposition), "
+                                "which macro driver it has been trading on, and what its ratios against "
+                                "the other metals say"
+                                + ("; and who has been buying it (ETF flows and central banks)"
+                                   if mt_focus == "Gold" else
+                                   "; and whether the miners confirm it where miners exist"))
+                            sysmsg = (
+                                "You are a commodities strategist at a research house. You get metal "
+                                "prices and returns, the split of each move into the metal's part and "
+                                "the dollar's, the classic ratios against their own history, "
+                                "correlations to the dollar, US yields and stocks, mining shares against "
+                                "their metal, World Gold Council buying data, summary cards, and "
+                                "forecast_inputs (base rates and volatility ranges from the metal's own "
+                                f"history).\n\nFocus on {focus_txt}. Never supply inventories, mine supply "
+                                "or positioning from memory.\n\n"
+                                + ar.forecast_style("gold and the metals complex" if mt_focus.startswith("The whole")
+                                                    else mt_focus))
+                            ai_read_run("metals", mt_focus, sysmsg, ctx, price=px_now)
+                    st.markdown("---")
+                    ai_read_show("metals", mt_focus)
     else:
         locked_tab("metals")
 
@@ -7652,41 +7708,38 @@ different and more durable thing than a direction.
                         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                         go_ai = st.button(f"🤖 AI read of {ai_coin} (1 credit)", type="primary",
                                           key="cr_ai", use_container_width=True)
-                    st.caption(
-                        "Reads the measured figures for that coin (trend, its link to bitcoin, "
-                        "funding and positioning) against the market backdrop above. It has no "
-                        "on-chain data, exchange flows or news, and says so when the question "
-                        "needs them.")
+                    ai_caption(ai_coin)
                     if go_ai:
-                        _err = ai_unavailable("read")
-                        if _err:
-                            st.error(f"AI read unavailable: {_err}.")
-                        else:
-                            with st.spinner(f"Reading {ai_coin}…"):
-                                try:
-                                    ctx = crypto_coin_context(ai_coin, universe, glob, closes,
-                                                              funding_all, mc_all, fg_all, cr_cards)
-                                    sysmsg = (
-                                        "You are a crypto strategist at a research house writing a "
-                                        f"short note on {ai_coin} for investors. You get the coin's "
-                                        "price history figures, its trend against its 50- and 200-day "
-                                        "averages, how tied it is to bitcoin (beta and the share of its "
-                                        "moves bitcoin explains), its funding rate and open interest, "
-                                        "and the state of the whole crypto market.\n\n"
-                                        "Answer, in this order of importance: where the coin stands "
-                                        "(trend, distance from its record); whether it is doing "
-                                        "anything of its own or is mostly a bitcoin position (for "
-                                        "bitcoin itself: whether it is trading like a risk asset or a "
-                                        "hedge, and its dominance); who is positioned through leverage "
-                                        "and what an unwind would mean; and how the market backdrop "
-                                        "helps or hurts it.\n\n" + HOUSE_STYLE)
-                                    read = ai_agent.complete(
-                                        sysmsg, json.dumps(ctx, indent=1, default=str),
-                                        max_tokens=8000, effort="medium")
-                                    st.markdown("---")
-                                    ai_md(read)
-                                except Exception as _e:
-                                    ai_failed(_e)
+                        ctx, px_now = None, None
+                        try:
+                            ctx = crypto_coin_context(ai_coin, universe, glob, closes,
+                                                      funding_all, mc_all, fg_all, cr_cards)
+                            if ai_coin in closes.columns:
+                                cs = closes[ai_coin].dropna()
+                                ctx["forecast_inputs"] = ar.forecast_inputs(
+                                    cs, horizons=(30, 90), periods_per_year=365, name=ai_coin,
+                                    levels=ar.default_levels(cs, 365))
+                                px_now = float(cs.iloc[-1])
+                        except Exception:
+                            log.exception("crypto context failed")
+                        if ctx is not None:
+                            sysmsg = (
+                                "You are a crypto strategist at a research house. You get the "
+                                f"figures for {ai_coin}: price changes, its trend against its 50- and "
+                                "200-day averages, how tied it is to bitcoin (beta and the share of "
+                                "its moves bitcoin explains), its funding rate and open interest, the "
+                                "state of the whole crypto market, and forecast_inputs (base rates "
+                                "and volatility ranges from its own history).\n\n"
+                                "Cover where the coin stands; whether it moves on its own or is "
+                                "mostly a bitcoin position (for bitcoin itself: whether it trades like "
+                                "a risk asset or a hedge, and its dominance); who is positioned "
+                                "through leverage and what an unwind would do; and how the market "
+                                "backdrop helps or hurts it. Crypto history here is short, so say how "
+                                "many cases the base rates rest on.\n\n"
+                                + ar.forecast_style(ai_coin))
+                            ai_read_run("crypto", ai_coin, sysmsg, ctx, price=px_now)
+                    st.markdown("---")
+                    ai_read_show("crypto", ai_coin)
     else:
         locked_tab("crypto")
 
@@ -8257,60 +8310,55 @@ industrials on P/B or EV/EBITDA, so read them against their own sector only.
 
                     # ---- AI read (its own button: it spends a credit) ----
                     with ft4:
-                        st.caption("Reads the figures above for this company and writes them up as a "
-                                   "short research note: the conclusion, the case for and against, and "
-                                   "what to check next.")
                         fund_run = st.button(f"🤖 AI read of {fund_sym} (1 credit)", key="fund_run",
                                              type="primary")
+                        ai_caption(name)
                         if fund_run:
-                            _err = ai_unavailable("read")
-                            if _err:
-                                st.error(f"AI read unavailable: {_err}.")
-                            else:
-                                with st.spinner("Reading the fundamentals…"):
-                                    try:
-                                        ctx = {
-                                            "company": name, "symbol": fund_sym,
-                                            "sector": rec.get("sector"),
-                                            "industry": rec.get("industry"),
-                                            "summary_cards": [{k: c[k] for k in ("topic", "state", "text")}
-                                                              for c in fund_cards],
-                                            "metrics": {k: v for k, v in rec.items()
-                                                        if not isinstance(v, (list, dict))},
-                                            "cash_flow": {"operating_cash_flow": rec_raw.get("operatingCashflow"),
-                                                          "net_income": rec_raw.get("netIncomeToCommon")},
-                                            "peer_comparison": (cmp_df.drop(columns=["note"]).to_dict("records")
-                                                                if not cmp_df.empty else []),
-                                            "peer_count": int(len(peers)),
-                                            "dupont": fnd.dupont(rec),
-                                            "observations": [fl["text"] for fl in fnd.quality_flags(rec)],
-                                            "range_position_pct": fnd.range_position(rec),
-                                        }
-                                        fund_system = (
-                                            "You are an equity analyst at a research house writing a "
-                                            f"short note on {name} for investors. You get the company's "
-                                            "metrics, its sector medians and percentiles (100 = the "
-                                            "favourable end), a DuPont split of its return on equity, "
-                                            "cash-flow figures and summary cards already computed from "
-                                            "them.\n\n"
-                                            "Cover, in this order: what you are paying for it against the "
-                                            "sector and against its own growth; whether the return is "
-                                            "earned by the business or by leverage (cite the DuPont "
-                                            "split); whether the profit turns into cash; then a **Bull "
-                                            "case:** and a **Bear case:** line, one or two sentences each, "
-                                            "built only from the figures; then what to check in the next "
-                                            "quarterly report.\n\n"
-                                            "Never invent revenue figures, segments, management comments "
-                                            "or competitors from memory. Trailing multiples mean nothing "
-                                            "on negative earnings; say so. If the peer set is small, say "
-                                            "the comparison is weak. No price target.\n\n" + HOUSE_STYLE)
-                                        read = ai_agent.complete(
-                                            fund_system, json.dumps(ctx, default=str, indent=2),
-                                            max_tokens=10000, effort="high")
-                                        st.markdown("---")
-                                        ai_md(read)
-                                    except Exception as e:
-                                        ai_failed(e)
+                            ctx, px_now = None, None
+                            try:
+                                ctx = {
+                                    "company": name, "symbol": fund_sym,
+                                    "sector": rec.get("sector"), "industry": rec.get("industry"),
+                                    "summary_cards": [{k: c[k] for k in ("topic", "state", "text")}
+                                                      for c in fund_cards],
+                                    "metrics": {k: v for k, v in rec.items() if not isinstance(v, (list, dict))},
+                                    "cash_flow": {"operating_cash_flow": rec_raw.get("operatingCashflow"),
+                                                  "net_income": rec_raw.get("netIncomeToCommon")},
+                                    "peer_comparison": (cmp_df.drop(columns=["note"]).to_dict("records")
+                                                        if not cmp_df.empty else []),
+                                    "peer_count": int(len(peers)),
+                                    "dupont": fnd.dupont(rec),
+                                    "observations": [fl["text"] for fl in fnd.quality_flags(rec)],
+                                    "range_position_pct": fnd.range_position(rec),
+                                }
+                                try:
+                                    h10 = fetch_yahoo_history(fund_sym, years=10, max_points=4000)["close"]
+                                except Exception:
+                                    h10 = fund_hist
+                                if h10 is not None and len(h10) > 260:
+                                    ctx["forecast_inputs"] = ar.forecast_inputs(
+                                        h10, name=fund_sym, levels=ar.default_levels(h10))
+                                    px_now = float(h10.iloc[-1])
+                            except Exception:
+                                log.exception("fundamentals context failed")
+                            if ctx is not None:
+                                fund_system = (
+                                    "You are an equity analyst at a research house. You get the company's "
+                                    "metrics, its sector medians and percentiles (100 = the favourable end), "
+                                    "a DuPont split of its return on equity, cash-flow figures, analyst "
+                                    "targets where present, summary cards, and forecast_inputs (base rates "
+                                    "and volatility ranges from ten years of its own price).\n\n"
+                                    "Cover what you are paying for it against the sector and against its "
+                                    "own growth; whether the return is earned by the business or by leverage "
+                                    "(cite the DuPont split); whether the profit turns into cash; and what "
+                                    "the next quarterly report has to show. The view is on the share price. "
+                                    "Never invent revenue figures, segments, management comments or "
+                                    "competitors from memory. Trailing multiples mean nothing on negative "
+                                    "earnings; say so. If the peer set is small, say the comparison is weak.\n\n"
+                                    + ar.forecast_style(f"{name} ({fund_sym})"))
+                                ai_read_run("fund", fund_sym, fund_system, ctx, price=px_now)
+                        st.markdown("---")
+                        ai_read_show("fund", fund_sym)
     else:
         locked_tab("fund")
 
@@ -8486,8 +8534,8 @@ every 20 minutes, and the week's economic calendar.
                     + "</div>", unsafe_allow_html=True)
 
         st.markdown("#### The detail")
-        nt1, nt2, nt3 = st.tabs(["📰 All headlines", "📅 This week's calendar",
-                                 "🤖 AI read for an asset (1 credit)"])
+        # the AI read comes first; the raw headlines are last
+        nt3, nt2, nt1 = st.tabs(["🤖 AI market read", "📅 This week's calendar", "📰 All headlines"])
 
         with nt1:
             if news_df.empty:
@@ -8555,31 +8603,35 @@ every 20 minutes, and the week's economic calendar.
                 st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                 go_news = st.button("🤖 AI read (1 credit)", type="primary", key="news_ai_run",
                                     use_container_width=True)
-            st.caption("Reads the recent headlines about this asset, its current technical state and "
-                       "this week's calendar, and says what they imply and what to watch. A reading of "
-                       "the news, not a tested prediction.")
+            ai_caption(f"what the news means for {focus_asset}" if focus_asset != ar.GLOBAL_FOCUS
+                       else "the global market")
+            if focus_asset == ar.GLOBAL_FOCUS:
+                st.caption("The global read is written automatically three times a day (07:30, 13:30 and "
+                           "20:30 UTC) and is free to read. Writing a fresh one now costs 1 credit.")
             news_items = news_df.to_dict("records") if not news_df.empty else []
             if go_news and news_items:
-                news_forecast = run_news_forecast(df_global=global_signals_cached(),
-                                                  df_crypto=df_crypto_for_ai,
-                                                  latest_news_items=news_items, focus_asset=focus_asset)
-                st.session_state["news_forecast"] = news_forecast
-                st.session_state["news_forecast_asset"] = focus_asset
-                if not str(news_forecast).startswith("⚠️"):
-                    save_news_forecast(focus_asset, news_forecast)
-            news_forecast = st.session_state.get("news_forecast")
-            if news_forecast and st.session_state.get("news_forecast_asset") == focus_asset:
-                st.markdown("---")
-                ai_md(news_forecast)
+                raw = run_news_forecast(df_global=global_signals_cached(), df_crypto=df_crypto_for_ai,
+                                        latest_news_items=news_items, focus_asset=focus_asset)
+                if str(raw).startswith("⚠️"):
+                    st.warning(raw)
+                else:
+                    clean, meta = ar.split_view(raw)
+                    st.session_state[f"ai_out:news:{focus_asset}"] = {
+                        "text": clean, "meta": meta, "mine": True,
+                        "ts": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")}
+                    ar.save_read("news", focus_asset, clean, meta)
+                    save_news_forecast(focus_asset, clean)
+                    ar.record_call("news", focus_asset, meta, st.session_state.get("news_last_price"))
+            st.markdown("---")
+            if st.session_state.get(f"ai_out:news:{focus_asset}") or ar.load_read("news", focus_asset):
+                ai_read_show("news", focus_asset)
             else:
-                stored = load_news_forecast(focus_asset)
+                stored = load_news_forecast(focus_asset)          # reads written before the new format
                 if stored:
-                    st.caption(f"Latest read for {focus_asset}, written {stored['ts']} UTC. Run it again "
-                               "for one based on the newest headlines.")
-                    st.markdown("---")
+                    st.caption(f"Latest read on {focus_asset}, written {stored['ts']} UTC.")
                     ai_md(stored["text"])
                 else:
-                    st.info(f"No read for {focus_asset} yet. Press the button to write one from the "
+                    st.info(f"No read on {focus_asset} yet. Press the button to write one from the "
                             "latest headlines.")
     else:
         locked_tab("news")
@@ -8831,7 +8883,20 @@ than tuned.
             tf_binance_q = ac2.selectbox("Binance timeframe", options=["1d", "4h", "1h", "15m"], index=0, key="quant_tf")
             mc_sims_q = ac3.number_input("Monte Carlo sims", min_value=1000, max_value=50000, value=10000, step=1000, key="quant_sims")
 
+        # The settings are captured when Run is pressed and the result is redrawn from them on
+        # every rerun, so it survives switching tabs and changing a widget does nothing until
+        # Run is pressed again.
         if run_quant_btn:
+            st.session_state["quant_run"] = {
+                "asset": focus_asset_q, "custom": custom_symbol_resolved, "src": source_pref_q,
+                "lookback": lookback_days_q, "horizon": horizon_label_q, "jump": jump_z_q,
+                "tf": tf_binance_q, "sims": mc_sims_q}
+        _qr = st.session_state.get("quant_run")
+        if _qr:
+            focus_asset_q, custom_symbol_resolved, source_pref_q = _qr["asset"], _qr["custom"], _qr["src"]
+            lookback_days_q, horizon_label_q, jump_z_q = _qr["lookback"], _qr["horizon"], _qr["jump"]
+            tf_binance_q, mc_sims_q = _qr["tf"], _qr["sims"]
+        if _qr:
             # Manual text input wins over the dropdown when it successfully resolves.
             if custom_symbol_resolved:
                 sym = custom_symbol_resolved
@@ -8858,7 +8923,7 @@ than tuned.
                         # histogram below both read from this sample.
                         mc_result = monte_carlo_forward_distribution(
                             close_series, horizon_bars=int(horizon_bars),
-                            sims=int(mc_sims_q), return_samples=True,
+                            sims=int(mc_sims_q), return_samples=True, seed=7,
                         )
                         qm = compute_quant_metrics(close_series, bars_per_year=bpy, jump_z=float(jump_z_q),
                                                    horizon_bars=int(horizon_bars), mc=mc_result)

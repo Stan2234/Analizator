@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
+import ai_bubble
 import ai_reads as ar
 
 log = logging.getLogger("analizator.app")
@@ -161,6 +162,9 @@ def resolve_user() -> None:
         verified = bool(c.get("email_verified"))
         if st.query_params.get("checkout") == "done":
             billing.forget(email)
+        if access.is_owner_email(email, verified):
+            s.user = {**access.owner(), "email": email}
+            return
         sub = billing.plan_for_email(email) if (verified and email) else None
         if sub:
             s.user = {"customer": sub["customer"], "tier": sub["plan"], "email": email}
@@ -173,13 +177,7 @@ def resolve_user() -> None:
 
 
 def current_user():
-    """The visitor, or, when the owner previews a plan, a stand-in on that plan."""
-    u = st.session_state.get("user") or access.free()
-    view = st.session_state.get("view_as", "owner")
-    if u.get("tier") == "owner" and view in ["free", *access.TIERS]:
-        return {"customer": f"cus_owner_preview_{view}" if view != "free" else None,
-                "tier": view, "preview": True}
-    return u
+    return st.session_state.get("user") or access.free()
 
 
 def _ad_ref() -> str:
@@ -208,7 +206,7 @@ def _checkout_links() -> Dict[Any, str]:
 def _portal_link() -> Optional[str]:
     s = st.session_state
     u = current_user()
-    if not s.get("portal_link") and u.get("customer", "").startswith("cus_") and not u.get("preview"):
+    if not s.get("portal_link") and (u.get("customer") or "").startswith("cus_"):
         try:
             s.portal_link = billing.portal_url(u["customer"], APP_URL + "/")
         except Exception:
@@ -226,7 +224,7 @@ def plans_panel(key: str) -> None:
     Not signed in: checkout through AI Bubble Tracker, no account needed (see access.checkout_url)."""
     u = current_user()
     can_buy = (AUTH_ENABLED and billing.ENABLED and st.user.is_logged_in
-               and u.get("email") and not u.get("unverified") and not u.get("preview"))
+               and u.get("email") and not u.get("unverified"))
     links = {}
     if can_buy:
         try:
@@ -247,7 +245,7 @@ def plans_panel(key: str) -> None:
                                type="primary" if plan == "plus" else "secondary", use_container_width=True)
                 st.link_button(f"{access.TIER_NAMES[plan]} yearly · 2 months free", links[(plan, "year")],
                                use_container_width=True)
-    if not links and not u.get("preview") and billing.ENABLED:
+    if not links and billing.ENABLED:
         # No account needed to buy: checkout runs through AI Bubble Tracker, Stripe asks for the
         # email, and the buyer comes back here with the plan unlocked in this browser.
         for col, plan in zip(cols, access.TIERS):
@@ -288,9 +286,7 @@ def locked_tab(tab: str) -> None:
     else:
         st.info(f"🔒 This tab is part of {plan}.")
     u = current_user()
-    if u.get("preview"):
-        st.caption("(Owner preview: a visitor sees the plans and a way to buy or upgrade here.)")
-    elif access.paid(u):
+    if access.paid(u):
         link = _portal_link()
         if link:
             st.link_button(f"Upgrade to {need}", link, type="primary")
@@ -321,26 +317,24 @@ with st.sidebar:
                 st.logout()
         elif _real.get("tier") != "owner":
             login_button()
-    if _real.get("tier") == "owner":
-        st.selectbox("View as", ["owner", "free", *access.TIERS], key="view_as",
-                     format_func=lambda t: "Owner (everything)" if t == "owner" else (
-                         "Visitor without a plan" if t == "free" else f"{access.TIER_NAMES[t]} customer"),
-                     help="See exactly what a visitor or a subscriber on that plan sees. AI calls still "
-                          "run for real and cost API money; credits are counted on a separate preview account.")
     _u = current_user()
-    st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}" + (" (preview)" if _u.get("preview") else ""))
+    st.markdown(f"**Plan:** {access.TIER_NAMES[_u['tier']]}")
     if _u.get("unverified"):
         st.warning("Verify your email (check your inbox), then log out and log in again to see your plan.")
     _left = access.credits_left(_u)
-    if access.paid(_u):
+    if _u["tier"] == "owner":
+        st.markdown("**AI credits:** unlimited · every tab open")
+    elif access.paid(_u):
         st.markdown(f"**AI credits:** {_left} of {access.CREDITS[_u['tier']]} left · reset {access.next_reset():%d %b}")
         st.caption("AI read 1 · news forecast 1 · analyst question 3 · FOMC read 3 · Deep Brief up to 10")
-        _pl = None if _u.get("preview") else _portal_link()
+        _pl = _portal_link()
         if _pl:
             st.link_button("Change plan, card or invoices", _pl)
     elif _u["tier"] == "free":
-        st.caption("Global Signals is free. The 🔒 tabs and the AI features come with a plan.")
-    if _real.get("tier") != "owner":
+        st.caption("Each tab's summary is free. The full tabs and the AI features come with a plan.")
+    # Production signs the owner in by account email (access.OWNER_EMAILS). The password is
+    # only for a local run, where Auth0 is not configured.
+    if not AUTH_ENABLED and _real.get("tier") != "owner":
         with st.expander("Owner"):
             _pwd = st.text_input("Owner password", type="password", key="owner_pwd")
             _expected = os.environ.get("APP_PASSWORD", "")
@@ -2006,6 +2000,16 @@ def ai_md(text: str) -> None:
     """Show model-written text. Streamlit reads a pair of dollar signs as a formula, so
     "$2.75tn ... $81,450" came out as green monospace; every dollar is escaped first."""
     st.markdown(re.sub(r"(?<!\\)\$", r"\\$", text or ""))
+
+
+def bubble_charts(chart_ids: List[str], key: str) -> None:
+    """The AI Bubble Tracker charts the analyst asked to show under its answer."""
+    for cid in chart_ids:
+        fig = ai_bubble.chart(cid)
+        if fig is None:
+            continue
+        st.plotly_chart(fig, use_container_width=True, key=f"bubble_{key}_{cid}")
+        st.caption(f"Chart from AI Bubble Tracker · [open the page]({ai_bubble.link(ai_bubble.CHARTS[cid][1])})")
 
 
 def ai_caption(subject: str) -> None:
@@ -9492,7 +9496,9 @@ with tab_ai:
 A conversation with Claude (Anthropic's model) that can look things up in this
 app's data instead of answering from memory: news, live quotes, technical
 indicator state, company fundamentals, FRED macro series, the economic
-calendar, institutional filings, analyst estimates and the crypto market.
+calendar, institutional filings, analyst estimates and the crypto market. It also
+reads AI Bubble Tracker (its figures, checks, weekly brief and charts) and the
+full text of any company's SEC filings, such as a new IPO's S-1.
 
 - **Each question costs 3 credits**, however many lookups the agent needs. A
   question that fails is refunded.
@@ -9512,8 +9518,9 @@ The conversation stays in this browser tab; a refresh starts a new one.
             f"{len(src_mod.RSS_FEEDS) if _HAS_SRC else 29} RSS feeds), market quotes "
             "(Yahoo, Binance), technical indicator state, company fundamentals with "
             "sector comparison, FRED macro series, the economic calendar, SEC filings "
-            "for ten large institutions, Finnhub analyst estimates, and the crypto "
-            "market aggregate. It reads live data rather than answering from memory, "
+            "for ten large institutions, Finnhub analyst estimates, the crypto "
+            "market aggregate, AI Bubble Tracker's data and charts, and the full text of "
+            "any company's SEC filings. It reads live data rather than answering from memory, "
             "and will tell you when a tool returns nothing."
         )
 
@@ -9576,6 +9583,7 @@ The conversation stays in this browser tab; a refresh starts a new one.
                     st.markdown(f"**You:** {q}")
                     st.markdown("---")
                     ai_md(a)
+                    bubble_charts(entry.get("charts", []), key=f"h{i}")
                     if tools:
                         with st.expander(f"🔧 Tools used ({len(tools)})", expanded=False):
                             for tc in tools:
@@ -9597,14 +9605,19 @@ The conversation stays in this browser tab; a refresh starts a new one.
                             st.session_state["agent_messages"] = result["messages"]
                             answer_text = result["text"]
                             tool_calls = result.get("tool_calls", [])
+                            charts = list(dict.fromkeys(
+                                str(tc["args"].get("chart")) for tc in tool_calls
+                                if tc["name"] == "show_ai_bubble_chart"))[:3]
                             # Save to display history
                             st.session_state["agent_display_history"].append({
                                 "q": user_input,
                                 "a": answer_text,
                                 "tools": tool_calls,
+                                "charts": charts,
                             })
                             # Show the latest answer fully visible
                             ai_md(answer_text)
+                            bubble_charts(charts, key="new")
                             if tool_calls:
                                 with st.expander(f"🔧 Tools used ({len(tool_calls)})"):
                                     for tc in tool_calls:

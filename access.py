@@ -5,8 +5,9 @@ subscription and sends them here with a short signed pass:
 
     base64url("cus_…|plus|1760000000") + "." + hmac_sha256(secret, that)[:32]
 
-The secret (ANALIZATOR_SSO_SECRET) is shared by the two apps. The owner still
-signs in with APP_PASSWORD and gets everything without a credit limit.
+The secret (ANALIZATOR_SSO_SECRET) is shared by the two apps. The owner signs in
+with a verified account email in OWNER_EMAILS and gets everything without a credit
+limit (a local run without Auth0 falls back to APP_PASSWORD).
 
 Credits pay for AI calls at roughly $0.10 of API cost each (measured on Opus
 5.5): a panel read 1, the news forecast 1, an analyst question 3, an FOMC read
@@ -28,6 +29,8 @@ from typing import Any, Dict, Optional
 import data_layer as dl
 
 SSO_SECRET = os.environ.get("ANALIZATOR_SSO_SECRET", "").strip()
+OWNER_EMAILS = {e.strip().lower() for e in
+                os.environ.get("OWNER_EMAILS", "02.25.stan@gmail.com").split(",") if e.strip()}
 AI_BUBBLE_URL = os.environ.get("AI_BUBBLE_URL", "https://ai-bubble-tracker.onrender.com").rstrip("/")
 
 TIERS = ["basic", "plus", "pro"]
@@ -98,6 +101,12 @@ def _verify_remote(token: str) -> Optional[Dict[str, Any]]:
 
 def owner() -> Dict[str, Any]:
     return {"customer": None, "tier": "owner"}
+
+
+def is_owner_email(email: Optional[str], verified: bool) -> bool:
+    """The owner's account: every tab and unlimited credits. Only a verified email counts,
+    or anyone could sign up with the address and skip the inbox check."""
+    return bool(verified and email and email.strip().lower() in OWNER_EMAILS)
 
 
 def free(email: Optional[str] = None) -> Dict[str, Any]:

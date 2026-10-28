@@ -19,6 +19,7 @@ import logging
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
+import ai_bubble
 import data_layer as dl
 import sources as src
 
@@ -412,6 +413,46 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "get_ai_bubble",
+        "description": (
+            "This site's AI Bubble Tracker: whether the money going into the AI boom and the money coming out "
+            "are diverging, built from SEC XBRL filings, FRED, Yahoo, TSMC, Census, FINRA and sourced press "
+            "figures, with the tracker's own conclusions (18 checks in calm / watch / diverging zones and a "
+            "weekly brief). Sections: " + "; ".join(f"{k} = {v[1]}" for k, v in ai_bubble.SECTIONS.items())
+            + ". Each answer carries its data date, a link to the page and the charts you can show."),
+        "input_schema": {"type": "object", "properties": {
+            "section": {"type": "string", "enum": list(ai_bubble.SECTIONS)},
+            "ticker": {"type": "string", "description": "for section=company: the tracked ticker"}},
+            "required": ["section"]}
+    },
+    {
+        "name": "show_ai_bubble_chart",
+        "description": ("Put one of AI Bubble Tracker's charts under your answer: "
+                        + "; ".join(f"{k} = {v[0]}" for k, v in ai_bubble.CHARTS.items())
+                        + ". Use it when a chart makes the point faster than words, at most three per answer, "
+                          "and refer to it in the text as the chart below."),
+        "input_schema": {"type": "object", "properties": {
+            "chart": {"type": "string", "enum": list(ai_bubble.CHARTS)}}, "required": ["chart"]}
+    },
+    {
+        "name": "get_sec_filing",
+        "description": (
+            "Read a company's SEC filing itself and get the passages and table rows that match your phrases. "
+            "Use it for figures that exist only in a filing's text: a new IPO's revenue, net loss, cash burn "
+            "and cash on hand from its S-1 (an S-1 has no XBRL data), guidance in an 8-K, segment detail, "
+            "commitments or risk factors in a 10-K or 10-Q. Works for companies without a ticker yet (e.g. "
+            "Anthropic). Table rows come back on one line with the column values separated by |; read the "
+            "column headers a few lines above. A prospectus takes 10-20 seconds the first time."),
+        "input_schema": {"type": "object", "properties": {
+            "company": {"type": "string", "description": "ticker or company name, e.g. NVDA or Anthropic"},
+            "form": {"type": "string", "description": "S-1 (includes S-1/A, F-1, 424B4), 10-K (includes 20-F), "
+                                                      "10-Q, 8-K, DEF 14A, or latest"},
+            "query": {"type": "string", "description": "phrases to find, separated by ; e.g. 'net loss; net cash "
+                                                       "provided by (used in) operating activities; cash and cash "
+                                                       "equivalents'"}},
+            "required": ["company", "query"]}
+    },
+    {
         "name": "get_forecast_inputs",
         "description": "Base rates and volatility ranges for any Yahoo symbol (stocks, indices, futures like GC=F, FX like EURUSD=X, crypto like BTC-USD), from up to ten years of daily prices: how often the price was higher 1 and 3 months later from the same trend state as today, the median move and the 10th-90th percentile spread, the 1- and 2-sigma price ranges for each horizon, the chance of trading through the key moving averages and the 52-week high/low, and those levels. Call this before putting probabilities on scenarios for an asset.",
         "input_schema": {"type": "object", "properties": {
@@ -709,7 +750,35 @@ def _tool_get_forecast_inputs(args: Dict[str, Any]) -> Any:
                                     levels=ai_reads.default_levels(s, ppy))
 
 
+def _tool_get_ai_bubble(args: Dict[str, Any]) -> Any:
+    return ai_bubble.section(args.get("section") or "overview", ticker=args.get("ticker"))
+
+
+def _tool_show_ai_bubble_chart(args: Dict[str, Any]) -> Any:
+    """The app draws the chart under the answer from this call; the model only learns it worked."""
+    cid = str(args.get("chart") or "")
+    fig = ai_bubble.chart(cid) if cid in ai_bubble.CHARTS else None
+    if fig is None:
+        return {"error": f"chart {cid} is not available", "charts": list(ai_bubble.CHARTS)}
+    title, tab = ai_bubble.CHARTS[cid]
+    return {"shown": True, "title": title, "page": ai_bubble.link(tab),
+            "y_axis": fig.layout.yaxis.title.text, "what_it_shows": ai_bubble.chart_summary(fig),
+            "note": "describe the chart with these figures, not from memory"}
+
+
+def _tool_get_sec_filing(args: Dict[str, Any]) -> Any:
+    import sec_docs
+    try:
+        return sec_docs.read_filing(str(args.get("company") or ""), str(args.get("form") or "latest"),
+                                    str(args.get("query") or ""))
+    except Exception as e:
+        return {"error": f"EDGAR read failed: {type(e).__name__}: {e}"}
+
+
 TOOL_DISPATCH = {
+    "get_ai_bubble":                _tool_get_ai_bubble,
+    "show_ai_bubble_chart":         _tool_show_ai_bubble_chart,
+    "get_sec_filing":               _tool_get_sec_filing,
     "get_forecast_inputs":          _tool_get_forecast_inputs,
     "search_news":                  _tool_search_news,
     "get_market_quote":             _tool_get_market_quote,
@@ -737,6 +806,8 @@ TOOL_DISPATCH = {
 SYSTEM_PROMPT = """You are Analizator, an autonomous markets and macro analyst with live tool access to a database of news, market quotes, technical signals, economic calendar events, FRED macro series, SEC filings (13F/Form 4/8-K) for major institutions (JPMorgan, Goldman Sachs, BlackRock, Berkshire, Bridgewater, Renaissance, Citadel, Two Sigma, Point72, Tiger Global), Finnhub analyst data, and a global crypto market overview (CoinGecko + Fear & Greed).
 
 You ALSO have access to the full S&P 500 symbol universe (~489 companies tagged with GICS sector and industry) plus 11 major indices (^GSPC, ^NDX, ^DJI, ^RUT, ^VIX, ^TNX, DX-Y.NYB, CL=F, ^FTSE, ^GDAXI, ^N225). Use search_universe to look up tickers by company name, get_top_movers for today's biggest gainers/losers, and get_sector_performance for sector rotation analysis.
+
+You also read this site's AI Bubble Tracker (get_ai_bubble, with its charts through show_ai_bubble_chart) and any company's SEC filings in full text (get_sec_filing).
 
 Your job is to answer the user's questions freely, like an intelligent analyst. There are no scripted answers. Use your tools whenever they would help — usually they will. Chain multiple tools when useful (e.g. pull a quote + signal + news for the same symbol before answering).
 
@@ -766,6 +837,18 @@ Rules:
   multiple. Trailing multiples are meaningless on negative earnings; say so
   rather than interpreting them.
 - When asked about sector rotation, leadership, or laggards, call get_sector_performance.
+- For anything about the AI boom (hyperscaler capex and cash flow, Nvidia, OpenAI and
+  Anthropic finances, circular deals, data-center leases, AI valuations, credit, margin
+  debt, power, GPUs, TSMC), call get_ai_bubble before answering: it holds the tracker's
+  figures and its own conclusions (the checks and the weekly brief). Name AI Bubble
+  Tracker as the source and give the page link. Figures on the private labs are press
+  reports, leaks or company projections unless marked otherwise; say which.
+- When one of AI Bubble Tracker's charts makes the point faster than words, call
+  show_ai_bubble_chart (at most three per answer) and refer to "the chart below".
+- For figures that exist only in a filing's text, such as a new IPO's losses, cash burn
+  and cash on hand from its S-1, guidance in an 8-K or a risk factor, call
+  get_sec_filing and quote the figures with the form, the filing date and the link.
+  Prefer the filing to press summaries of it, and check the period each column covers.
 - Format prices to a sensible number of decimals. Use thousand separators for big numbers.
 - If the user asks something outside markets/macro, answer briefly and offer to bring it back to markets.
 - Write the answer the way a research note is written. Open with the answer itself in
@@ -779,6 +862,11 @@ Rules:
   when two pull opposite ways say which is winning now.
 - Never refuse a question just because data is incomplete — give your best read,
   state plainly which part is missing, and say what it would take to close the gap.
+  Whenever you say a figure or result is not available to you, add straight after
+  that sentence, in brackets, an offer naming exactly what is missing, in this form:
+  "(If you give me the <the missing figures or results>, for example by pasting them
+  here, I'll give you a full analysis.)" Only make the offer after the tools have
+  come back empty, never instead of calling them.
 - Today's date in UTC: {today}
 """
 
@@ -792,7 +880,9 @@ def _build_system_prompt() -> str:
 def _route_model(user_msg: str) -> str:
     """Cheap heuristic: short factual = haiku, otherwise opus."""
     if len(user_msg) < 80 and not any(k in user_msg.lower() for k in
-                                       ("analyz", "explain", "why", "compare", "scenario", "risk", "forecast", "outlook")):
+                                       ("analyz", "explain", "why", "compare", "scenario", "risk", "forecast", "outlook",
+                                        # reading a filing or the tracker's accounts needs the stronger model
+                                        "s-1", "10-k", "10-q", "filing", "ipo", "bubble", "runway", "burn")):
         return HAIKU_MODEL
     return OPUS_MODEL
 

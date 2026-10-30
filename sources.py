@@ -602,19 +602,26 @@ def fetch_fred_observations(api_key: str, series_id: str, limit: int = 50) -> Li
 
 FH_BASE = "https://finnhub.io/api/v1"
 
-def fetch_finnhub_earnings_calendar(api_key: str, days_ahead: int = 14) -> List[Dict[str, Any]]:
+def fetch_finnhub_earnings_calendar(api_key: str, days_ahead: int = 14,
+                                    days_back: int = 0) -> List[Dict[str, Any]]:
     if not api_key:
         return []
+    # Finnhub returns at most 1,500 rows a request, which a week of earnings season fills,
+    # so the range goes in three-day windows.
     today = dt.date.today()
-    to = today + dt.timedelta(days=days_ahead)
-    r = _get(f"{FH_BASE}/calendar/earnings",
-             params={"from": today.isoformat(), "to": to.isoformat(), "token": api_key})
-    if not r:
-        return []
-    try:
-        return r.json().get("earningsCalendar") or []
-    except Exception:
-        return []
+    start, end = today - dt.timedelta(days=days_back), today + dt.timedelta(days=days_ahead)
+    out: Dict[tuple, Dict[str, Any]] = {}
+    while start <= end:
+        stop = min(end, start + dt.timedelta(days=2))
+        r = _get(f"{FH_BASE}/calendar/earnings",
+                 params={"from": start.isoformat(), "to": stop.isoformat(), "token": api_key})
+        try:
+            for e in (r.json().get("earningsCalendar") or []) if r else []:
+                out[(e.get("symbol"), e.get("date"))] = e
+        except Exception:
+            pass
+        start = stop + dt.timedelta(days=1)
+    return sorted(out.values(), key=lambda e: (e.get("date") or "", e.get("symbol") or ""))
 
 
 def fetch_finnhub_economic_calendar(api_key: str) -> List[Dict[str, Any]]:

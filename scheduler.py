@@ -110,8 +110,11 @@ def job_refresh_finnhub_calendars() -> None:
         api_key = _get_secret("FINNHUB_API_KEY")
         if not api_key:
             return
-        # Earnings
-        earnings = src.fetch_finnhub_earnings_calendar(api_key, days_ahead=14)
+        # Earnings. The last week is fetched too: a report's actual figures only arrive
+        # after the day, and the Stocks tab counts beats and misses from them.
+        earnings = src.fetch_finnhub_earnings_calendar(api_key, days_ahead=14, days_back=8)
+        if earnings:
+            dl.kv_set("earnings_calendar", {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "rows": earnings})
         events = []
         for e in earnings:
             d = e.get("date")
@@ -149,6 +152,43 @@ def job_refresh_finnhub_calendars() -> None:
         log.info("finnhub calendars job: %d events", n)
     except Exception as e:
         log.exception("job_refresh_finnhub_calendars failed: %s", e)
+
+
+def _sp500_members() -> list:
+    return [m for m in dl.universe_all(asset_types=["equity"]) if m.get("symbol")]
+
+
+def job_stock_breadth() -> None:
+    """Breadth of the S&P 500 (share above the 50/200-day averages, highs and lows, each
+    member's returns) from two years of member closes, for the Stocks tab."""
+    try:
+        import equities
+        out = equities.compute_breadth(_sp500_members())
+        if out:
+            dl.kv_set("stock_breadth", out)
+            log.info("stock breadth: %s stocks, %.1f%% above 200-day", out["n"], out["pct_above_200"] or 0)
+    except Exception as e:
+        log.exception("job_stock_breadth failed: %s", e)
+
+
+def job_market_valuation() -> None:
+    """Bottom-up valuation of the S&P 500 from every member's quote summary; each day is kept
+    in a history so the P/E gets a past."""
+    try:
+        import equities
+        out = equities.compute_valuation(_sp500_members())
+        if not out:
+            return
+        dl.kv_set("market_valuation", out)
+        hist = [h for h in dl.kv_get("market_valuation_history", []) or [] if h.get("date") != out["as_of"]]
+        ix = out["index"]
+        hist.append({"date": out["as_of"], "trailing_pe": ix["trailing_pe"], "forward_pe": ix["forward_pe"],
+                     "earnings_yield_fwd_pct": ix["earnings_yield_fwd_pct"], "top10_share_pct": out["top10_share_pct"],
+                     "forward_pe_without_top10": out["without_top10"]["forward_pe"]})
+        dl.kv_set("market_valuation_history", hist[-3000:])
+        log.info("market valuation: %s, forward P/E %s", out["coverage"], ix["forward_pe"])
+    except Exception as e:
+        log.exception("job_market_valuation failed: %s", e)
 
 
 def job_refresh_macro_calendar() -> None:
@@ -386,6 +426,14 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
                           id="free_market_read", replace_existing=True)
         sched.add_job(job_refresh_sp500_universe, CronTrigger(hour=2, minute=30),
                       id="sp500_universe", replace_existing=True)
+        # After the US close; also soon after a restart when the stored copy is from an earlier day.
+        stale = lambda key: str((dl.kv_get(key) or {}).get("as_of", "")) < dt.date.today().isoformat()
+        sched.add_job(job_stock_breadth, CronTrigger(day_of_week="mon-fri", hour=21, minute=15),
+                      id="stock_breadth", replace_existing=True,
+                      **({"next_run_time": soon(6)} if stale("stock_breadth") else {}))
+        sched.add_job(job_market_valuation, CronTrigger(day_of_week="mon-fri", hour=22, minute=0),
+                      id="market_valuation", replace_existing=True,
+                      **({"next_run_time": soon(9)} if stale("market_valuation") else {}))
 
         # Optional: scheduled deep brief generation (opt-in via env var)
         if _get_secret("ENABLE_SCHEDULED_BRIEF", "").lower() in ("1", "true", "yes", "on"):

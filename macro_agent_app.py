@@ -23,6 +23,7 @@ import logging
 
 import ai_bubble
 import ai_reads as ar
+import equities as eqm
 
 log = logging.getLogger("analizator.app")
 
@@ -266,7 +267,7 @@ def plans_panel(key: str) -> None:
 
 # Tabs whose summary ("… today" cards and the key chart) is free: a visitor sees what the tab
 # says before paying, and the plan unlocks everything from "The detail" down.
-FREE_SUMMARY_TABS = {"fx", "carry", "cb", "metals", "crypto", "fund", "news"}
+FREE_SUMMARY_TABS = {"stocks", "fx", "carry", "cb", "metals", "crypto", "fund", "news"}
 
 
 def tab_unlocked(tab: str) -> bool:
@@ -3580,12 +3581,12 @@ st.caption(f"Last update time (UTC): {now}")
 st.markdown("---")
 
 _TAB_LABELS = [
-    ("global", "🌍 Global Signals"), ("fx", "💱 Currencies"), ("carry", "💴 Carry Trade"),
-    ("cb", "🏦 Central Banks"), ("metals", "🥇 Metals"), ("crypto", "🪙 Crypto"),
+    ("global", "🌍 Global Signals"), ("stocks", "📈 Stocks"), ("fx", "💱 Currencies"),
+    ("carry", "💴 Carry Trade"), ("cb", "🏦 Central Banks"), ("metals", "🥇 Metals"), ("crypto", "🪙 Crypto"),
     ("fund", "📐 Fundamentals"), ("news", "📰 News & Macro"), ("quant", "🧮 Quant Lab"),
     ("ai", "🤖 AI Analyst"), ("fomc", "🏛 FOMC Lab"), ("brief", "🎯 Deep Brief"),
 ]
-(tab_global, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
+(tab_global, tab_stocks, tab_fx, tab_carry, tab_cb, tab_metals, tab_crypto, tab_fund,
  tab_news, tab_quant, tab_ai, tab_fomc, tab_brief) = st.tabs(
     [label if tab_visible(key) else f"🔒 {label}" for key, label in _TAB_LABELS]
 )
@@ -7784,6 +7785,518 @@ different and more durable thing than a direction.
                         ai_read_show("crypto", ai_coin)
     else:
         locked_tab("crypto")
+
+
+# -------- STOCKS TAB --------
+# The stock market as an asset class: the indices, how many stocks take part (breadth),
+# which sectors lead, the earnings season and what the market costs. The heavy parts,
+# breadth and the bottom-up valuation, are computed once a day by jobs in scheduler.py.
+
+STOCK_AI_TARGETS = {"S&P 500": "^GSPC", "Nasdaq-100": "^NDX", "Russell 2000": "^RUT", "Dow Jones": "^DJI"}
+STOCK_ETFS = ("SPY", "RSP", "QQQ", "IWM", "^VIX")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def stock_closes(symbols: Tuple[str, ...], years: float = 2.0) -> Dict[str, pd.Series]:
+    """Daily closes for indices, ETFs or stocks, fetched in parallel; one that fails is left out."""
+    def one(sym: str):
+        try:
+            return sym, fetch_yahoo_history(sym, years=years, max_points=6000)["close"]
+        except Exception:
+            return sym, None
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return {sym: s for sym, s in pool.map(one, symbols) if s is not None and len(s) > 1}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def stock_kv(key: str) -> Any:
+    return dl.kv_get(key) if _HAS_AGENT else None
+
+
+def ten_year_yield() -> Optional[float]:
+    try:
+        rows = dl.latest_fred("DGS10", n=1)
+        return float(rows[0]["value"]) if rows else None
+    except Exception:
+        return None
+
+
+def _p(v: Optional[float], nd: int = 1) -> str:
+    return "n/a" if v is None or pd.isna(v) else f"{v:+.{nd}f}%"
+
+
+def stock_earnings() -> pd.DataFrame:
+    cal = stock_kv("earnings_calendar") or {}
+    try:
+        members = {m["symbol"]: m for m in dl.universe_all(asset_types=["equity"])}
+    except Exception:
+        members = {}
+    return eqm.earnings_rows(cal.get("rows") or [], members)
+
+
+def stocks_today_cards(closes: Dict[str, pd.Series], breadth: Dict[str, Any], val: Dict[str, Any],
+                       earn: pd.DataFrame) -> List[Dict[str, str]]:
+    """Stocks today: the S&P 500's trend, how many stocks take part, who leads, the fear gauge,
+    sector rotation, the earnings season, what the market costs and the rest of the world."""
+    cards: List[Dict[str, str]] = []
+    spx = closes.get("^GSPC")
+    r = eqm.row_for(spx) if spx is not None and len(spx) >= 200 else {}
+
+    # 1. The S&P 500's trend
+    if r:
+        state, tone, lv = _trend_word(spx)
+        hi = r["from 52w high"]
+        text = (f"The S&P 500 closed at {r['last']:,.0f}: {_p(r['1 day'])} on the day, {_p(r['1 month'])} over a "
+                f"month and {_p(r['YTD'])} this year. "
+                + (f"It is {abs(hi):.1f}% below its 52-week high" if hi is not None and hi < -0.1
+                   else "It is at its 52-week high")
+                + f", {'above' if lv['px'] > lv['m200'] else 'below'} its 200-day average ({lv['m200']:,.0f}) and "
+                  f"{'above' if lv['px'] > lv['m50'] else 'below'} its 50-day ({lv['m50']:,.0f}).")
+        cards.append({"topic": "S&P 500", "state": state, "tone": tone, "text": text})
+
+    # 2. Breadth: how many stocks take part
+    if breadth and breadth.get("pct_above_200") is not None:
+        p200, p50 = breadth["pct_above_200"], breadth.get("pct_above_50") or 0
+        hist = [h["pct_above_200"] for h in breadth.get("history", []) if h.get("pct_above_200") is not None]
+        near_high = (r.get("from 52w high") or -99) > -3
+        state = ("Narrow" if near_high and p200 < 50 else "Broad" if p200 >= 60 and p50 >= 50
+                 else "Weak" if p200 < 40 else "Mixed")
+        tone = {"Broad": "up", "Narrow": "warn", "Weak": "down"}.get(state, "flat")
+        text = f"{p200:.0f}% of S&P 500 stocks are above their 200-day average and {p50:.0f}% above their 50-day"
+        if len(hist) > 100:
+            pc = 100 * sum(x <= p200 for x in hist) / len(hist)
+            text += f"; over the past year the share ranged {min(hist):.0f}-{max(hist):.0f}% and is higher now than on {pc:.0f}% of days"
+        text += (f". {breadth.get('new_highs', 0)} new 52-week highs against {breadth.get('new_lows', 0)} new lows; "
+                 f"on {breadth.get('as_of')} {breadth.get('advancers', 0)} stocks rose and {breadth.get('decliners', 0)} fell.")
+        if state == "Narrow":
+            text += " The index is near its high with fewer than half the stocks in uptrends: a few large names carry it."
+        cards.append({"topic": "How many stocks take part", "state": state, "tone": tone, "text": text})
+
+    # 3. Leadership: big against small, cap-weighted against equal-weighted
+    rsp, spy = closes.get("RSP"), closes.get("SPY")
+    if rsp is not None and spy is not None:
+        r3, s3 = eqm.change_over(rsp, 91), eqm.change_over(spy, 91)
+        if r3 is not None and s3 is not None:
+            g = r3 - s3
+            state = "Broadening" if g > 1.5 else "Narrowing" if g < -1.5 else "Even"
+            text = (f"Over three months the equal-weighted S&P 500 (every company the same size) returned {_p(r3)} "
+                    f"against {_p(s3)} for the regular index, where the largest companies weigh most")
+            if val:
+                text += f"; the ten largest are {val.get('top10_share_pct', 0):.0f}% of its value"
+            ndx, rut = closes.get("^NDX"), closes.get("^RUT")
+            if ndx is not None and rut is not None:
+                text += (f". Over a month the Nasdaq-100 did {_p(eqm.change_over(ndx, 30))} and small companies "
+                         f"(Russell 2000) {_p(eqm.change_over(rut, 30))}.")
+            else:
+                text += "."
+            cards.append({"topic": "Who leads", "state": state,
+                          "tone": {"Broadening": "up", "Narrowing": "warn"}.get(state, "flat"), "text": text})
+
+    # 4. The fear gauge
+    vix = closes.get("^VIX")
+    if vix is not None and len(vix) > 200:
+        v = float(vix.iloc[-1])
+        yr = vix[vix.index >= vix.index[-1] - pd.Timedelta(days=365)]
+        state = "Calm" if v < 15 else "Normal" if v < 20 else "Elevated" if v < 30 else "Stressed"
+        cards.append({"topic": "Volatility (VIX)", "state": f"{state} · {v:.1f}",
+                      "tone": {"Elevated": "warn", "Stressed": "down"}.get(state, "flat"),
+                      "text": f"The VIX, the options market's expected volatility of the S&P 500 over the next 30 "
+                              f"days, is {v:.1f} against a one-year median of {yr.median():.1f}; it was lower on "
+                              f"{(yr < v).mean() * 100:.0f}% of the past year's days. At this level options price a "
+                              f"typical daily move of about ±{v / np.sqrt(252):.1f}%."})
+
+    # 5. Sector rotation
+    sec = {s: eqm.change_over(closes[s], 30) for s in eqm.SECTOR_ETFS if s in closes}
+    sec = {k: v for k, v in sec.items() if v is not None}
+    if len(sec) >= 8:
+        best, worst = max(sec, key=sec.get), min(sec, key=sec.get)
+        cyc = float(np.mean([sec[s] for s in eqm.CYCLICAL if s in sec]))
+        dfn = float(np.mean([sec[s] for s in eqm.DEFENSIVE if s in sec]))
+        state = ("Cyclicals lead" if cyc - dfn > 1.5 else "Defensives lead" if cyc - dfn < -1.5
+                 else "No clear rotation")
+        cards.append({"topic": "Sectors, past month", "state": state,
+                      "tone": {"Cyclicals lead": "up", "Defensives lead": "warn"}.get(state, "flat"),
+                      "text": f"{eqm.SECTOR_ETFS[best]} led ({_p(sec[best])}) and {eqm.SECTOR_ETFS[worst]} lagged "
+                              f"({_p(sec[worst])}). Economy-sensitive sectors averaged {_p(cyc)} against {_p(dfn)} "
+                              "for the defensive ones (staples, utilities, health care, real estate)."})
+
+    # 6. The earnings season
+    if not earn.empty:
+        today = pd.Timestamp.now().normalize()
+        rep = earn[earn["eps_surprise_pct"].notna() & (earn["date"] >= today - pd.Timedelta(days=7))]
+        ahead = earn[(earn["date"] >= today) & (earn["date"] < today + pd.Timedelta(days=7)) & earn["eps_actual"].isna()]
+        caps = (val or {}).get("caps_bn") or {}
+        big = ahead.assign(cap=ahead["symbol"].map(caps)).sort_values("cap", ascending=False).head(4)
+        parts = []
+        if len(rep):
+            beats = int((rep["eps_surprise_pct"] > 0).sum())
+            parts.append(f"In the past week {len(rep)} S&P 500 companies reported and {beats} beat the analysts' "
+                         f"earnings estimate (median surprise {_p(rep['eps_surprise_pct'].median())}); usually about "
+                         "three in four beat, because estimates drift lower into the report.")
+        if len(ahead):
+            parts.append(f"{len(ahead)} report in the next 7 days, the largest "
+                         + ", ".join(f"{x.company} ({x.date:%a %d %b})" for x in big.itertuples()) + ".")
+        if parts:
+            rate = (rep["eps_surprise_pct"] > 0).mean() if len(rep) else None
+            cards.append({"topic": "Earnings season",
+                          "state": (f"{rate * 100:.0f}% beat" if rate is not None else f"{len(ahead)} this week"),
+                          "tone": ("up" if rate is not None and rate >= 0.75 else
+                                   "warn" if rate is not None and rate < 0.6 else "flat"),
+                          "text": " ".join(parts)})
+
+    # 7. What the market costs
+    ix = (val or {}).get("index") or {}
+    if ix.get("forward_pe"):
+        y10 = ten_year_yield()
+        text = (f"The S&P 500 costs {ix['trailing_pe']:.1f} times the last 12 months' reported earnings and "
+                f"{ix['forward_pe']:.1f} times analysts' estimates for the next fiscal year, summed over all its "
+                f"companies. Its earnings yield on those estimates is {ix['earnings_yield_fwd_pct']:.1f}%")
+        text += (f" against {y10:.2f}% on the 10-year Treasury" if y10 else "") + "."
+        ex = ((val.get("without_top10") or {}).get("forward_pe"))
+        if ex:
+            text += f" Without the ten largest companies the forward P/E is {ex:.1f}."
+        cards.append({"topic": "What the market costs", "state": f"{ix['forward_pe']:.1f}x forward earnings",
+                      "tone": "flat", "text": text})
+
+    # 8. The rest of the world
+    w = {n: eqm.change_over(closes[s], 30) for s, n, _ in eqm.WORLD_INDICES if s in closes}
+    w = {k: v for k, v in w.items() if v is not None}
+    if len(w) >= 6:
+        best, worst = max(w, key=w.get), min(w, key=w.get)
+        up = sum(v > 0 for v in w.values())
+        cards.append({"topic": "World markets, past month", "state": f"{up} of {len(w)} up",
+                      "tone": "up" if up >= 0.7 * len(w) else "down" if up <= 0.3 * len(w) else "flat",
+                      "text": f"{best} led ({_p(w[best])}) and {worst} lagged ({_p(w[worst])}), each in its own "
+                              f"currency; the S&P 500 did {_p(r.get('1 month'))}."})
+    return cards
+
+
+def _returns_display(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["1 day", "1 week", "1 month", "3 months", "YTD", "1 year", "from 52w high", "vs 200-day"]
+    out = pd.DataFrame({"Name": df["Name"], "Last": [f"{v:,.2f}" for v in df["last"]]})
+    for c in cols:
+        if c in df:
+            out[c] = [_p(v) for v in df[c]]
+    return out
+
+
+def norm_chart(closes: Dict[str, pd.Series], names: Dict[str, str], days: int, title: str) -> Optional[go.Figure]:
+    fig = go.Figure()
+    for sym, s in closes.items():
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        s = s[s.index >= s.index[-1] - pd.Timedelta(days=days)] if days else s[s.index.year == s.index[-1].year]
+        if len(s) > 2:
+            fig.add_trace(go.Scatter(x=s.index, y=s / s.iloc[0] * 100, name=names.get(sym, sym), mode="lines"))
+    if not fig.data:
+        return None
+    fig.add_hline(y=100, line_dash="dot", line_color="#555")
+    fig.update_layout(template="plotly_dark", height=380, paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                      margin=dict(l=10, r=10, t=40, b=10), title=title, legend=dict(orientation="h", y=-0.15),
+                      yaxis_title="100 = start")
+    return fig
+
+
+with tab_stocks:
+    if tab_visible("stocks"):
+        st.markdown("""
+        <div style="padding:12px 0 4px 0">
+        <span style="font-size:28px;font-weight:800;letter-spacing:-1px">STOCKS</span>
+        <span style="font-size:14px;color:#888;margin-left:12px">The stock market: trend, how many stocks take part, who leads, earnings and what it costs</span>
+        </div>
+        """, unsafe_allow_html=True)
+        with st.expander("What this panel does, and how to read it", expanded=False):
+            st.markdown("""
+The stock market as a whole, centred on the S&P 500, with the other US indices and
+twelve markets abroad.
+
+- **Stocks today**: the index's trend, how many of its 500 stocks are in uptrends
+  (breadth), whether big or small companies lead, the VIX, sector rotation, the
+  earnings season, what the market costs and how the rest of the world did.
+- **Breadth** answers whether a move is broad or carried by a few names. An index
+  at a high with most stocks below their 200-day average is a narrow market;
+  narrow markets have often been fragile, but they can stay narrow for a long time.
+- **Valuation** is summed from all members: total market value over total
+  earnings, reported earnings for the trailing P/E and analysts' estimates for the
+  forward one. The history of these figures starts the day this app began
+  recording them.
+- **The detail** (with a plan): every index here and abroad, the breadth history,
+  sectors and their valuations, the earnings calendar with surprises, any single
+  stock, and an AI read with a forecast and scenarios (1 credit).
+
+Prices are Yahoo Finance's daily closes; earnings come from Finnhub. Breadth and
+valuation are recomputed after each US close. None of this is a recommendation.
+""")
+        closes = stock_closes(tuple([s for s, _ in eqm.US_INDICES] + [s for s, _, _ in eqm.WORLD_INDICES]
+                                    + list(STOCK_ETFS) + list(eqm.SECTOR_ETFS)))
+        breadth = stock_kv("stock_breadth") or {}
+        val = stock_kv("market_valuation") or {}
+        earn = stock_earnings()
+        stock_cards = stocks_today_cards(closes, breadth, val, earn)
+        read_cards("Stocks today", stock_cards,
+                   note="Computed from Yahoo Finance closes, every S&P 500 member's prices and quote summary "
+                        f"(breadth as of {breadth.get('as_of', 'n/a')}, valuation as of {val.get('as_of', 'n/a')}) "
+                        "and Finnhub's earnings calendar. A description of the market now, not a recommendation.")
+        fig_spx = trend_chart(closes["^GSPC"], "S&P 500", "#22c55e", unit_prefix="") if "^GSPC" in closes else None
+        if fig_spx is not None:
+            st.markdown("##### The S&P 500 over the past year, with its 50- and 200-day averages")
+            st.plotly_chart(fig_spx, use_container_width=True)
+
+        if not tab_unlocked("stocks"):
+            st.markdown("#### The detail")
+            locked_tab("stocks")
+        else:
+            st.markdown("#### The detail")
+            sk1, sk2, sk3, sk4, sk5, sk6 = st.tabs([
+                "🌍 Indices", "📊 Breadth & leadership", "🔄 Sectors", "📅 Earnings", "🔎 One stock",
+                "🤖 AI read (1 credit)"])
+
+            with sk1:
+                us = eqm.returns_table({s: closes[s] for s, _ in eqm.US_INDICES if s in closes}, eqm.INDEX_NAMES)
+                world = eqm.returns_table({s: closes[s] for s, _, _ in eqm.WORLD_INDICES if s in closes}, eqm.INDEX_NAMES)
+                st.markdown("##### United States")
+                if not us.empty:
+                    st.dataframe(_returns_display(us), use_container_width=True, hide_index=True)
+                st.markdown("##### Abroad (each in its own currency)")
+                if not world.empty:
+                    st.dataframe(_returns_display(world), use_container_width=True, hide_index=True)
+                c1, c2 = st.columns([1, 3])
+                hz = c1.radio("Period", ["1 month", "3 months", "This year", "1 year"], index=1, key="stk_hz")
+                pick = c2.multiselect("Indices", list(eqm.INDEX_NAMES), key="stk_pick",
+                                      default=["^GSPC", "^NDX", "^RUT", "^STOXX50E", "^N225", "000300.SS"],
+                                      format_func=lambda s: eqm.INDEX_NAMES.get(s, s))
+                days = {"1 month": 30, "3 months": 91, "This year": 0, "1 year": 365}[hz]
+                f = norm_chart({s: closes[s] for s in pick if s in closes}, eqm.INDEX_NAMES, days,
+                               f"Performance over {hz.lower()}, in each index's currency")
+                if f is not None:
+                    st.plotly_chart(f, use_container_width=True)
+
+            with sk2:
+                hist = pd.DataFrame(breadth.get("history") or [])
+                if hist.empty:
+                    st.info("Breadth is computed after the US close; the first run takes a few minutes after a restart.")
+                else:
+                    hist["date"] = pd.to_datetime(hist["date"])
+                    fb = go.Figure()
+                    fb.add_trace(go.Scatter(x=hist["date"], y=hist["pct_above_200"], name="% above 200-day"))
+                    fb.add_trace(go.Scatter(x=hist["date"], y=hist["pct_above_50"], name="% above 50-day",
+                                            line=dict(dash="dot")))
+                    if "^GSPC" in closes:
+                        sp = closes["^GSPC"][closes["^GSPC"].index >= hist["date"].min()]
+                        fb.add_trace(go.Scatter(x=sp.index, y=sp, name="S&P 500 (right)", yaxis="y2",
+                                                line=dict(color="#a3a3a3", width=1)))
+                    fb.update_layout(template="plotly_dark", height=380, paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                     margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15),
+                                     title="Share of S&P 500 stocks above their moving averages",
+                                     yaxis=dict(title="%", range=[0, 100]),
+                                     yaxis2=dict(overlaying="y", side="right", showgrid=False))
+                    st.plotly_chart(fb, use_container_width=True)
+                    fh = go.Figure()
+                    fh.add_trace(go.Bar(x=hist["date"], y=hist["new_highs"], name="New 52-week highs",
+                                        marker_color="#22c55e"))
+                    fh.add_trace(go.Bar(x=hist["date"], y=-hist["new_lows"], name="New 52-week lows",
+                                        marker_color="#ef4444"))
+                    fh.update_layout(template="plotly_dark", height=280, paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                     margin=dict(l=10, r=10, t=40, b=10), barmode="relative",
+                                     title="New highs and lows each day", legend=dict(orientation="h", y=-0.2))
+                    st.plotly_chart(fh, use_container_width=True)
+                if "RSP" in closes and "SPY" in closes:
+                    ratio = (closes["RSP"] / closes["SPY"]).dropna()
+                    fr = go.Figure(go.Scatter(x=ratio.index, y=ratio / ratio.iloc[0] * 100, name="RSP / SPY"))
+                    fr.update_layout(template="plotly_dark", height=300, paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                     margin=dict(l=10, r=10, t=40, b=10), yaxis_title="100 = two years ago",
+                                     title="Equal-weighted against cap-weighted S&P 500 (falling = narrowing)")
+                    st.plotly_chart(fr, use_container_width=True)
+                bs = breadth.get("by_sector") or {}
+                if bs:
+                    st.markdown("##### Breadth by sector")
+                    st.dataframe(pd.DataFrame([{"Sector": k, "Stocks": v["n"], "% above 200-day": v["pct_above_200"],
+                                                "% above 50-day": v["pct_above_50"]} for k, v in bs.items()])
+                                 .sort_values("% above 200-day", ascending=False),
+                                 use_container_width=True, hide_index=True)
+
+            with sk3:
+                sect = eqm.returns_table({s: closes[s] for s in eqm.SECTOR_ETFS if s in closes}, eqm.SECTOR_ETFS)
+                if not sect.empty:
+                    hz2 = st.radio("Period", ["1 week", "1 month", "3 months", "YTD", "1 year"], index=1,
+                                   horizontal=True, key="stk_sect_hz")
+                    sd = sect.sort_values(hz2, ascending=True)
+                    fs = go.Figure(go.Bar(x=sd[hz2], y=sd["Name"], orientation="h",
+                                          marker_color=["#22c55e" if (v or 0) >= 0 else "#ef4444" for v in sd[hz2]],
+                                          text=[_p(v) for v in sd[hz2]], textposition="outside"))
+                    fs.update_layout(template="plotly_dark", height=420, paper_bgcolor="#000", plot_bgcolor="#0a0a0a",
+                                     margin=dict(l=10, r=40, t=40, b=10), title=f"Sector ETFs, {hz2.lower()}")
+                    st.plotly_chart(fs, use_container_width=True)
+                    st.dataframe(_returns_display(sect), use_container_width=True, hide_index=True)
+                    st.caption("SPDR sector ETFs (XLK, XLF …): market-value-weighted, so in technology and "
+                               "communication services a handful of giants set the number.")
+                bys = (val or {}).get("by_sector") or {}
+                if bys:
+                    st.markdown("##### What each sector costs")
+                    st.dataframe(pd.DataFrame([{
+                        "Sector": k, "Weight": f"{v['weight_pct']:.1f}%",
+                        "P/E, last 12 months": v.get("trailing_pe"), "P/E, next year's estimates": v.get("forward_pe"),
+                        "Net margin": f"{v['net_margin_pct']:.1f}%" if v.get("net_margin_pct") is not None else "n/a",
+                        "Median revenue growth": _p(v.get("median_revenue_growth_pct")),
+                        "Dividend yield": f"{v['dividend_yield_pct']:.2f}%" if v.get("dividend_yield_pct") is not None else "n/a",
+                        "Companies": v["companies"]} for k, v in bys.items()]).sort_values("Weight", ascending=False),
+                        use_container_width=True, hide_index=True)
+                    st.caption(f"Summed from every member's Yahoo quote summary on {val.get('as_of')}: total market "
+                               "value over total earnings, losses included. Forward estimates are analysts' adjusted "
+                               "figures, which usually run above reported earnings.")
+
+            with sk4:
+                if earn.empty:
+                    st.info("The earnings calendar refreshes every two hours from Finnhub.")
+                else:
+                    caps = (val or {}).get("caps_bn") or {}
+                    today = pd.Timestamp.now().normalize()
+                    rep = earn[earn["eps_actual"].notna() & (earn["date"] >= today - pd.Timedelta(days=7))].sort_values(
+                        "date", ascending=False)
+                    ahead = earn[(earn["date"] >= today) & earn["eps_actual"].isna()].copy()
+                    st.markdown(f"##### Reported in the past week · {len(rep)} S&P 500 companies")
+                    if not rep.empty:
+                        st.dataframe(pd.DataFrame({
+                            "Date": rep["date"].dt.strftime("%a %d %b"), "Company": rep["company"], "Ticker": rep["symbol"],
+                            "EPS estimate": rep["eps_estimate"].round(2), "EPS actual": rep["eps_actual"].round(2),
+                            "EPS surprise": [_p(v) for v in rep["eps_surprise_pct"]],
+                            "Revenue est. ($bn)": rep["revenue_estimate_bn"].round(2),
+                            "Revenue actual ($bn)": rep["revenue_actual_bn"].round(2),
+                            "Revenue surprise": [_p(v) for v in rep["revenue_surprise_pct"]]}),
+                            use_container_width=True, hide_index=True)
+                    st.markdown(f"##### Coming up · {len(ahead)} S&P 500 companies in the next two weeks")
+                    if not ahead.empty:
+                        ahead["cap"] = ahead["symbol"].map(caps)
+                        st.dataframe(pd.DataFrame({
+                            "Date": ahead["date"].dt.strftime("%a %d %b"), "When": ahead["when"],
+                            "Company": ahead["company"], "Ticker": ahead["symbol"], "Sector": ahead["sector"],
+                            "Market value ($bn)": ahead["cap"], "EPS estimate": ahead["eps_estimate"].round(2),
+                            "Revenue est. ($bn)": ahead["revenue_estimate_bn"].round(2)}),
+                            use_container_width=True, hide_index=True)
+                    st.caption("Finnhub's calendar and consensus estimates. A surprise is the reported figure "
+                               "against the estimate; the share price reacts to the guidance as much as to the beat.")
+
+            stk_one_sym = None
+            with sk5:
+                with st.form("stk_one_form", border=False):
+                    o1, o2 = st.columns([3, 1])
+                    one_q = o1.text_input("Stock", value="NVDA", key="stk_one_q", label_visibility="collapsed",
+                                          placeholder="Ticker or company name: NVDA, Apple, JPM")
+                    o2.form_submit_button("▶ Show", type="primary", use_container_width=True)
+                if one_q.strip():
+                    try:
+                        hits = dl.universe_search(one_q.strip(), limit=1) if _HAS_AGENT else []
+                    except Exception:
+                        hits = []
+                    stk_one_sym = hits[0]["symbol"] if hits else one_q.strip().upper()
+                    meta = (dl.universe_meta(stk_one_sym) if _HAS_AGENT else None) or {}
+                    etf = eqm.GICS_ETF.get(meta.get("sector") or "")
+                    oc = stock_closes(tuple(x for x in (stk_one_sym, "^GSPC", etf) if x))
+                    s1 = oc.get(stk_one_sym)
+                    if s1 is None:
+                        st.error(f"No price history for {stk_one_sym}.")
+                    else:
+                        st.markdown(f"### {meta.get('company_name') or stk_one_sym} · `{stk_one_sym}`")
+                        if meta.get("sector"):
+                            st.caption(" · ".join(x for x in (meta.get("sector"), meta.get("industry")) if x))
+                        f1 = trend_chart(s1, stk_one_sym, "#22c55e")
+                        if f1 is not None:
+                            st.plotly_chart(f1, use_container_width=True)
+                        names = {stk_one_sym: stk_one_sym, "^GSPC": "S&P 500"} | ({etf: f"{eqm.SECTOR_ETFS[etf]} sector"} if etf else {})
+                        st.dataframe(_returns_display(eqm.returns_table(oc, names)), use_container_width=True,
+                                     hide_index=True)
+                        nx = earn[(earn["symbol"] == stk_one_sym)] if not earn.empty else earn
+                        if not nx.empty:
+                            e0 = nx.iloc[-1]
+                            st.caption(f"Earnings: {e0['date']:%a %d %b} {e0['when']}"
+                                       + (f", EPS estimate {e0['eps_estimate']:.2f}" if pd.notna(e0['eps_estimate']) else "")
+                                       + (f", reported {e0['eps_actual']:.2f} ({_p(e0['eps_surprise_pct'])})"
+                                          if pd.notna(e0['eps_actual']) else ""))
+                        try:
+                            h10 = fetch_yahoo_history(stk_one_sym, years=10, max_points=4000)["close"]
+                            fi = ar.forecast_inputs(h10, name=stk_one_sym)
+                        except Exception:
+                            fi = {}
+                        if fi.get("available"):
+                            st.markdown("##### What happened next, historically, from a trend like today's")
+                            rows = []
+                            for lbl, b in (fi.get("base_rates") or {}).items():
+                                same = b.get("same_trend_state") or {}
+                                rows.append({"Horizon": lbl, "Times higher afterwards": f"{same.get('share_higher_pct', 'n/a')}%",
+                                             "Median move": _p(same.get("median_move_pct")),
+                                             "10th-90th percentile": f"{_p(same.get('p10_move_pct'))} to {_p(same.get('p90_move_pct'))}",
+                                             "Cases": same.get("n")})
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                            st.caption(f"From {stk_one_sym}'s own daily history since {fi.get('history_from')}, on days "
+                                       f"in the same trend state as today ({fi.get('trend_state_now')}). Base rates, "
+                                       "not a forecast: the past does not repeat on schedule.")
+                        news = dl.query_news(since_hours=96, keyword=(meta.get("company_name") or stk_one_sym).split()[0],
+                                             limit=8) if _HAS_AGENT else []
+                        if news:
+                            st.markdown("##### In the news")
+                            for n in news:
+                                st.markdown(f"- [{n['title']}]({n['url']}) · {n['source']}")
+                        st.caption("For the business itself (margins, growth, balance sheet against its sector) "
+                                   "open the Fundamentals tab.")
+
+            with sk6:
+                targets = list(STOCK_AI_TARGETS) + ([stk_one_sym] if stk_one_sym else [])
+                tgt = st.selectbox("Read on", targets, key="stk_ai_target",
+                                   format_func=lambda t: t if t in STOCK_AI_TARGETS else f"{t} (the stock in One stock)")
+                go_ai = st.button(f"🤖 AI read of {tgt} (1 credit)", key="stk_ai_run", type="primary")
+                ai_caption(tgt)
+                if go_ai:
+                    sym = STOCK_AI_TARGETS.get(tgt, tgt)
+                    ctx: Dict[str, Any] = {
+                        "subject": tgt, "symbol": sym,
+                        "summary_cards": [{k: c[k] for k in ("topic", "state", "text")} for c in stock_cards],
+                        "us_indices": _returns_display(eqm.returns_table(
+                            {s: closes[s] for s, _ in eqm.US_INDICES if s in closes}, eqm.INDEX_NAMES)).to_dict("records"),
+                        "world_indices": _returns_display(eqm.returns_table(
+                            {s: closes[s] for s, _, _ in eqm.WORLD_INDICES if s in closes}, eqm.INDEX_NAMES)).to_dict("records"),
+                        "breadth": {k: v for k, v in breadth.items() if k not in ("stocks", "history")},
+                        "breadth_last_60_days": (breadth.get("history") or [])[-60:],
+                        "sectors": _returns_display(eqm.returns_table(
+                            {s: closes[s] for s in eqm.SECTOR_ETFS if s in closes}, eqm.SECTOR_ETFS)).to_dict("records"),
+                        "valuation": {k: v for k, v in (val or {}).items() if k != "caps_bn"},
+                        "valuation_history": (stock_kv("market_valuation_history") or [])[-60:],
+                        "ten_year_treasury_pct": ten_year_yield(),
+                        "earnings": earn.drop(columns=["date"]).assign(date=earn["date"].dt.strftime("%Y-%m-%d"))
+                                        .to_dict("records") if not earn.empty else [],
+                    }
+                    px_now = None
+                    try:
+                        h10 = fetch_yahoo_history(sym, years=10, max_points=4000)["close"]
+                        ctx["forecast_inputs"] = ar.forecast_inputs(h10, name=tgt, levels=ar.default_levels(h10))
+                        px_now = float(h10.iloc[-1])
+                    except Exception:
+                        log.exception("stocks forecast inputs failed")
+                    if tgt in STOCK_AI_TARGETS:
+                        system = (
+                            "You are a US equity strategist at a research house. You get the index's trend and the "
+                            "other indices here and abroad, breadth (the share of S&P 500 stocks above their 50- and "
+                            "200-day averages, highs and lows), equal- against cap-weighted performance, sector returns "
+                            "and valuations, the earnings season with surprises, a bottom-up valuation of the S&P 500 "
+                            "(reported trailing earnings, analysts' adjusted forward estimates) with the 10-year "
+                            "Treasury yield, the VIX in the cards, the week's calendar, and forecast_inputs from ten "
+                            "years of the index's own prices.\n\nCover what is driving the index now and whether the "
+                            "move is broad or narrow; whether earnings are supporting the price; what the valuation "
+                            "against bond yields leaves room for; and the events this week that could move it. The "
+                            "view is on the index level. Never invent earnings figures, index targets or strategist "
+                            "forecasts from memory.\n\n" + ar.forecast_style(tgt))
+                    else:
+                        system = (
+                            "You are an equity analyst at a research house. You get the stock's price history in "
+                            "forecast_inputs, the market around it (indices, breadth, sectors, valuation, earnings "
+                            "calendar with this company's date and surprise if listed) and the summary cards.\n\n"
+                            "Cover the stock's trend against the S&P 500 and its sector, what the coming or latest "
+                            "earnings report means for it, and the market backdrop it trades in. For the business's "
+                            "own numbers say the Fundamentals tab has them; do not invent revenue, margins or "
+                            "guidance from memory.\n\n" + ar.forecast_style(f"{tgt}"))
+                    ai_read_run("stocks", tgt, system, ctx, price=px_now)
+                st.markdown("---")
+                ai_read_show("stocks", tgt)
+    else:
+        locked_tab("stocks")
 
 
 # -------- FUNDAMENTALS TAB --------

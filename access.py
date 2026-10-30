@@ -43,7 +43,7 @@ ACTION_NAMES = {"read": "an AI read", "news": "the AI news forecast", "analyst":
 
 PLANS = {
     "basic": {"month": 9, "year": 90, "points": [
-        "Adds Currencies, Central Banks, Metals", "10 AI credits a month", "All of AI Bubble Tracker"]},
+        "Adds Stocks, Currencies, Central Banks, Metals", "10 AI credits a month", "All of AI Bubble Tracker"]},
     "plus": {"month": 24, "year": 240, "points": [
         "Everything in Basic", "Adds Crypto, Fundamentals, News & Macro, Quant Lab, AI Analyst", "60 AI credits a month"]},
     "pro": {"month": 49, "year": 490, "points": [
@@ -52,7 +52,7 @@ PLANS = {
 
 # The lowest plan that opens each tab.
 TAB_TIER = {
-    "global": "free", "fx": "basic", "cb": "basic", "metals": "basic",
+    "global": "free", "stocks": "basic", "fx": "basic", "cb": "basic", "metals": "basic",
     "crypto": "plus", "fund": "plus", "news": "plus", "quant": "plus", "ai": "plus",
     "carry": "pro", "fomc": "pro", "brief": "pro",
 }

@@ -33,6 +33,7 @@ HAIKU_MODEL = "claude-haiku-4-5"  # current Haiku — still the cheap/fast tier
 # asked — leaving it would truncate answers mid-sentence.
 DEFAULT_MAX_TOKENS = 8000
 AGENT_EFFORT = "high"
+MAX_TOOL_ROUNDS = 8
 
 
 # ---------------- secrets ----------------
@@ -429,8 +430,9 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "show_ai_bubble_chart",
         "description": ("Put one of AI Bubble Tracker's charts under your answer: "
                         + "; ".join(f"{k} = {v[0]}" for k, v in ai_bubble.CHARTS.items())
-                        + ". Use it when a chart makes the point faster than words, at most three per answer, "
-                          "and refer to it in the text as the chart below."),
+                        + ". Use it when a chart makes the point faster than words, at most three per answer. "
+                          "Call it before you write the answer, never after, and refer to it in the text as the "
+                          "chart below."),
         "input_schema": {"type": "object", "properties": {
             "chart": {"type": "string", "enum": list(ai_bubble.CHARTS)}}, "required": ["chart"]}
     },
@@ -844,7 +846,8 @@ Rules:
   Tracker as the source and give the page link. Figures on the private labs are press
   reports, leaks or company projections unless marked otherwise; say which.
 - When one of AI Bubble Tracker's charts makes the point faster than words, call
-  show_ai_bubble_chart (at most three per answer) and refer to "the chart below".
+  show_ai_bubble_chart (at most three per answer) before writing, and refer to "the chart
+  below". Write the whole answer in your last message, after every lookup.
 - For figures that exist only in a filing's text, such as a new IPO's losses, cash burn
   and cash on hand from its S-1, guidance in an 8-K or a risk factor, call
   get_sec_filing and quote the figures with the form, the filing date and the link.
@@ -888,7 +891,7 @@ def _route_model(user_msg: str) -> str:
 
 
 def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = None,
-                   max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, Any]:
+                   max_tokens: int = DEFAULT_MAX_TOKENS, extra_system: str = "") -> Dict[str, Any]:
     """
     Run one user-turn through Claude with tool-use loop.
     `messages` is the running conversation in Anthropic format
@@ -908,11 +911,15 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
     model = force_model or _route_model(user_text)
 
     tool_calls_log: List[Dict[str, Any]] = []
+    earlier_text: List[str] = []   # text written in rounds that also called tools
     convo = list(messages)
     safety_iter = 0
 
-    while safety_iter < 8:
+    # A question that keeps calling tools gets one last round with tools switched off, so it
+    # answers from what it has found instead of stopping with nothing to show for the credits.
+    while safety_iter <= MAX_TOOL_ROUNDS:
         safety_iter += 1
+        final = safety_iter > MAX_TOOL_ROUNDS
         try:
             # Opus 5.5 defaults to effort "medium" where Opus 5 defaulted to
             # "high"; state it so the analyst keeps the depth it had. Haiku 4.5
@@ -925,9 +932,10 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
                 cache_control={"type": "ephemeral"},
                 model=model,
                 max_tokens=max_tokens,
-                system=_build_system_prompt(),
+                system=_build_system_prompt() + extra_system,
                 tools=TOOLS,
                 messages=convo,
+                **({"tool_choice": {"type": "none"}} if final else {}),
                 **extra,
             )
         except Exception as e:
@@ -964,8 +972,15 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
         convo.append({"role": "assistant", "content": assistant_blocks})
 
         if resp.stop_reason != "tool_use" or not tool_uses:
-            return {"text": "\n".join(text_out_parts).strip() or "(no response)",
+            final_text = "\n".join(text_out_parts).strip()
+            # The model sometimes writes the answer and then asks for a chart, leaving only a
+            # closing paragraph for the last round: put the substantial earlier text back in front.
+            body = [t for t in earlier_text if len(t) > 200]
+            if body and len(final_text) < 1500:
+                final_text = "\n\n".join(body + [final_text]).strip()
+            return {"text": final_text or "(no response)",
                     "messages": convo, "tool_calls": tool_calls_log}
+        earlier_text.extend(t.strip() for t in text_out_parts if t.strip())
 
         # Run the tools, return tool_results
         tool_results_content = []
@@ -986,4 +1001,5 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
             })
         convo.append({"role": "user", "content": tool_results_content})
 
-    return {"text": "(agent hit tool-use loop limit)", "messages": convo, "tool_calls": tool_calls_log}
+    return {"text": "⚠️ The analyst ran out of lookups before it could answer. Try a narrower question.",
+            "messages": convo, "tool_calls": tool_calls_log}

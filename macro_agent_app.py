@@ -9252,7 +9252,9 @@ _NEWS_STOP = set("""a an the and or of to in on for with at by from as is are wa
 after before over under into about amid as against new says say said will would could may might more most than up down
 out off not no yes how why what when where who whom which while week year years day days today amid via report reports
 just also still back first last next two three four five per its his her their they them we our you your has have had""".split())
-_CB_NEWS_RE = re.compile(r"\b(fed|federal reserve|powell|fomc|ecb|lagarde|boj|bank of japan|ueda|boe|bank of england|"
+# "boe" not followed by "/": oil companies report output in BOE/d (barrels of oil equivalent a
+# day), which put a production-guidance headline under "central banks in the news"
+_CB_NEWS_RE = re.compile(r"\b(fed|federal reserve|powell|fomc|ecb|lagarde|boj|bank of japan|ueda|boe(?!/)|bank of england|"
                          r"bailey|rate cuts?|rate hikes?|interest rates?|central bank)\b", re.I)
 
 

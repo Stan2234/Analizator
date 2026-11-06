@@ -106,7 +106,9 @@ def group_events() -> Optional[Dict[str, Any]]:
         if len(idx) < 2:
             continue
         # the lead is the real headline closest to the label, never text the model wrote
-        lab = _tokens(e["label"])
+        # the head of the label names the event ("Tech stock selloff ..."); its tail lists
+        # side effects ("... and crypto losses") that would pick a side-story headline
+        lab = _tokens(" ".join(str(e["label"]).split()[:5]))
         lead = max(idx, key=lambda i: (len(lab & _tokens(rows[i]["title"])), -i))
         events.append({"label": str(e["label"])[:120],
                        "relevance": e.get("relevance") if e.get("relevance") in RELEVANCE else "low",

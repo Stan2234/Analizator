@@ -816,6 +816,31 @@ def fetch_sec_all_institutions() -> List[Dict[str, Any]]:
 
 YAHOO_QUOTE = "https://query2.finance.yahoo.com/v8/finance/chart/{}"
 
+
+def _yahoo_previous_close(res: Dict[str, Any]) -> Optional[float]:
+    """Close of the session before the latest one.
+
+    Yahoo's meta "chartPreviousClose" is the close before the whole chart range: with
+    range=5d it is five sessions back, so a "since the previous close" change built on it
+    is really a one-week change. Take it from the daily bars instead.
+    """
+    meta = res.get("meta") or {}
+    ts = res.get("timestamp") or []
+    closes = (((res.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+    bars = [(t, c) for t, c in zip(ts, closes) if c is not None]
+    if not bars:
+        return None
+    off = meta.get("gmtoffset") or 0
+    day = lambda t: (int(t) + off) // 86400  # noqa: E731 - exchange-local calendar day
+    rmt = meta.get("regularMarketTime")
+    if rmt and day(bars[-1][0]) == day(rmt):
+        # The last bar is the current (or latest) session: the one before it is the previous close.
+        if len(bars) >= 2:
+            return bars[-2][1]
+        return meta.get("chartPreviousClose")  # one-bar range: the close before it is the right one
+    return bars[-1][1]
+
+
 def fetch_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
     r = _get(YAHOO_QUOTE.format(quote_plus(symbol)), params={"interval": "1d", "range": "5d"})
     if not r:
@@ -825,10 +850,12 @@ def fetch_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
         if not result:
             return None
         meta = result[0].get("meta") or {}
+        price, prev = meta.get("regularMarketPrice"), _yahoo_previous_close(result[0])
         return {
             "symbol": symbol,
-            "price": meta.get("regularMarketPrice"),
-            "prev_close": meta.get("chartPreviousClose"),
+            "price": price,
+            "prev_close": prev,
+            "change_pct": ((float(price) - float(prev)) / float(prev) * 100.0) if price is not None and prev else None,
             "currency": meta.get("currency"),
             "exchange": meta.get("exchangeName"),
         }

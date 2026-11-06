@@ -411,6 +411,16 @@ def upsert_econ_events(events: Iterable[Dict[str, Any]]) -> int:
     return n
 
 
+def drop_econ_events(source: str, through_date: str) -> int:
+    """Remove one feed's events up to a date, once a better feed covers those days."""
+    conn = get_conn()
+    with _DB_LOCK:
+        n = conn.execute("DELETE FROM econ_events WHERE source = ? AND substr(event_time, 1, 10) <= ?",
+                         (source, through_date)).rowcount
+        conn.commit()
+    return n
+
+
 def query_econ_events(days_ahead: int = 14, days_back: int = 1) -> List[Dict[str, Any]]:
     conn = get_conn()
     now = dt.datetime.now(dt.timezone.utc)

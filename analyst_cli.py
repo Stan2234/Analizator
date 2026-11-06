@@ -74,7 +74,7 @@ def main() -> dict:
         # Opus for every question: on the tracker they are analysis questions however short,
         # and the 3-credit price was set on Opus's cost.
         res = agent.run_agent_turn(req.get("messages") or [], force_model=agent.OPUS_MODEL,
-                                   extra_system=AI_BUBBLE_NOTE)
+                                   extra_system=AI_BUBBLE_NOTE, max_tool_calls=8)
     except Exception as e:
         access.refund(user, "analyst")
         return {"error": f"The analyst failed: {type(e).__name__}. No credits were used.", **_credits(user, access)}

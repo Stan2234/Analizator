@@ -258,6 +258,14 @@ def global_news_read() -> Optional[str]:
                                      for r in rows[:150]]
     except Exception:
         ctx["headlines_last_24h"] = []
+    try:
+        # the same event grouping the News tab shows, so the read weighs stories the same way
+        import news_events
+        ev = dl.kv_get(news_events.KV_KEY) or {}
+        ctx["events_last_24h"] = [{"event": e["label"], "market_relevance": e["relevance"],
+                                   "headlines": len(e["urls"])} for e in (ev.get("events") or [])]
+    except Exception:
+        pass
     macro = {}
     for sid, label, unit in _FRED:
         try:

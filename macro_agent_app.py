@@ -4068,19 +4068,27 @@ def fx_today_cards(uv: pd.DataFrame, codes: List[str], rates: pd.DataFrame,
         cards.append(CALENDAR_MISSING)
         return cards
     ev = fxa.fx_event_risk(events, codes, 7)
+    # ForexFactory publishes next week late; after its last day only US dates (from FRED) are known
+    ff_last = max((str(e.get("event_time") or "")[:10] for e in events
+                   if e.get("source") == "ForexFactory"), default="")
+    gap = (" Next week's dates for currencies other than the dollar are not published yet."
+           if ff_last and ff_last < (dt.date.today() + dt.timedelta(days=7)).isoformat() else "")
     if not ev.empty:
         cb = ev[ev["is_cb"]]
-        pick = (cb if not cb.empty else ev).head(3)
+        # rate decisions first, then the high-impact data, so a lone CPI is not hidden behind
+        # three minor releases
+        pick = pd.concat([cb, ev[~ev["is_cb"] & (ev["impact"].astype(str).str.lower() == "high")],
+                          ev[~ev["is_cb"]]]).drop_duplicates(subset=["date", "ccy", "event"]).head(3)
         items = "; ".join(f"{r['flag']} {r['event']} ({pd.Timestamp(r['date']).strftime('%a %d %b')})"
                           for _, r in pick.iterrows())
         cards.append({"topic": "Next 7 days", "state": f"{len(cb)} rate decision" + ("" if len(cb) == 1 else "s")
                       if not cb.empty else f"{len(ev)} key release" + ("" if len(ev) == 1 else "s"),
                       "tone": "warn" if not cb.empty else "flat",
-                      "text": items + ". Carry and trends often break around these."})
+                      "text": items + ". Carry and trends often break around these." + gap})
     else:
         cards.append({"topic": "Next 7 days", "state": "Quiet calendar", "tone": "flat",
                       "text": "No central-bank decisions or top-tier data for these currencies in the "
-                              "days the calendar covers."})
+                              "days the calendar covers." + gap})
     return cards
 
 
@@ -6320,6 +6328,17 @@ def metals_today_cards(px: pd.DataFrame, bd: pd.DataFrame, rt: pd.DataFrame,
                     weak = abs(cd) < 0.3 and abs(cy) < 0.3
                     text += (f" Lately the link is {'weak' if weak else 'working'}: gold's 6-month "
                              f"correlation is {cd:+.2f} with the dollar and {cy:+.2f} with yields.")
+            # the backdrop and gold's own month can disagree; say so instead of leaving a
+            # "tailwind" next to a falling price
+            g1 = _pct_change_days(px[gold_t], 30) if gold_t in px.columns else None
+            if g1 is not None and score > 0 and g1 < -1:
+                state, tone = "Tailwind, but gold fell", "warn"
+                text += (f" Gold still fell {g1:.1f}% over the same month, so these two are not what is "
+                         "moving it now; the buying and selling below says more.")
+            elif g1 is not None and score < 0 and g1 > 1:
+                state, tone = "Headwind, but gold rose", "warn"
+                text += (f" Gold rose {g1:+.1f}% over the same month anyway, so demand is outweighing "
+                         "the dollar and yields; see who is buying below.")
             cards.append({"topic": "Dollar and yields", "state": state, "tone": tone, "text": text})
 
     # 3. Who is buying: central banks and gold ETFs (World Gold Council)
@@ -7839,8 +7858,42 @@ def stock_earnings() -> pd.DataFrame:
     return eqm.earnings_rows(cal.get("rows") or [], members)
 
 
+def big_day_card(spx: pd.Series, lookback: int = 3) -> Optional[Dict[str, str]]:
+    """The S&P 500's largest move of the last few sessions when it is a rare one (in the
+    biggest 3% of days), with the record of what followed moves that size."""
+    s = pd.to_numeric(spx, errors="coerce").dropna()
+    if len(s) < 750:
+        return None
+    ret = s.pct_change().dropna() * 100
+    recent = ret.tail(lookback)
+    day = recent.abs().idxmax()
+    move = float(ret.loc[day])
+    if abs(move) < max(2.0, float(ret.abs().quantile(0.97))):
+        return None
+    down = move < 0
+    prior = ret[ret.index < day]
+    worse = prior[prior <= move] if down else prior[prior >= move]
+    since = (f", the biggest {'drop' if down else 'gain'} since {worse.index[-1]:%d %b %Y}"
+             if not worse.empty else f", the biggest {'drop' if down else 'gain'} in the data")
+    rarity = (ret.abs() >= abs(move)).mean() * 100
+    text = (f"The S&P 500 {'fell' if down else 'rose'} {abs(move):.1f}% on {day:%a %d %b}{since}. "
+            f"Moves this size happened on {rarity:.1f}% of trading days since {ret.index[0]:%Y}.")
+    # what followed: same-direction days at least 2/3 as large, one month (21 sessions) later
+    fwd = s.shift(-21) / s - 1
+    cases = ret[(ret <= move * 2 / 3) if down else (ret >= move * 2 / 3)].index
+    cases = [d for d in cases if d < day and pd.notna(fwd.get(d))]
+    if len(cases) >= 10:
+        f = fwd.loc[cases] * 100
+        text += (f" After the {len(cases)} earlier days {'down' if down else 'up'} {abs(move) * 2 / 3:.1f}% or more, "
+                 f"the index was higher a month later {(f > 0).mean() * 100:.0f}% of the time "
+                 f"(median {_p(float(f.median()))}). That is a record, not a forecast; such days cluster "
+                 "in stressed markets.")
+    return {"topic": f"Big day · {day:%d %b}", "state": f"{'Drop' if down else 'Jump'} {move:+.1f}%",
+            "tone": "down" if down else "up", "text": text}
+
+
 def stocks_today_cards(closes: Dict[str, pd.Series], breadth: Dict[str, Any], val: Dict[str, Any],
-                       earn: pd.DataFrame) -> List[Dict[str, str]]:
+                       earn: pd.DataFrame, spx_long: Optional[pd.Series] = None) -> List[Dict[str, str]]:
     """Stocks today: the S&P 500's trend, how many stocks take part, who leads, the fear gauge,
     sector rotation, the earnings season, what the market costs and the rest of the world."""
     cards: List[Dict[str, str]] = []
@@ -7858,6 +7911,10 @@ def stocks_today_cards(closes: Dict[str, pd.Series], breadth: Dict[str, Any], va
                 + f", {'above' if lv['px'] > lv['m200'] else 'below'} its 200-day average ({lv['m200']:,.0f}) and "
                   f"{'above' if lv['px'] > lv['m50'] else 'below'} its 50-day ({lv['m50']:,.0f}).")
         cards.append({"topic": "S&P 500", "state": state, "tone": tone, "text": text})
+        big = big_day_card(spx_long if spx_long is not None else spx)
+        if big:
+            # a day like that is the news; it goes first, not buried in the trend card
+            cards.insert(0, big)
 
     # 2. Breadth: how many stocks take part
     if breadth and breadth.get("pct_above_200") is not None:
@@ -8036,7 +8093,9 @@ valuation are recomputed after each US close. None of this is a recommendation.
         breadth = stock_kv("stock_breadth") or {}
         val = stock_kv("market_valuation") or {}
         earn = stock_earnings()
-        stock_cards = stocks_today_cards(closes, breadth, val, earn)
+        # ten years for the big-day card's record of what followed similar days
+        stock_cards = stocks_today_cards(closes, breadth, val, earn,
+                                         spx_long=stock_closes(("^GSPC",), 10.0).get("^GSPC"))
         read_cards("Stocks today", stock_cards,
                    note="Computed from Yahoo Finance closes, every S&P 500 member's prices and quote summary "
                         f"(breadth as of {breadth.get('as_of', 'n/a')}, valuation as of {val.get('as_of', 'n/a')}) "
@@ -9244,7 +9303,17 @@ def news_today_cards(df: pd.DataFrame, clusters: List[Dict[str, Any]],
     day = df[df["published_at"] >= now - pd.Timedelta(hours=24)] if not df.empty else df
 
     # 1. The day's biggest story
-    if clusters and clusters[0]["n_sources"] >= 2:
+    if clusters and clusters[0].get("label") and clusters[0]["n_sources"] >= 2:
+        # grouped by event: name the event, then the next two
+        c = clusters[0]
+        text = (f"{c['label']}: {c['n']} headlines from {c['n_sources']} outlets, including "
+                f"{', '.join(c['sources'][:4])}. Lead headline: “{c['title']}”.")
+        more = [x for x in clusters[1:3] if x["n_sources"] >= 2]
+        if more:
+            text += " Also: " + "; ".join(f"{x['label']} ({x['n_sources']} outlets)" for x in more) + "."
+        cards.append({"topic": "Biggest story", "state": f"{c['n_sources']} outlets",
+                      "tone": "warn" if c.get("relevance") == "high" else "flat", "text": text})
+    elif clusters and clusters[0]["n_sources"] >= 2:
         c = clusters[0]
         cards.append({"topic": "Most-covered story", "state": f"{c['n_sources']} outlets",
                       "tone": "flat",
@@ -9330,13 +9399,25 @@ every 20 minutes, and the week's economic calendar.
         if "category" not in news_df.columns:
             news_df["category"] = news_df.get("keyword", "")
         news_events = fx_econ_events()
-        news_cl = news_clusters(news_df, 24)
+        # stories grouped by event (a small AI model, every 30 minutes); the word-overlap
+        # clusters stand in when that grouping is missing or stale
+        try:
+            import news_events as nev
+            news_cl = nev.event_clusters(news_df, dl.kv_get(nev.KV_KEY) if _HAS_AGENT else None)
+        except Exception:
+            news_cl = []
+        by_event = bool(news_cl)
+        if not by_event:
+            news_cl = news_clusters(news_df, 24)
 
         # ---------------- news today: the summary first ----------------
         read_cards("News today", news_today_cards(news_df, news_cl, news_events),
                    note="Counted from about 30 news feeds and NewsAPI, collected every 20 minutes, "
-                        "and from the economic calendar. Headlines are grouped into stories by the "
-                        "words they share.")
+                        "and from the economic calendar. "
+                        + ("Headlines are grouped into events by an AI model (Claude Haiku) every 30 minutes "
+                           "and ranked by the number of outlets, weighted by how much the event matters "
+                           "to markets; the outlet counts are recounted from the headlines themselves."
+                           if by_event else "Headlines are grouped into stories by the words they share."))
 
         st.markdown("##### The top stories of the last 24 hours")
         if not news_cl:
@@ -9352,7 +9433,9 @@ every 20 minutes, and the week's economic calendar.
                     f"<a href='{c['url']}' target='_blank' style='font-size:16px;font-weight:600;"
                     f"color:#fff;text-decoration:none'>{ihtml.escape(str(c['title']))}</a>"
                     f"<div style='font-size:12.5px;color:#a3a3a3;margin-top:2px'>"
-                    f"{c['n_sources']} outlet{'s' if c['n_sources'] != 1 else ''} · {srcs} · latest {when}"
+                    + (f"<div style='font-size:12.5px;color:#86efac;margin-bottom:2px'>{ihtml.escape(str(c['label']))}"
+                       f" · {c['n']} headlines</div>" if c.get("label") else "")
+                    + f"{c['n_sources']} outlet{'s' if c['n_sources'] != 1 else ''} · {srcs} · latest {when}"
                     f" · {ihtml.escape(str(c.get('category') or ''))}</div>"
                     + (f"<div style='font-size:14px;color:#d4d4d4;margin-top:4px'>{ihtml.escape(lead)}</div>"
                        if lead else "")

@@ -34,6 +34,10 @@ HAIKU_MODEL = "claude-haiku-4-5"  # current Haiku — still the cheap/fast tier
 DEFAULT_MAX_TOKENS = 8000
 AGENT_EFFORT = "high"
 MAX_TOOL_ROUNDS = 8
+# Lookups per question, across all rounds. Rounds alone did not cap cost: a test question on
+# the AI Bubble tracker made 23 calls in 8 rounds (several of them the same quote twice) for
+# a 3-credit price set on a handful. Over the budget the model is told to answer.
+MAX_TOOL_CALLS = 10
 
 
 # ---------------- secrets ----------------
@@ -410,7 +414,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_db_health",
-        "description": "Diagnostics: how many news/market/signal/SEC rows are stored, and the timestamp of the latest news.",
+        "description": "Diagnostics: how many news/market/signal/SEC rows are stored, and the timestamp of the latest news. Only for questions about the data itself; the other tools already say when their data is from.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -891,7 +895,8 @@ def _route_model(user_msg: str) -> str:
 
 
 def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = None,
-                   max_tokens: int = DEFAULT_MAX_TOKENS, extra_system: str = "") -> Dict[str, Any]:
+                   max_tokens: int = DEFAULT_MAX_TOKENS, extra_system: str = "",
+                   max_tool_calls: int = MAX_TOOL_CALLS) -> Dict[str, Any]:
     """
     Run one user-turn through Claude with tool-use loop.
     `messages` is the running conversation in Anthropic format
@@ -914,12 +919,16 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
     earlier_text: List[str] = []   # text written in rounds that also called tools
     convo = list(messages)
     safety_iter = 0
+    seen: Dict[str, Any] = {}      # name+args -> result: a repeated lookup is not run or counted twice
+    budget_note = (f"\n\nLookup budget: at most {max_tool_calls} tool calls for this question. Ask for "
+                   "several things in one round where you can, never repeat a lookup, and write the "
+                   "answer as soon as the figures that answer the question are in hand.")
 
     # A question that keeps calling tools gets one last round with tools switched off, so it
     # answers from what it has found instead of stopping with nothing to show for the credits.
     while safety_iter <= MAX_TOOL_ROUNDS:
         safety_iter += 1
-        final = safety_iter > MAX_TOOL_ROUNDS
+        final = safety_iter > MAX_TOOL_ROUNDS or len(seen) >= max_tool_calls
         try:
             # Opus 5.5 defaults to effort "medium" where Opus 5 defaulted to
             # "high"; state it so the analyst keeps the depth it had. Haiku 4.5
@@ -932,7 +941,7 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
                 cache_control={"type": "ephemeral"},
                 model=model,
                 max_tokens=max_tokens,
-                system=_build_system_prompt() + extra_system,
+                system=_build_system_prompt() + extra_system + budget_note,
                 tools=TOOLS,
                 messages=convo,
                 **({"tool_choice": {"type": "none"}} if final else {}),
@@ -987,13 +996,22 @@ def run_agent_turn(messages: List[Dict[str, Any]], force_model: Optional[str] = 
         for tu in tool_uses:
             name = tu["name"]
             args = tu["input"]
-            fn = TOOL_DISPATCH.get(name)
-            try:
-                result = fn(args) if fn else {"error": f"unknown tool {name}"}
-            except Exception as e:
-                log.exception("tool %s failed", name)
-                result = {"error": str(e)}
-            tool_calls_log.append({"name": name, "args": args, "result_preview": str(result)[:200]})
+            key = name + json.dumps(args, sort_keys=True, default=str)
+            if key in seen:
+                result = seen[key]
+            elif len(seen) >= max_tool_calls:
+                # every tool_use needs a result; this one says the budget is spent
+                result = {"skipped": "lookup budget reached: answer with the figures already found, "
+                                     "and name anything still missing"}
+            else:
+                fn = TOOL_DISPATCH.get(name)
+                try:
+                    result = fn(args) if fn else {"error": f"unknown tool {name}"}
+                except Exception as e:
+                    log.exception("tool %s failed", name)
+                    result = {"error": str(e)}
+                seen[key] = result
+                tool_calls_log.append({"name": name, "args": args, "result_preview": str(result)[:200]})
             tool_results_content.append({
                 "type": "tool_result",
                 "tool_use_id": tu["id"],

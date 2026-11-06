@@ -193,10 +193,26 @@ def job_market_valuation() -> None:
 
 def job_refresh_macro_calendar() -> None:
     try:
-        n = dl.upsert_econ_events(src.fetch_forexfactory_calendar())
-        log.info("macro calendar job: %d events", n)
+        events = src.fetch_macro_calendar(_get_secret("FRED_API_KEY"))
+        ff_last = max((e["event_time"][:10] for e in events if e.get("source") == "ForexFactory"), default="")
+        if ff_last:
+            # FRED stood in for days ForexFactory had not published yet; now it has
+            dl.drop_econ_events("FRED release calendar", ff_last)
+        n = dl.upsert_econ_events(events)
+        log.info("macro calendar job: %d events (ForexFactory through %s, FRED after)", n, ff_last or "-")
     except Exception as e:
         log.exception("job_refresh_macro_calendar failed: %s", e)
+
+
+def job_news_events() -> None:
+    """Group the day's headlines into events for the News tab (a small model, ~1 cent a run)."""
+    try:
+        import news_events
+        out = news_events.group_events()
+        if out:
+            log.info("news events: %d events from %d headlines", len(out["events"]), out["n_headlines"])
+    except Exception as e:
+        log.exception("job_news_events failed: %s", e)
 
 
 def job_free_market_read() -> None:
@@ -407,6 +423,8 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_universe_full, IntervalTrigger(minutes=30),
                       id="universe_full", replace_existing=True, next_run_time=soon(2))
         sched.add_job(job_refresh_rss, IntervalTrigger(minutes=20), id="rss", replace_existing=True)
+        sched.add_job(job_news_events, IntervalTrigger(minutes=30), id="news_events", replace_existing=True,
+                      next_run_time=soon(3))
         # NewsAPI's free plan allows 100 requests a day; a run makes 5, so every 2 h is 60.
         sched.add_job(job_refresh_news, IntervalTrigger(hours=2), id="newsapi", replace_existing=True,
                       next_run_time=soon(1))

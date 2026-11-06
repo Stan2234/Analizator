@@ -680,6 +680,59 @@ def fetch_forexfactory_calendar() -> List[Dict[str, Any]]:
     return out
 
 
+# ForexFactory only publishes next week's file late in the week (it answers 404 before), so a
+# "next 7 days" card read on a Friday missed the next US CPI. FRED's release calendar lists the
+# official US release dates months ahead. These are the market-moving ones, titled the way
+# ForexFactory titles them so the two feeds do not double-count; all come out at 8:30 New York.
+_FRED_RELEASES = {
+    10: ("CPI m/m", "high"), 50: ("Non-Farm Employment Change", "high"),
+    46: ("PPI m/m", "high"), 9: ("Retail Sales m/m", "high"),
+    53: ("GDP q/q", "high"), 54: ("Core PCE Price Index m/m", "high"),
+    180: ("Unemployment Claims", "medium"),
+}
+
+
+def fetch_fred_release_calendar(api_key: str, days_ahead: int = 21) -> List[Dict[str, Any]]:
+    """Upcoming US macro releases from FRED's official release-date calendar, in UTC."""
+    if not api_key:
+        return []
+    from zoneinfo import ZoneInfo
+    today = dt.date.today()
+    r = _get(f"{FRED_BASE}/releases/dates",
+             params={"api_key": api_key, "file_type": "json", "realtime_start": today.isoformat(),
+                     "realtime_end": (today + dt.timedelta(days=days_ahead)).isoformat(),
+                     "include_release_dates_with_no_data": "true", "sort_order": "asc", "limit": 1000})
+    if not r:
+        return []
+    try:
+        rows = r.json().get("release_dates") or []
+    except Exception:
+        return []
+    ny, out, seen = ZoneInfo("America/New_York"), [], set()
+    for row in rows:
+        spec = _FRED_RELEASES.get(int(row.get("release_id") or 0))
+        if not spec or (row.get("date"), spec[0]) in seen:
+            continue
+        seen.add((row.get("date"), spec[0]))
+        try:
+            when = dt.datetime.combine(dt.date.fromisoformat(row["date"]), dt.time(8, 30), ny)
+        except Exception:
+            continue
+        out.append({"event_time": when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "country": "US", "title": spec[0], "importance": spec[1],
+                    "actual": "", "forecast": "", "previous": "", "source": "FRED release calendar",
+                    "extra": {"currency": "USD", "release": row.get("release_name")}})
+    return out
+
+
+def fetch_macro_calendar(fred_api_key: str = "") -> List[Dict[str, Any]]:
+    """ForexFactory for the weeks it has published, FRED's US release dates after that."""
+    ff = fetch_forexfactory_calendar()
+    last = max((e["event_time"][:10] for e in ff), default="")
+    us = [e for e in fetch_fred_release_calendar(fred_api_key) if e["event_time"][:10] > last]
+    return ff + us
+
+
 def fetch_finnhub_ipo_calendar(api_key: str, days_ahead: int = 30) -> List[Dict[str, Any]]:
     if not api_key:
         return []

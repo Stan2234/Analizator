@@ -4057,9 +4057,9 @@ def fx_today_cards(uv: pd.DataFrame, codes: List[str], rates: pd.DataFrame,
                 "days for the typical currency." if med < 30 else
                 f"Day-to-day swings over the past month are wilder than on {med:.0f}% of past days "
                 "for the typical currency." if med > 70 else
-                f"Day-to-day swings are about normal for the typical currency ({med:.0f}th "
+                f"Day-to-day swings are about normal for the typical currency ({ordinal(med)} "
                 "percentile of its own history).")
-        text += (f" Most unsettled: {c[hot].flag} {hot}/USD ({pcts[hot]:.0f}th percentile). Calm "
+        text += (f" Most unsettled: {c[hot].flag} {hot}/USD ({ordinal(pcts[hot])} percentile). Calm "
                  "markets suit carry trades; sudden jumps in volatility are what unwind them.")
         cards.append({"topic": "How jumpy", "state": state, "tone": tone, "text": text})
 
@@ -4074,7 +4074,7 @@ def fx_today_cards(uv: pd.DataFrame, codes: List[str], rates: pd.DataFrame,
         items = "; ".join(f"{r['flag']} {r['event']} ({pd.Timestamp(r['date']).strftime('%a %d %b')})"
                           for _, r in pick.iterrows())
         cards.append({"topic": "Next 7 days", "state": f"{len(cb)} rate decision" + ("" if len(cb) == 1 else "s")
-                      if not cb.empty else f"{len(ev)} key releases",
+                      if not cb.empty else f"{len(ev)} key release" + ("" if len(ev) == 1 else "s"),
                       "tone": "warn" if not cb.empty else "flat",
                       "text": items + ". Carry and trends often break around these."})
     else:
@@ -4800,7 +4800,7 @@ def carry_today_cards(funding: str, f_rate: Optional[float], ct: pd.DataFrame,
         cards.append({"topic": f"{funding} and stocks", "state": "Unwind-like link" if unwind_like else "Normal link",
                       "tone": "warn" if unwind_like else "flat",
                       "text": f"Over three months {funding}/USD has a {ec:+.2f} correlation with the S&P 500"
-                              + (f" ({ecp:.0f}th percentile)" if ecp is not None else "")
+                              + (f" ({ordinal(ecp)} percentile)" if ecp is not None else "")
                               + (". A strongly negative link means the funding currency rises when "
                                  "stocks fall, the mechanism of past unwinds." if unwind_like else
                                  ". It is not yet behaving like a crowded trade being sold with stocks.")})
@@ -6367,7 +6367,7 @@ def metals_today_cards(px: pd.DataFrame, bd: pd.DataFrame, rt: pd.DataFrame,
                     f"average" + (f", {c3:+.1f}% over three months." if c3 is not None else "."))
             if not rt.empty and "Copper / Gold" in rt.index:
                 cg = rt.loc["Copper / Gold"]
-                text += (f" Against gold it sits at the {cg['percentile']:.0f}th percentile of its history: "
+                text += (f" Against gold it sits at the {ordinal(cg['percentile'])} percentile of its history: "
                          + ("the market prices little growth relative to fear." if cg["percentile"] < 25 else
                             "growth expectations are holding up well against fear." if cg["percentile"] > 75 else
                             "a middling balance between growth and fear."))
@@ -7124,6 +7124,10 @@ def crypto_today_cards(universe: pd.DataFrame, glob: Dict[str, Any], closes: pd.
                 state = "Hedge-like"
                 text = (f"bitcoin has been moving with gold (correlation {gold:+.2f}) "
                         f"more than with tech stocks ({nas:+.2f}).")
+            elif nas > 0.3 and gold > 0.3:
+                state = "Moves with both"
+                text = (f"bitcoin has moved with tech stocks (correlation {nas:+.2f}) and with gold "
+                        f"({gold:+.2f}) about equally, so neither label fits on its own.")
             else:
                 state = "Its own thing"
                 text = (f"bitcoin's link to tech stocks ({nas:+.2f}) and to gold ({gold:+.2f}) "

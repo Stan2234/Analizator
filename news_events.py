@@ -5,7 +5,7 @@ staff", but it cannot see that "Nasdaq sinks", "Oracle falls as Microsoft winds 
 and "Bitcoin ETFs bleed as tech rout tests buyers" are one market event. On a day like that
 the event was split into a dozen one-outlet stories and a Cybertruck factbox led the page.
 
-A small model reads the last day's headlines every 30 minutes and says which ones report
+Every hour a small model names the last day's events and sorts each headline into one, so it says which ones report
 the same event and how much that event matters to markets. Only the grouping comes from
 the model: the outlet counts are recounted here from the headlines it pointed at, and the
 headline shown is a real one from the group, never text the model wrote. When the stored
@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("analizator.news_events")
@@ -23,35 +24,44 @@ log = logging.getLogger("analizator.news_events")
 KV_KEY = "news_events"
 MAX_HEADLINES = 350
 FRESH_HOURS = 3
+ASSIGN_CHUNK = 70
 # outlets count for more when the event moves markets: a sell-off told by eight outlets
 # outranks a product recall told by five
 RELEVANCE = {"high": 3.0, "medium": 1.5, "low": 0.5}
 
-SYSTEM = (
-    "You group news headlines into events for a markets website. You get numbered headlines "
-    "from the last 24 hours as 'index | outlet | headline'.\n\n"
-    "Return the 10 events reported by the most different outlets, each with at least two "
-    "headlines. Headlines belong to one event when they report the same happening or its "
-    "direct market consequences: a sell-off in tech stocks, the companies falling with it and "
-    "the flows it caused are one event; two unrelated earnings reports are not. Do not merge "
-    "events only because they share a theme such as 'AI' or 'Trump'. The same day's broad market "
-    "moves (indices falling or rising, a sector rout, stocks at the close) are one event, not one "
-    "per index or region.\n\n"
+NAME_SYSTEM = (
+    "You find the events in a day of news headlines for a markets website. You get numbered "
+    "headlines from the last 24 hours as 'index | outlet | headline'.\n\n"
+    "List the 12 events told by the most headlines and outlets. An event is one happening "
+    "with its direct consequences: a sell-off in tech stocks, the companies falling with it, "
+    "the flows it caused and the day's index moves are one event; two unrelated earnings "
+    "reports are not. Do not merge events only because they share a theme such as 'AI' or "
+    "'Trump'.\n\n"
     "For each event give:\n"
-    "- label: a neutral description of the event in at most 12 words, using only facts in "
-    "its headlines\n"
+    "- label: a neutral description in at most 12 words, using only facts in the headlines\n"
     "- relevance: 'high' if it moves broad markets, rates, currencies or commodities; "
     "'medium' if it moves a sector or a large company; 'low' otherwise (politics with no "
-    "market angle, sport, crime, single small companies, product stories)\n"
-    "- lead: the index of the headline that states the event most plainly\n"
-    "- items: the indices of all its headlines\n\n"
-    'Reply with JSON only: {"events": [{"label": "...", "relevance": "high", "lead": 3, '
-    '"items": [3, 17, 42]}]}'
+    "market angle, sport, crime, single small companies, product stories)\n\n"
+    'Reply with JSON only: {"events": [{"label": "...", "relevance": "high"}]}'
+)
+
+ASSIGN_SYSTEM = (
+    "You sort news headlines into a fixed list of events. You get the numbered events, then "
+    "numbered headlines as 'index | outlet | headline'. For every headline, in order, write "
+    "one line 'index:event', where event is the number of the event it reports, including "
+    "headlines about a company or asset caught up in that event, or 0 if it belongs to none. "
+    "Write a line for every headline and nothing else."
 )
 
 
+def _tokens(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9$%]+", str(text).lower()) if len(w) > 2}
+
+
 def group_events() -> Optional[Dict[str, Any]]:
-    """Scheduler job: ask the model for the event grouping and store it."""
+    """Scheduler job: the model names the day's events, then assigns every headline to one of
+    them. Two steps because one step left most of a big event's headlines out, and by a
+    different amount on each run; sorting a list into fixed events is the easier task."""
     import agent as ai_agent
     import data_layer as dl
 
@@ -62,24 +72,43 @@ def group_events() -> Optional[Dict[str, Any]]:
     if len(rows) < 10:
         return None
     lines = "\n".join(f"{i} | {r.get('source')} | {str(r['title'])[:200]}" for i, r in enumerate(rows))
-    resp = ai_agent.create_message(
-        ai_agent.get_anthropic_client(), route="news_events", model=ai_agent.HAIKU_MODEL,
-        max_tokens=3000, system=SYSTEM, messages=[{"role": "user", "content": lines}])
-    raw = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
-    start, end = raw.find("{"), raw.rfind("}")
+    client = ai_agent.get_anthropic_client()
+
+    def ask(system: str, user: str, max_tokens: int) -> str:
+        resp = ai_agent.create_message(client, route="news_events", model=ai_agent.HAIKU_MODEL,
+                                       max_tokens=max_tokens, temperature=0, system=system,
+                                       messages=[{"role": "user", "content": user}])
+        return "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+
+    raw = ask(NAME_SYSTEM, lines, 1500)
     try:
-        data = json.loads(raw[start:end + 1])
+        named = json.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("events") or []
     except Exception:
-        log.warning("news events: unreadable reply")
+        log.warning("news events: unreadable event list")
         return None
+    named = [e for e in named if e.get("label")][:12]
+    if not named:
+        return None
+    menu = "\n".join(f"{k} | {e['label']}" for k, e in enumerate(named, 1))
+    # in chunks: given all 350 at once it answered for fewer than half of them
+    groups: Dict[int, List[int]] = {}
+    all_lines = lines.split("\n")
+    for c in range(0, len(all_lines), ASSIGN_CHUNK):
+        chunk = "\n".join(all_lines[c:c + ASSIGN_CHUNK])
+        raw = ask(ASSIGN_SYSTEM, f"Events:\n{menu}\n\nHeadlines:\n{chunk}", 1200)
+        for i, k in re.findall(r"^\s*(\d+)\s*:\s*(\d+)\s*$", raw, re.M):
+            i, k = int(i), int(k)
+            if c <= i < c + ASSIGN_CHUNK and 1 <= k <= len(named):
+                groups.setdefault(k, []).append(i)
     events = []
-    for e in data.get("events") or []:
-        idx = sorted({int(i) for i in e.get("items") or [] if str(i).lstrip("-").isdigit()
-                      and 0 <= int(i) < len(rows)})
+    for k, e in enumerate(named, 1):
+        idx = sorted(set(groups.get(k, [])))
         if len(idx) < 2:
             continue
-        lead = int(e["lead"]) if str(e.get("lead", "")).isdigit() and int(e["lead"]) in idx else idx[0]
-        events.append({"label": str(e.get("label") or "")[:120],
+        # the lead is the real headline closest to the label, never text the model wrote
+        lab = _tokens(e["label"])
+        lead = max(idx, key=lambda i: (len(lab & _tokens(rows[i]["title"])), -i))
+        events.append({"label": str(e["label"])[:120],
                        "relevance": e.get("relevance") if e.get("relevance") in RELEVANCE else "low",
                        "lead_url": rows[lead]["url"], "urls": [rows[i]["url"] for i in idx]})
     out = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

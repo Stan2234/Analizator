@@ -6333,7 +6333,7 @@ def metals_today_cards(px: pd.DataFrame, bd: pd.DataFrame, rt: pd.DataFrame,
             g1 = _pct_change_days(px[gold_t], 30) if gold_t in px.columns else None
             if g1 is not None and score > 0 and g1 < -1:
                 state, tone = "Tailwind, but gold fell", "warn"
-                text += (f" Gold still fell {g1:.1f}% over the same month, so these two are not what is "
+                text += (f" Gold still fell {abs(g1):.1f}% over the same month, so these two are not what is "
                          "moving it now; the buying and selling below says more.")
             elif g1 is not None and score < 0 and g1 > 1:
                 state, tone = "Headwind, but gold rose", "warn"
@@ -9399,7 +9399,7 @@ every 20 minutes, and the week's economic calendar.
         if "category" not in news_df.columns:
             news_df["category"] = news_df.get("keyword", "")
         news_events = fx_econ_events()
-        # stories grouped by event (a small AI model, every 30 minutes); the word-overlap
+        # stories grouped by event (a small AI model, every hour); the word-overlap
         # clusters stand in when that grouping is missing or stale
         try:
             import news_events as nev
@@ -9414,7 +9414,7 @@ every 20 minutes, and the week's economic calendar.
         read_cards("News today", news_today_cards(news_df, news_cl, news_events),
                    note="Counted from about 30 news feeds and NewsAPI, collected every 20 minutes, "
                         "and from the economic calendar. "
-                        + ("Headlines are grouped into events by an AI model (Claude Haiku) every 30 minutes "
+                        + ("Headlines are grouped into events by an AI model (Claude Haiku) every hour "
                            "and ranked by the number of outlets, weighted by how much the event matters "
                            "to markets; the outlet counts are recounted from the headlines themselves."
                            if by_event else "Headlines are grouped into stories by the words they share."))

@@ -205,7 +205,7 @@ def job_refresh_macro_calendar() -> None:
 
 
 def job_news_events() -> None:
-    """Group the day's headlines into events for the News tab (a small model, ~1 cent a run)."""
+    """Group the day's headlines into events for the News tab (a small model in six calls, ~3 cents a run, hourly)."""
     try:
         import news_events
         out = news_events.group_events()
@@ -423,7 +423,7 @@ def start_scheduler(run_now: bool = True) -> BackgroundScheduler:
         sched.add_job(job_refresh_universe_full, IntervalTrigger(minutes=30),
                       id="universe_full", replace_existing=True, next_run_time=soon(2))
         sched.add_job(job_refresh_rss, IntervalTrigger(minutes=20), id="rss", replace_existing=True)
-        sched.add_job(job_news_events, IntervalTrigger(minutes=30), id="news_events", replace_existing=True,
+        sched.add_job(job_news_events, IntervalTrigger(hours=1), id="news_events", replace_existing=True,
                       next_run_time=soon(3))
         # NewsAPI's free plan allows 100 requests a day; a run makes 5, so every 2 h is 60.
         sched.add_job(job_refresh_news, IntervalTrigger(hours=2), id="newsapi", replace_existing=True,
